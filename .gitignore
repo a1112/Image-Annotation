@@ -1,6 +1,7 @@
 node_modules/
 dist/
 data/
+.worktrees/
 src-tauri/target/
 src-tauri/gen/
 *.log
