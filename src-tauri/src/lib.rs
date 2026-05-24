@@ -1,6 +1,7 @@
 pub mod annotations;
 pub mod datasets;
 pub mod domain;
+pub mod http_backend;
 pub mod importers;
 mod platform;
 pub mod project_fs;
@@ -9,8 +10,9 @@ pub mod windows;
 
 use datasets::{BuiltinDataset, DownloadJob};
 use domain::{
-    AnnotationObject, BackendDesign, BackendTask, DatasetImage, DatasetProject, ProjectDetail,
-    SampleRepository,
+    AnnotationObject, AnnotationSaveResult, AnnotationState, AnnotationTask, AnnotationVersion,
+    BackendDesign, BackendTask, DatasetExport, DatasetImage, DatasetProject, DatasetSnapshot,
+    ProjectDetail, SampleRepository, TaskItem,
 };
 use platform::NativeBackdropStatus;
 use serde::Serialize;
@@ -154,6 +156,11 @@ fn get_backend_design() -> BackendDesign {
 }
 
 #[tauri::command]
+fn backend_health() -> serde_json::Value {
+    http_backend::desktop_health_payload()
+}
+
+#[tauri::command]
 fn list_builtin_datasets() -> Result<Vec<BuiltinDataset>, String> {
     project_fs::ensure_test_data_dirs()?;
     Ok(datasets::builtin_datasets())
@@ -268,6 +275,160 @@ fn create_dataset_project(
 }
 
 #[tauri::command]
+fn create_project(
+    tasks: State<'_, BackendTaskState>,
+    name: String,
+    dataset_type: String,
+) -> Result<DatasetProject, String> {
+    create_dataset_project(tasks, name, dataset_type, "empty".to_string())
+}
+
+#[tauri::command]
+fn import_images(
+    tasks: State<'_, BackendTaskState>,
+    project_id: String,
+    source_path: String,
+) -> Result<DatasetProject, String> {
+    let task_id = format!("import-images-{project_id}");
+    record_backend_task(
+        &tasks,
+        BackendTask::new(
+            task_id.clone(),
+            "图片目录导入",
+            "image-import",
+            "running",
+            20,
+            "正在导入本地图片目录",
+        ),
+    )?;
+    match datasets::import_images_into_project(&project_id, &source_path) {
+        Ok(project) => {
+            record_backend_task(
+                &tasks,
+                BackendTask::new(
+                    task_id,
+                    "图片目录导入",
+                    "image-import",
+                    "completed",
+                    100,
+                    format!("已导入并索引 {} 张图片", project.image_count),
+                )
+                .finished(),
+            )?;
+            Ok(project)
+        }
+        Err(error) => {
+            record_backend_task(
+                &tasks,
+                BackendTask::new(task_id, "图片目录导入", "image-import", "failed", 0, &error)
+                    .finished(),
+            )?;
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+fn import_yolo_dataset(
+    tasks: State<'_, BackendTaskState>,
+    project_id: String,
+    source_path: String,
+) -> Result<DatasetProject, String> {
+    let task_id = format!("import-yolo-{project_id}");
+    record_backend_task(
+        &tasks,
+        BackendTask::new(
+            task_id.clone(),
+            "YOLO 数据集导入",
+            "yolo-import",
+            "running",
+            20,
+            "正在导入 YOLO 数据集目录",
+        ),
+    )?;
+    match datasets::import_yolo_dataset_into_project(&project_id, &source_path) {
+        Ok(project) => {
+            record_backend_task(
+                &tasks,
+                BackendTask::new(
+                    task_id,
+                    "YOLO 数据集导入",
+                    "yolo-import",
+                    "completed",
+                    100,
+                    format!("已导入并索引 {} 张图片", project.image_count),
+                )
+                .finished(),
+            )?;
+            Ok(project)
+        }
+        Err(error) => {
+            record_backend_task(
+                &tasks,
+                BackendTask::new(task_id, "YOLO 数据集导入", "yolo-import", "failed", 0, &error)
+                    .finished(),
+            )?;
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+fn open_local_dataset(
+    tasks: State<'_, BackendTaskState>,
+    source_path: String,
+    dataset_type: String,
+) -> Result<DatasetProject, String> {
+    let task_id = format!("open-local-{}", dataset_slug(&source_path, "dataset"));
+    record_backend_task(
+        &tasks,
+        BackendTask::new(
+            task_id.clone(),
+            "打开本机数据集",
+            "local-dataset-open",
+            "running",
+            20,
+            "正在索引本机目录",
+        ),
+    )?;
+    match datasets::open_local_dataset(&source_path, &dataset_type) {
+        Ok(project) => {
+            record_backend_task(
+                &tasks,
+                BackendTask::new(
+                    task_id,
+                    "打开本机数据集",
+                    "local-dataset-open",
+                    "completed",
+                    100,
+                    format!("已索引 {} 张图片", project.image_count),
+                )
+                .finished(),
+            )?;
+            Ok(project)
+        }
+        Err(error) => {
+            record_backend_task(
+                &tasks,
+                BackendTask::new(task_id, "打开本机数据集", "local-dataset-open", "failed", 0, &error)
+                    .finished(),
+            )?;
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+fn rescan_project_assets(project_id: String) -> Result<DatasetProject, String> {
+    datasets::rescan_project_assets(&project_id)
+}
+
+#[tauri::command]
+fn generate_thumbnails(project_id: String) -> Result<u32, String> {
+    datasets::generate_project_thumbnails(&project_id)
+}
+
+#[tauri::command]
 fn get_dataset_download_job(dataset_key: String) -> Result<Option<DownloadJob>, String> {
     Ok(datasets::completed_job(&dataset_key))
 }
@@ -277,9 +438,11 @@ fn list_project_images(
     repository: State<'_, RepositoryState>,
     project_id: String,
     group_id: Option<String>,
+    offset: Option<u32>,
+    limit: Option<u32>,
 ) -> Result<Vec<DatasetImage>, String> {
     let repository = repository.lock().map_err(|err| err.to_string())?;
-    Ok(repository.project_images(&project_id, group_id))
+    Ok(repository.project_images_paged(&project_id, group_id, offset, limit))
 }
 
 #[tauri::command]
@@ -293,14 +456,167 @@ fn get_image_annotations(
 }
 
 #[tauri::command]
+fn get_image_annotation_state(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    image_id: String,
+) -> Result<AnnotationState, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    Ok(repository.image_annotation_state(&project_id, &image_id))
+}
+
+#[tauri::command]
 fn save_image_annotations(
     repository: State<'_, RepositoryState>,
     project_id: String,
     image_id: String,
+    revision: Option<String>,
     objects: Vec<AnnotationObject>,
+) -> Result<AnnotationSaveResult, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.save_image_annotations_with_revision(&project_id, &image_id, revision, objects)
+}
+
+#[tauri::command]
+fn submit_image_annotations(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    image_id: String,
 ) -> Result<(), String> {
     let repository = repository.lock().map_err(|err| err.to_string())?;
-    repository.save_image_annotations(&project_id, &image_id, objects)
+    repository.submit_image_annotations(&project_id, &image_id)
+}
+
+#[tauri::command]
+fn get_annotation_history(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    image_id: String,
+) -> Result<Vec<AnnotationVersion>, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.annotation_history(&project_id, &image_id)
+}
+
+#[tauri::command]
+fn restore_annotation_version(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    image_id: String,
+    revision: String,
+) -> Result<AnnotationSaveResult, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.restore_annotation_version(&project_id, &image_id, &revision)
+}
+
+#[tauri::command]
+fn create_annotation_task(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    name: String,
+) -> Result<AnnotationTask, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.create_annotation_task(&project_id, &name)
+}
+
+#[tauri::command]
+fn list_tasks(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+) -> Result<Vec<AnnotationTask>, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.annotation_tasks(&project_id)
+}
+
+#[tauri::command]
+fn list_task_items(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    task_id: String,
+) -> Result<Vec<TaskItem>, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.task_items(&project_id, &task_id)
+}
+
+#[tauri::command]
+fn claim_task_item(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    task_id: String,
+    image_id: String,
+) -> Result<(), String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.claim_task_item(&project_id, &task_id, &image_id)
+}
+
+#[tauri::command]
+fn release_task_item(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    task_id: String,
+    image_id: String,
+) -> Result<(), String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.release_task_item(&project_id, &task_id, &image_id)
+}
+
+#[tauri::command]
+fn review_task_item(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    image_id: String,
+    decision: String,
+    note: String,
+) -> Result<(), String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.review_task_item(&project_id, &image_id, &decision, &note)
+}
+
+#[tauri::command]
+fn list_review_queue(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+) -> Result<Vec<DatasetImage>, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.review_queue(&project_id)
+}
+
+#[tauri::command]
+fn create_dataset_snapshot(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    name: String,
+) -> Result<DatasetSnapshot, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.create_dataset_snapshot(&project_id, &name)
+}
+
+#[tauri::command]
+fn list_snapshots(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+) -> Result<Vec<DatasetSnapshot>, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.dataset_snapshots(&project_id)
+}
+
+#[tauri::command]
+fn export_dataset(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    snapshot_id: String,
+    format: String,
+) -> Result<DatasetExport, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.export_dataset(&project_id, &snapshot_id, &format)
+}
+
+#[tauri::command]
+fn list_exports(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+) -> Result<Vec<DatasetExport>, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.dataset_exports(&project_id)
 }
 
 #[tauri::command]
@@ -386,7 +702,7 @@ fn retry_backend_task(tasks: State<'_, BackendTaskState>, task_id: String) -> Re
 fn open_backend_task_tray(app: AppHandle) -> Result<(), String> {
     #[cfg(not(mobile))]
     {
-        show_main_window(&app)
+        windows::open_backend_tasks_window(&app)
     }
 
     #[cfg(mobile)]
@@ -437,16 +753,38 @@ pub fn run() {
                 show_window,
                 close_window,
                 window_state,
+                backend_health,
                 list_dataset_projects,
                 get_project_detail,
                 get_backend_design,
                 list_builtin_datasets,
                 download_test_dataset,
                 create_dataset_project,
+                create_project,
+                import_images,
+                import_yolo_dataset,
+                open_local_dataset,
+                rescan_project_assets,
+                generate_thumbnails,
                 get_dataset_download_job,
                 list_project_images,
                 get_image_annotations,
+                get_image_annotation_state,
                 save_image_annotations,
+                submit_image_annotations,
+                get_annotation_history,
+                restore_annotation_version,
+                create_annotation_task,
+                list_tasks,
+                list_task_items,
+                claim_task_item,
+                release_task_item,
+                review_task_item,
+                list_review_queue,
+                create_dataset_snapshot,
+                list_snapshots,
+                export_dataset,
+                list_exports,
                 get_file_asset_path,
                 open_annotation_window,
                 list_backend_tasks,
@@ -456,6 +794,9 @@ pub fn run() {
                 open_backend_task_tray
             ])
             .setup(|app| {
+                if let Err(error) = http_backend::start_background_backend(app.handle().clone()) {
+                    eprintln!("local http backend failed to start: {error}");
+                }
                 setup_system_tray(app.handle())?;
 
                 if let Some(window) = app.get_webview_window("main") {
@@ -482,16 +823,38 @@ pub fn run() {
     {
         app = app.invoke_handler(tauri::generate_handler![
             window_state,
+            backend_health,
             list_dataset_projects,
             get_project_detail,
             get_backend_design,
             list_builtin_datasets,
             download_test_dataset,
             create_dataset_project,
+            create_project,
+            import_images,
+            import_yolo_dataset,
+            open_local_dataset,
+            rescan_project_assets,
+            generate_thumbnails,
             get_dataset_download_job,
             list_project_images,
             get_image_annotations,
+            get_image_annotation_state,
             save_image_annotations,
+            submit_image_annotations,
+            get_annotation_history,
+            restore_annotation_version,
+            create_annotation_task,
+            list_tasks,
+            list_task_items,
+            claim_task_item,
+            release_task_item,
+            review_task_item,
+            list_review_queue,
+            create_dataset_snapshot,
+            list_snapshots,
+            export_dataset,
+            list_exports,
             get_file_asset_path,
             open_annotation_window,
             list_backend_tasks,
@@ -528,20 +891,20 @@ fn hide_main_window(app: &AppHandle) -> Result<(), String> {
 
 #[cfg(not(mobile))]
 fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
-    let show_item = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "Show Window", true, None::<&str>)?;
-    let hide_item = MenuItem::with_id(app, TRAY_MENU_HIDE_ID, "Hide to Tray", true, None::<&str>)?;
+    let show_item = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示主窗口", true, None::<&str>)?;
+    let hide_item = MenuItem::with_id(app, TRAY_MENU_HIDE_ID, "隐藏到托盘", true, None::<&str>)?;
     let annotate_item = MenuItem::with_id(
         app,
         TRAY_MENU_ANNOTATE_ID,
-        "Start Annotation",
+        "打开标注工作台",
         true,
         None::<&str>,
     )?;
     let tasks_item =
-        MenuItem::with_id(app, TRAY_MENU_TASKS_ID, "Backend Tasks", true, None::<&str>)?;
-    let export_item = MenuItem::with_id(app, TRAY_MENU_EXPORT_ID, "Export", true, None::<&str>)?;
+        MenuItem::with_id(app, TRAY_MENU_TASKS_ID, "后台任务", true, None::<&str>)?;
+    let export_item = MenuItem::with_id(app, TRAY_MENU_EXPORT_ID, "导出中心", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "Quit", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出应用", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
@@ -602,10 +965,10 @@ fn tray_action_from_icon_event(event: &TrayIconEvent) -> Option<TrayAction> {
 #[cfg(not(mobile))]
 fn apply_tray_action(app: &AppHandle, action: TrayAction) -> Result<(), String> {
     match action {
-        TrayAction::ShowWindow
-        | TrayAction::StartAnnotation
-        | TrayAction::BackendTasks
-        | TrayAction::Export => show_main_window(app),
+        TrayAction::ShowWindow | TrayAction::StartAnnotation | TrayAction::Export => {
+            show_main_window(app)
+        }
+        TrayAction::BackendTasks => windows::open_backend_tasks_window(app),
         TrayAction::HideWindow => hide_main_window(app),
         TrayAction::Quit => {
             app.exit(0);
@@ -715,7 +1078,7 @@ mod tests {
             .iter()
             .any(|layer| layer.name == "Command API"));
         assert!(design.layers.iter().any(|layer| layer.name == "Project FS"));
-        assert!(design.storage_plan.contains("data/test_data"));
+        assert!(design.storage_plan.contains("data/workspaces/default"));
     }
 
     #[test]

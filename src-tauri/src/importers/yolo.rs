@@ -96,6 +96,36 @@ pub fn line_to_annotation(
     ))
 }
 
+pub fn annotations_to_yolo_lines(
+    objects: &[AnnotationObject],
+    image_width: u32,
+    image_height: u32,
+) -> Result<String, String> {
+    if image_width == 0 || image_height == 0 {
+        return Err("image dimensions are required for YOLO export".to_string());
+    }
+
+    let mut lines = String::new();
+    for object in objects {
+        let Some(bbox) = object.bbox.as_ref() else {
+            continue;
+        };
+        let width = bbox.width.max(1.0).min(image_width as f64);
+        let height = bbox.height.max(1.0).min(image_height as f64);
+        let center_x = (bbox.x + width / 2.0).clamp(0.0, image_width as f64);
+        let center_y = (bbox.y + height / 2.0).clamp(0.0, image_height as f64);
+        lines.push_str(&format!(
+            "{} {:.6} {:.6} {:.6} {:.6}\n",
+            object.class_id,
+            center_x / image_width as f64,
+            center_y / image_height as f64,
+            width / image_width as f64,
+            height / image_height as f64,
+        ));
+    }
+    Ok(lines)
+}
+
 fn parse_f64_values(line: &str) -> Result<Vec<f64>, String> {
     line.split_whitespace()
         .map(|part| {

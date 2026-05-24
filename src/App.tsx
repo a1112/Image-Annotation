@@ -33,29 +33,43 @@ import type { KeyboardEvent, MouseEvent } from "react";
 import {
   clearCompletedBackendTasks,
   createDatasetProject,
+  createDatasetSnapshot,
+  detectBackendConnection,
   downloadTestDataset,
+  exportDataset,
   getFileAssetUrl,
   getImageAnnotations,
+  getImageAnnotationState,
+  importImages,
+  importYoloDataset,
   getProjectDetail,
   isBackendUnavailableError,
   listBackendTasks,
   listBuiltinDatasets,
   listDatasetProjects,
+  listExports,
   listProjectImages,
+  listSnapshots,
   openAnnotationWindow,
+  openBackendTaskTray,
+  openLocalDataset,
   saveImageAnnotations,
+  submitImageAnnotations,
 } from "./api/tauri";
+import type { BackendConnection } from "./api/tauri";
 import type {
   AnnotationObject,
   BackendTask,
   BuiltinDataset,
+  DatasetExport,
   DatasetImage,
   DatasetProject,
+  DatasetSnapshot,
   ProjectDetail,
 } from "./types/domain";
 import { invoke } from "@tauri-apps/api/core";
 
-type ProjectTab = "概览" | "数据分组" | "图片" | "类别" | "任务" | "质检" | "导出" | "后端";
+type ProjectTab = "概览" | "数据分组" | "图片" | "类别" | "任务" | "质检" | "快照" | "导出";
 type ToolMode = "select" | "bbox" | "polygon" | "pan";
 type DataRuntimeState = "loading" | "ready" | "downloading" | "backend-unavailable" | "download-error";
 type DatasetCreationForm = {
@@ -66,10 +80,14 @@ type DatasetCreationForm = {
 type Route =
   | { name: "datasets" }
   | { name: "project"; projectId: string; tab?: ProjectTab }
-  | { name: "annotate"; projectId: string; imageId?: string };
+  | { name: "annotate"; projectId: string; imageId?: string }
+  | { name: "backendTasks" };
 
-const projectTabs: ProjectTab[] = ["概览", "数据分组", "图片", "类别", "任务", "质检", "导出", "后端"];
+const projectTabs: ProjectTab[] = ["概览", "数据分组", "图片", "类别", "任务", "质检", "快照", "导出"];
 const defaultTestDatasetKey = "coco128";
+const datasetPreviewLimit = 3;
+const projectImagePageSize = 48;
+const annotationImagePageSize = 120;
 const defaultDatasetCreationForm: DatasetCreationForm = {
   name: "Demo BBox 数据集",
   datasetType: "yolo-detect",
@@ -98,6 +116,9 @@ function parseRoute(): Route {
   const parts = hash.split("/").filter(Boolean);
   if (parts[0] === "annotate" && parts[1]) {
     return { name: "annotate", projectId: parts[1], imageId: parts[2] };
+  }
+  if (parts[0] === "backend-tasks") {
+    return { name: "backendTasks" };
   }
   if (parts[0] === "datasets" && parts[1]) {
     return { name: "project", projectId: parts[1] };
@@ -145,6 +166,82 @@ function useImageAssetUrls(projectId: string | undefined, images: DatasetImage[]
   return urls;
 }
 
+function useImageAnnotations(projectId: string | undefined, images: DatasetImage[], limit = 12) {
+  const [annotations, setAnnotations] = useState<Record<string, AnnotationObject[]>>({});
+
+  useEffect(() => {
+    if (!projectId || images.length === 0) {
+      setAnnotations({});
+      return;
+    }
+
+    let cancelled = false;
+    Promise.all(
+      images.slice(0, limit).map(async (image) => {
+        try {
+          return [image.id, await getImageAnnotations(projectId, image.id)] as const;
+        } catch {
+          return [image.id, []] as const;
+        }
+      }),
+    ).then((entries) => {
+      if (!cancelled) {
+        setAnnotations(Object.fromEntries(entries));
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, images, limit]);
+
+  return annotations;
+}
+
+function ThumbnailAnnotationOverlay({
+  image,
+  objects,
+}: {
+  image: DatasetImage;
+  objects: AnnotationObject[] | undefined;
+}) {
+  const visibleObjects = (objects ?? []).filter(
+    (object) => (object.type === "bbox" && object.bbox) || (object.type === "polygon" && object.polygon?.length),
+  );
+
+  if (visibleObjects.length === 0) {
+    return null;
+  }
+
+  return (
+    <svg
+      aria-label={`${image.fileName} 标注预览`}
+      className="thumbnail-annotations"
+      preserveAspectRatio="xMidYMid slice"
+      viewBox={`0 0 ${image.width || 640} ${image.height || 480}`}
+    >
+      {visibleObjects.map((object) => object.type === "bbox" && object.bbox ? (
+        <rect
+          aria-label={`${image.fileName} 标注框 ${object.label}`}
+          className="thumbnail-annotation-box"
+          key={object.id}
+          x={object.bbox.x}
+          y={object.bbox.y}
+          width={object.bbox.width}
+          height={object.bbox.height}
+        />
+      ) : object.polygon ? (
+        <polygon
+          aria-label={`${image.fileName} 多边形标注 ${object.label}`}
+          className="thumbnail-annotation-polygon"
+          key={object.id}
+          points={object.polygon.map((point) => `${point.x},${point.y}`).join(" ")}
+        />
+      ) : null)}
+    </svg>
+  );
+}
+
 function normalizeBox(start: { x: number; y: number }, end: { x: number; y: number }) {
   const x = Math.min(start.x, end.x);
   const y = Math.min(start.y, end.y);
@@ -158,6 +255,44 @@ function normalizeBox(start: { x: number; y: number }, end: { x: number; y: numb
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+type ResizeHandle = "nw" | "ne" | "sw" | "se";
+
+function resizeBox(
+  original: NonNullable<AnnotationObject["bbox"]>,
+  dx: number,
+  dy: number,
+  handle: ResizeHandle,
+  imageWidth: number,
+  imageHeight: number,
+) {
+  const minSize = 3;
+  let left = original.x;
+  let top = original.y;
+  let right = original.x + original.width;
+  let bottom = original.y + original.height;
+
+  if (handle.includes("w")) left = clamp(left + dx, 0, right - minSize);
+  if (handle.includes("e")) right = clamp(right + dx, left + minSize, imageWidth);
+  if (handle.includes("n")) top = clamp(top + dy, 0, bottom - minSize);
+  if (handle.includes("s")) bottom = clamp(bottom + dy, top + minSize, imageHeight);
+
+  return {
+    x: Number(left.toFixed(1)),
+    y: Number(top.toFixed(1)),
+    width: Number((right - left).toFixed(1)),
+    height: Number((bottom - top).toFixed(1)),
+  };
+}
+
+function bboxHandles(box: NonNullable<AnnotationObject["bbox"]>) {
+  return [
+    { handle: "nw" as const, x: box.x, y: box.y },
+    { handle: "ne" as const, x: box.x + box.width, y: box.y },
+    { handle: "sw" as const, x: box.x, y: box.y + box.height },
+    { handle: "se" as const, x: box.x + box.width, y: box.y + box.height },
+  ];
 }
 
 function DatasetCard({
@@ -206,10 +341,18 @@ function DatasetCard({
         <span className="quality-chip ready">{dataset.status}</span>
       </div>
       <div className="type-row">
+        {dataset.tags.some((tag) => tag.includes("local-linked")) ? (
+          <span className="type-chip local">本机链接</span>
+        ) : null}
         {dataset.annotationTypes.map((type) => (
           <span className="type-chip" key={type}>
             {type}
           </span>
+        ))}
+      </div>
+      <div className="tag-list compact">
+        {dataset.tags.slice(0, 3).map((tag) => (
+          <span key={tag}>{tag}</span>
         ))}
       </div>
       <div className="metric-grid">
@@ -283,11 +426,13 @@ function BuiltinDatasetPanel({
 }
 
 function TopBar({
+  backendConnection,
   onBackendTasks,
   onCreateDataset,
   onDataSubmit,
   onDatasets,
 }: {
+  backendConnection: BackendConnection;
   onBackendTasks: () => void;
   onCreateDataset: () => void;
   onDataSubmit: () => void;
@@ -319,9 +464,9 @@ function TopBar({
           <Plus size={16} />
           新建数据集
         </button>
-        <span className="sync-state">
-          <CheckCircle2 size={15} />
-          本地数据
+        <span className={`sync-state ${backendConnection.mode}`}>
+          {backendConnection.mode === "unavailable" ? <CircleAlert size={15} /> : <CheckCircle2 size={15} />}
+          {backendConnection.label}
         </span>
         <button aria-label="最小化" type="button" onClick={() => runDesktopCommand("minimize_window")}>
           <Minimize2 size={16} />
@@ -481,13 +626,13 @@ function ProjectInfoDialog({ onClose }: { onClose: () => void }) {
             <X size={16} />
           </button>
         </div>
-        <div className="info-path">data/test_data</div>
+        <div className="info-path">data/workspaces/default</div>
         <section>
           <h3>
             <Tags size={16} />
             数据工程结构
           </h3>
-          {["registry.json", "cache/downloads", "projects/{projectId}/project.json", "annotations/native", "exports"].map((item) => (
+          {["registry.json", "projects/{projectId}/project.json", "assets/original", "assets/thumbnails", "annotations/native", "snapshots", "exports"].map((item) => (
             <div className="detail-row" key={item}>
               <span>{item}</span>
             </div>
@@ -532,13 +677,25 @@ function ProjectInfoDialog({ onClose }: { onClose: () => void }) {
 
 function DataSubmitDialog({
   datasets,
+  projects,
   onCancel,
   onDownload,
+  onImportImages,
+  onImportYolo,
+  onOpenLocal,
 }: {
   datasets: BuiltinDataset[];
+  projects: DatasetProject[];
   onCancel: () => void;
   onDownload: (datasetKey: string) => void;
+  onImportImages: (projectId: string, sourcePath: string) => void;
+  onImportYolo: (projectId: string, sourcePath: string) => void;
+  onOpenLocal: (sourcePath: string, datasetType: string) => void;
 }) {
+  const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
+  const [sourcePath, setSourcePath] = useState("");
+  const [localDatasetType, setLocalDatasetType] = useState<"voc-detect" | "yolo-detect">("voc-detect");
+
   return (
     <div className="modal-backdrop">
       <section aria-labelledby="data-submit-title" className="dataset-dialog data-submit-dialog" role="dialog">
@@ -553,23 +710,61 @@ function DataSubmitDialog({
         </div>
         <div className="submit-options">
           <article className="submit-option">
+            <FolderKanban size={18} />
+            <div>
+              <h3>打开本机标注目录</h3>
+              <p>不复制图片，直接索引本机 VOC / YOLO BBox 目录，保存时原地写回 XML 或 TXT。</p>
+            </div>
+            <button type="button" onClick={() => onOpenLocal(sourcePath, localDatasetType)} disabled={!sourcePath.trim()}>
+              打开本机数据集
+            </button>
+          </article>
+          <article className="submit-option">
             <Upload size={18} />
             <div>
               <h3>本地图片或目录</h3>
-              <p>用于后续接入目录选择、批量图片导入和格式识别。</p>
+              <p>输入本机图片目录路径，后端会复制、索引并生成可标注图片列表。</p>
             </div>
-            <button type="button" disabled>
-              待接入
+            <button type="button" onClick={() => onImportImages(projectId, sourcePath)} disabled={!projectId || !sourcePath.trim()}>
+              导入图片目录
             </button>
           </article>
           <article className="submit-option">
             <Database size={18} />
             <div>
-              <h3>新建空数据集</h3>
-              <p>需要先定义数据集类型，再导入真实图片。</p>
+              <h3>YOLO 数据集目录</h3>
+              <p>导入包含 images/labels 的 YOLO 检测或分割数据集。</p>
             </div>
-            <span>使用顶部新建</span>
+            <button type="button" onClick={() => onImportYolo(projectId, sourcePath)} disabled={!projectId || !sourcePath.trim()}>
+              导入 YOLO 数据集
+            </button>
           </article>
+        </div>
+        <div className="submit-path-form">
+          <label>
+            <span>目录类型</span>
+            <select value={localDatasetType} onChange={(event) => setLocalDatasetType(event.target.value as "voc-detect" | "yolo-detect")}>
+              <option value="voc-detect">Pascal VOC BBox XML</option>
+              <option value="yolo-detect">YOLO BBox TXT</option>
+            </select>
+          </label>
+          <label>
+            <span>目标项目</span>
+            <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
+              <option value="">请选择项目</option>
+              {projects.map((project) => (
+                <option key={project.id} value={project.id}>{project.name}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>本地路径</span>
+            <input
+              placeholder="例如 F:\\datasets\\my-yolo-dataset"
+              value={sourcePath}
+              onChange={(event) => setSourcePath(event.target.value)}
+            />
+          </label>
         </div>
         <BuiltinDatasetPanel datasets={datasets} onDownload={onDownload} />
       </section>
@@ -682,6 +877,7 @@ function BackendTaskTray({
   onClearCompleted,
   onClose,
   onRefresh,
+  variant = "overlay",
 }: {
   tasks: BackendTask[];
   state: "idle" | "loading" | "error";
@@ -689,57 +885,66 @@ function BackendTaskTray({
   onClearCompleted: () => void;
   onClose: () => void;
   onRefresh: () => void;
+  variant?: "overlay" | "window";
 }) {
+  const content = (
+    <aside aria-label="后端任务托盘" className={`backend-task-tray ${variant}`} role="complementary">
+      <div className="task-tray-header">
+        <div>
+          <span className="eyebrow">Rust 后端</span>
+          <h2>后端任务</h2>
+        </div>
+        <button aria-label="关闭后端任务托盘" type="button" onClick={onClose}>
+          <X size={16} />
+        </button>
+      </div>
+      <div className="task-tray-actions">
+        <button type="button" onClick={onRefresh}>
+          刷新
+        </button>
+        <button type="button" onClick={onClearCompleted}>
+          清理已完成
+        </button>
+      </div>
+      {state === "loading" ? (
+        <div className="task-empty">正在读取后端任务...</div>
+      ) : state === "error" ? (
+        <div className="task-empty error">{message ?? "后端未连接"}</div>
+      ) : tasks.length === 0 ? (
+        <div className="task-empty">暂无后端任务</div>
+      ) : (
+        <div className="backend-task-list">
+          {tasks.map((task) => (
+            <article className={`backend-task-card ${task.status}`} key={task.id}>
+              <div className="task-card-title">
+                <div>
+                  <h3>{task.title}</h3>
+                  <span>{task.kind}</span>
+                </div>
+                <strong>{task.status}</strong>
+              </div>
+              <p>{task.message}</p>
+              <div className="progress-bar" aria-label={`${task.progress}%`}>
+                <span style={{ width: `${task.progress}%` }} />
+              </div>
+              <div className="task-card-meta">
+                <span>ID: {task.id}</span>
+                <span>{task.finishedAt ? "已结束" : "进行中"}</span>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </aside>
+  );
+
+  if (variant === "window") {
+    return <div className="task-window-shell">{content}</div>;
+  }
+
   return (
     <div className="task-tray-backdrop">
-      <aside aria-label="后端任务托盘" className="backend-task-tray" role="complementary">
-        <div className="task-tray-header">
-          <div>
-            <span className="eyebrow">Rust 后端</span>
-            <h2>后端任务</h2>
-          </div>
-          <button aria-label="关闭后端任务托盘" type="button" onClick={onClose}>
-            <X size={16} />
-          </button>
-        </div>
-        <div className="task-tray-actions">
-          <button type="button" onClick={onRefresh}>
-            刷新
-          </button>
-          <button type="button" onClick={onClearCompleted}>
-            清理已完成
-          </button>
-        </div>
-        {state === "loading" ? (
-          <div className="task-empty">正在读取后端任务...</div>
-        ) : state === "error" ? (
-          <div className="task-empty error">{message ?? "后端未连接"}</div>
-        ) : tasks.length === 0 ? (
-          <div className="task-empty">暂无后端任务</div>
-        ) : (
-          <div className="backend-task-list">
-            {tasks.map((task) => (
-              <article className={`backend-task-card ${task.status}`} key={task.id}>
-                <div className="task-card-title">
-                  <div>
-                    <h3>{task.title}</h3>
-                    <span>{task.kind}</span>
-                  </div>
-                  <strong>{task.status}</strong>
-                </div>
-                <p>{task.message}</p>
-                <div className="progress-bar" aria-label={`${task.progress}%`}>
-                  <span style={{ width: `${task.progress}%` }} />
-                </div>
-                <div className="task-card-meta">
-                  <span>ID: {task.id}</span>
-                  <span>{task.finishedAt ? "已结束" : "进行中"}</span>
-                </div>
-              </article>
-            ))}
-          </div>
-        )}
-      </aside>
+      {content}
     </div>
   );
 }
@@ -753,27 +958,69 @@ function ProjectWorkspace({
 }) {
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [images, setImages] = useState<DatasetImage[]>([]);
+  const [snapshots, setSnapshots] = useState<DatasetSnapshot[]>([]);
+  const [exports, setExports] = useState<DatasetExport[]>([]);
+  const [workflowMessage, setWorkflowMessage] = useState<string | null>(null);
   const [tab, setTab] = useState<ProjectTab>("概览");
+  const [imagePage, setImagePage] = useState(0);
   const [loadError, setLoadError] = useState<{ title: string; message: string } | null>(null);
-  const imageUrls = useImageAssetUrls(projectId, images, 36);
+  const imageUrls = useImageAssetUrls(projectId, images, images.length);
+  const imageAnnotations = useImageAnnotations(projectId, images, images.length);
+
+  useEffect(() => {
+    setImagePage(0);
+  }, [projectId]);
 
   useEffect(() => {
     setLoadError(null);
-    Promise.all([getProjectDetail(projectId), listProjectImages(projectId)])
-      .then(([nextDetail, nextImages]) => {
+    Promise.all([
+      getProjectDetail(projectId),
+      listProjectImages(projectId, undefined, {
+        offset: imagePage * projectImagePageSize,
+        limit: projectImagePageSize,
+      }),
+      listSnapshots(projectId).catch(() => []),
+      listExports(projectId).catch(() => []),
+    ])
+      .then(([nextDetail, nextImages, nextSnapshots, nextExports]) => {
         setDetail(nextDetail);
         setImages(nextImages);
+        setSnapshots(nextSnapshots);
+        setExports(nextExports);
       })
       .catch((error) => {
         setDetail(null);
         setImages([]);
+        setSnapshots([]);
+        setExports([]);
         setLoadError(
           isBackendUnavailableError(error)
             ? { title: "后端未连接", message: "请在 Tauri 桌面环境启动应用。" }
             : { title: "数据集未初始化", message: error instanceof Error ? error.message : String(error) },
         );
       });
-  }, [projectId]);
+  }, [projectId, imagePage]);
+
+  async function handleCreateSnapshot() {
+    if (!detail) return;
+    const snapshot = await createDatasetSnapshot(
+      projectId,
+      `${detail.project.name} 快照 ${snapshots.length + 1}`,
+    );
+    setSnapshots((current) => [snapshot, ...current]);
+    setWorkflowMessage(`已创建快照 ${snapshot.name}`);
+  }
+
+  async function handleExport(format: "yolo" | "coco") {
+    const snapshotId = snapshots[0]?.id;
+    if (!snapshotId) {
+      setWorkflowMessage("请先创建快照，再执行导出。");
+      return;
+    }
+    const nextExport = await exportDataset(projectId, snapshotId, format);
+    setExports((current) => [nextExport, ...current]);
+    setWorkflowMessage(`已导出 ${format.toUpperCase()} 数据包`);
+  }
 
   if (loadError) {
     return (
@@ -792,56 +1039,51 @@ function ProjectWorkspace({
   return (
     <main className="project-page">
       <section className="project-main">
-        <div className="project-header">
-          <div>
-            <button className="text-button" type="button" onClick={() => navigate("#/datasets")}>
-              数据集
-            </button>
-            <h1>{detail.project.name}</h1>
-            <p>{detail.project.description}</p>
+        <div className="project-sticky-header">
+          <div className="project-header">
+            <div>
+              <button className="text-button" type="button" onClick={() => navigate("#/datasets")}>
+                数据集
+              </button>
+              <h1>{detail.project.name}</h1>
+              <p>{detail.project.description}</p>
+            </div>
+            <div className="project-actions">
+              <button type="button" onClick={() => navigate(`#/annotate/${detail.project.id}/${images[0]?.id ?? ""}`)}>
+                <Play size={16} />
+                开始标注
+              </button>
+              <button type="button" onClick={() => onOpenWindow(detail.project)}>
+                <Layers3 size={16} />
+                独立窗口标注
+              </button>
+              <button className="primary" type="button">
+                <Download size={16} />
+                导出数据集
+              </button>
+            </div>
           </div>
-          <div className="project-actions">
-            <button type="button" onClick={() => navigate(`#/annotate/${detail.project.id}/${images[0]?.id ?? ""}`)}>
-              <Play size={16} />
-              开始标注
-            </button>
-            <button type="button" onClick={() => onOpenWindow(detail.project)}>
-              <Layers3 size={16} />
-              独立窗口标注
-            </button>
-            <button className="primary" type="button">
-              <Download size={16} />
-              导出数据集
-            </button>
+          <div className="project-tabs" aria-label="项目页面">
+            {projectTabs.map((item) => (
+              <button aria-pressed={item === tab} className={item === tab ? "active" : ""} key={item} onClick={() => setTab(item)} type="button">
+                {item}
+              </button>
+            ))}
           </div>
         </div>
-        <div className="project-tabs" aria-label="项目页面">
-          {projectTabs.map((item) => (
-            <button aria-pressed={item === tab} className={item === tab ? "active" : ""} key={item} onClick={() => setTab(item)} type="button">
-              {item}
-            </button>
-          ))}
-        </div>
-        <section className="project-surface">{renderProjectTab(tab, detail, images, imageUrls)}</section>
-      </section>
-      <aside className="detail-panel project-side" aria-label="Project details">
-        <span className="eyebrow">项目运行时</span>
-        <h2>Rust 后端</h2>
-        <div className="backend-flow">
-          {["Command API", "Project FS", "YOLO Importer", "Annotation Store"].map((layer) => (
-            <div key={layer}>{layer}</div>
-          ))}
-        </div>
-        <section>
-          <h3>
-            <Database size={16} />
-            存储方案
-          </h3>
-          <p className="side-copy">
-            SQLite 保存项目索引，图片保留在 data/test_data/projects 下，编辑后的标注写入 annotations/native。
-          </p>
+        <section className="project-surface">
+          {renderProjectTab(tab, detail, images, imageUrls, imageAnnotations, {
+            exports,
+            imagePage,
+            imagePageSize: projectImagePageSize,
+            snapshots,
+            workflowMessage,
+            onCreateSnapshot: handleCreateSnapshot,
+            onExport: handleExport,
+            onImagePageChange: setImagePage,
+          })}
         </section>
-      </aside>
+      </section>
     </main>
   );
 }
@@ -851,6 +1093,17 @@ function renderProjectTab(
   detail: ProjectDetail,
   images: DatasetImage[],
   imageUrls: Record<string, string>,
+  imageAnnotations: Record<string, AnnotationObject[]>,
+  workflow: {
+    snapshots: DatasetSnapshot[];
+    exports: DatasetExport[];
+    imagePage: number;
+    imagePageSize: number;
+    workflowMessage: string | null;
+    onCreateSnapshot: () => void;
+    onExport: (format: "yolo" | "coco") => void;
+    onImagePageChange: (page: number) => void;
+  },
 ) {
   switch (tab) {
     case "数据分组":
@@ -888,12 +1141,41 @@ function renderProjectTab(
     case "图片":
       return (
         <div>
-          <h2>图片浏览</h2>
+          <div className="tab-header-row">
+            <h2>图片浏览</h2>
+            <div className="pager-actions">
+              <span>
+                第 {workflow.imagePage + 1} 页 / {formatNumber(detail.project.imageCount)} 张
+              </span>
+              <button type="button" onClick={() => workflow.onImagePageChange(Math.max(0, workflow.imagePage - 1))} disabled={workflow.imagePage === 0}>
+                上一页
+              </button>
+              <button
+                type="button"
+                onClick={() => workflow.onImagePageChange(workflow.imagePage + 1)}
+                disabled={(workflow.imagePage + 1) * workflow.imagePageSize >= detail.project.imageCount}
+              >
+                下一页
+              </button>
+            </div>
+          </div>
           <div className="image-grid">
-            {images.slice(0, 24).map((image) => (
-              <div className="image-tile" key={image.id}>
+            {images.map((image) => (
+              <div
+                className="image-tile"
+                key={image.id}
+                onDoubleClick={() => navigate(`#/annotate/${detail.project.id}/${image.id}`)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") navigate(`#/annotate/${detail.project.id}/${image.id}`);
+                }}
+              >
                 <div className="sample-thumb traffic-a">
-                  {imageUrls[image.id] ? <img alt={image.fileName} src={imageUrls[image.id]} /> : null}
+                  {imageUrls[image.id] ? (
+                    <img alt={image.fileName} decoding="async" loading="lazy" src={imageUrls[image.id]} />
+                  ) : null}
+                  <ThumbnailAnnotationOverlay image={image} objects={imageAnnotations[image.id]} />
                 </div>
                 <span>{image.fileName}</span>
                 <em>{image.status}</em>
@@ -950,31 +1232,44 @@ function renderProjectTab(
       return (
         <div>
           <h2>导出预设</h2>
-          {detail.exportPresets.length === 0 ? <p>暂无导出预设</p> : (
+          <div className="action-row">
+            <button type="button" onClick={() => workflow.onExport("yolo")}>导出 YOLO</button>
+            <button type="button" onClick={() => workflow.onExport("coco")}>导出 COCO</button>
+          </div>
+          {workflow.workflowMessage ? <p className="workflow-message">{workflow.workflowMessage}</p> : null}
+          {workflow.exports.length === 0 ? <p>暂无导出记录</p> : (
             <div className="export-grid">
-              {detail.exportPresets.map((preset) => (
-                <article className="export-card" key={preset.name}>
-                  <h3>{preset.name}</h3>
-                  <p>{preset.format}</p>
-                  <span>{preset.scope}</span>
-                  <strong>{preset.status}</strong>
+              {workflow.exports.map((item) => (
+                <article className="export-card" key={item.id}>
+                  <h3>{item.format.toUpperCase()}</h3>
+                  <p>{item.outputPath}</p>
+                  <span>{item.snapshotId}</span>
+                  <strong>{item.status}</strong>
                 </article>
               ))}
             </div>
           )}
         </div>
       );
-    case "后端":
+    case "快照":
       return (
         <div>
-          <h2>Rust 后端设计</h2>
-          <div className="backend-diagram">
-            <div>React 界面</div>
-            <div>Tauri 命令 API</div>
-            <div>Project FS</div>
-            <div>YOLO Importer</div>
-            <div>SQLite + JSON</div>
+          <div className="tab-header-row">
+            <h2>数据集快照</h2>
+            <button type="button" onClick={workflow.onCreateSnapshot}>创建快照</button>
           </div>
+          {workflow.workflowMessage ? <p className="workflow-message">{workflow.workflowMessage}</p> : null}
+          {workflow.snapshots.length === 0 ? <p>暂无快照</p> : (
+            <div className="data-table">
+              {workflow.snapshots.map((snapshot) => (
+                <div className="table-row" key={snapshot.id}>
+                  <strong>{snapshot.name}</strong>
+                  <span>{snapshot.imageCount} 张图片</span>
+                  <span>{snapshot.createdAt}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       );
     default:
@@ -1001,11 +1296,18 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
   const [activeImageId, setActiveImageId] = useState(imageId ?? "");
   const [assetUrl, setAssetUrl] = useState("");
   const [objects, setObjects] = useState<AnnotationObject[]>([]);
+  const [revision, setRevision] = useState<string | null>(null);
+  const [annotationStatus, setAnnotationStatus] = useState("加载中");
+  const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const [saveAndNext, setSaveAndNext] = useState(false);
   const [mode, setMode] = useState<ToolMode>("select");
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
   const [draftBox, setDraftBox] = useState<{ start: { x: number; y: number }; end: { x: number; y: number } } | null>(null);
   const [dragState, setDragState] = useState<{
     objectId: string;
+    kind: "move" | "resize";
+    handle?: "nw" | "ne" | "sw" | "se";
     start: { x: number; y: number };
     original: NonNullable<AnnotationObject["bbox"]>;
   } | null>(null);
@@ -1016,7 +1318,7 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
   useEffect(() => {
     setImagesLoaded(false);
     setLoadError(null);
-    listProjectImages(projectId)
+    listProjectImages(projectId, undefined, { offset: 0, limit: annotationImagePageSize })
       .then((items) => {
         setImages(items);
         setImagesLoaded(true);
@@ -1046,21 +1348,80 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
           message: error instanceof Error ? error.message : String(error),
         });
       });
-    getImageAnnotations(projectId, nextImageId)
-      .then((items) => {
-        setObjects(items);
-        setSelectedObjectId(items[0]?.id ?? null);
+    getImageAnnotationState(projectId, nextImageId)
+      .then((state) => {
+        setObjects(state.objects);
+        setRevision(state.revision);
+        setAnnotationStatus(state.status);
+        setSaveMessage(null);
+        setDirty(false);
+        setSelectedObjectId(state.objects[0]?.id ?? null);
       })
       .catch(() => {
         setObjects([]);
+        setRevision(null);
+        setAnnotationStatus("未标注");
+        setDirty(false);
         setSelectedObjectId(null);
       });
   }, [projectId, activeImageId, imageId]);
 
-  async function save() {
+  useEffect(() => {
+    function handleBeforeUnload(event: BeforeUnloadEvent) {
+      if (!dirty) return;
+      event.preventDefault();
+      event.returnValue = "";
+    }
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [dirty]);
+
+  async function save(options: { next?: boolean } = {}) {
     const targetImageId = activeImageId || imageId;
     if (!targetImageId) return;
-    await saveImageAnnotations(projectId, targetImageId, objects);
+    const result = await saveImageAnnotations(projectId, targetImageId, revision, objects);
+    setRevision(result.revision);
+    setAnnotationStatus("草稿");
+    setDirty(false);
+    setSaveMessage(`已保存并写回标注文件 ${result.savedAt}`);
+    if (options.next || saveAndNext) {
+      goToImage(1);
+    }
+  }
+
+  async function submit() {
+    const targetImageId = activeImageId || imageId;
+    if (!targetImageId) return;
+    await submitImageAnnotations(projectId, targetImageId);
+    setAnnotationStatus("待质检");
+    setSaveMessage("已提交质检");
+  }
+
+  useEffect(() => {
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === "Delete" || event.key === "Backspace") {
+        deleteSelectedObject();
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "d") {
+        event.preventDefault();
+        duplicateSelectedObject();
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        void save();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [selectedObjectId, objects, revision, activeImageId, imageId]);
+
+  function goToImage(offset: number) {
+    if (!activeImage) return;
+    if (dirty && !window.confirm("当前标注尚未保存，是否继续切换图片？")) return;
+    const index = images.findIndex((image) => image.id === activeImage.id);
+    const next = images[index + offset];
+    if (next) setActiveImageId(next.id);
   }
 
   if (loadError) {
@@ -1144,9 +1505,16 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
     if (dragState) {
       const dx = point.x - dragState.start.x;
       const dy = point.y - dragState.start.y;
+      setDirty(true);
       setObjects((current) =>
         current.map((object) => {
           if (object.id !== dragState.objectId || !object.bbox || !activeImage) return object;
+          if (dragState.kind === "resize" && dragState.handle) {
+            return {
+              ...object,
+              bbox: resizeBox(dragState.original, dx, dy, dragState.handle, activeImage.width, activeImage.height),
+            };
+          }
           return {
             ...object,
             bbox: {
@@ -1174,6 +1542,7 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
           attributes: { source: "manual" },
         };
         setObjects((current) => [...current, object]);
+        setDirty(true);
         setSelectedObjectId(object.id);
       }
     }
@@ -1195,6 +1564,35 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
     const { clientX, clientY } = eventClientPosition(event);
     setDragState({
       objectId: object.id,
+      kind: "move",
+      start: {
+        x: clamp(((clientX - (rect?.left ?? 0)) / rectWidth) * width, 0, width),
+        y: clamp(((clientY - (rect?.top ?? 0)) / rectHeight) * height, 0, height),
+      },
+      original: object.bbox,
+    });
+  }
+
+  function beginObjectResize(
+    event: MouseEvent<SVGRectElement>,
+    object: AnnotationObject,
+    handle: "nw" | "ne" | "sw" | "se",
+  ) {
+    if (!object.bbox) return;
+    event.stopPropagation();
+    setMode("select");
+    setSelectedObjectId(object.id);
+    const ownerSvg = event.currentTarget.ownerSVGElement;
+    const width = activeImage?.width || 640;
+    const height = activeImage?.height || 480;
+    const rect = ownerSvg?.getBoundingClientRect();
+    const rectWidth = rect?.width || width;
+    const rectHeight = rect?.height || height;
+    const { clientX, clientY } = eventClientPosition(event);
+    setDragState({
+      objectId: object.id,
+      kind: "resize",
+      handle,
       start: {
         x: clamp(((clientX - (rect?.left ?? 0)) / rectWidth) * width, 0, width),
         y: clamp(((clientY - (rect?.top ?? 0)) / rectHeight) * height, 0, height),
@@ -1205,6 +1603,7 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
 
   function updateSelectedLabel(label: string) {
     if (!selectedObjectId) return;
+    setDirty(true);
     setObjects((current) =>
       current.map((object) => (object.id === selectedObjectId ? { ...object, label } : object)),
     );
@@ -1215,6 +1614,7 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
     const value = Number(rawValue);
     if (!Number.isFinite(value)) return;
 
+    setDirty(true);
     setObjects((current) =>
       current.map((object) => {
         if (object.id !== selectedObjectId || !object.bbox) return object;
@@ -1244,8 +1644,32 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
 
   function deleteSelectedObject() {
     if (!selectedObjectId) return;
+    setDirty(true);
     setObjects((current) => current.filter((object) => object.id !== selectedObjectId));
     setSelectedObjectId(null);
+  }
+
+  function duplicateSelectedObject() {
+    if (!selectedObject) return;
+    const duplicate: AnnotationObject = {
+      ...selectedObject,
+      id: `ann-${Date.now()}`,
+      bbox: selectedObject.bbox
+        ? {
+            ...selectedObject.bbox,
+            x: activeImage ? clamp(selectedObject.bbox.x + 8, 0, activeImage.width - selectedObject.bbox.width) : selectedObject.bbox.x + 8,
+            y: activeImage ? clamp(selectedObject.bbox.y + 8, 0, activeImage.height - selectedObject.bbox.height) : selectedObject.bbox.y + 8,
+          }
+        : undefined,
+      polygon: selectedObject.polygon?.map((point) => ({
+        x: activeImage ? clamp(point.x + 8, 0, activeImage.width) : point.x + 8,
+        y: activeImage ? clamp(point.y + 8, 0, activeImage.height) : point.y + 8,
+      })),
+      attributes: { ...selectedObject.attributes, source: "copy" },
+    };
+    setObjects((current) => [...current, duplicate]);
+    setSelectedObjectId(duplicate.id);
+    setDirty(true);
   }
 
   return (
@@ -1278,12 +1702,33 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
         <div className="annotation-toolbar">
           <div>
             <h1>标注工作台</h1>
-            <span>{projectId} / {activeImage?.fileName ?? "加载图片"}</span>
+            <span>{projectId} / {activeImage?.fileName ?? "加载图片"} / {annotationStatus}</span>
           </div>
-          <button type="button" onClick={save}>
-            <Save size={16} />
-            保存标注
-          </button>
+          <div className="annotation-actions">
+            {saveMessage ? <span>{saveMessage}</span> : null}
+            {dirty ? <span className="dirty-state">未保存</span> : null}
+            <label className="inline-toggle">
+              <input type="checkbox" checked={saveAndNext} onChange={(event) => setSaveAndNext(event.target.checked)} />
+              保存后下一张
+            </label>
+            <button type="button" onClick={() => goToImage(-1)} disabled={!activeImage || images.findIndex((image) => image.id === activeImage.id) <= 0}>
+              上一张
+            </button>
+            <button type="button" onClick={() => goToImage(1)} disabled={!activeImage || images.findIndex((image) => image.id === activeImage.id) >= images.length - 1}>
+              下一张
+            </button>
+            <button type="button" onClick={submit}>
+              <ClipboardCheck size={16} />
+              提交质检
+            </button>
+            <button type="button" onClick={() => save()}>
+              <Save size={16} />
+              保存标注
+            </button>
+            <button type="button" onClick={() => save({ next: true })}>
+              保存并下一张
+            </button>
+          </div>
         </div>
         <div className="image-stage">
           <div
@@ -1312,6 +1757,22 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
                     height={object.bbox.height}
                   />
                   <text x={object.bbox.x + 4} y={Math.max(14, object.bbox.y - 4)}>{object.label}</text>
+                  {object.id === selectedObjectId ? (
+                    <>
+                      {bboxHandles(object.bbox).map((handle) => (
+                        <rect
+                          aria-label={`${handle.handle} resize`}
+                          className="annotation-handle"
+                          key={handle.handle}
+                          onMouseDown={(event) => beginObjectResize(event, object, handle.handle)}
+                          x={handle.x - 4}
+                          y={handle.y - 4}
+                          width={8}
+                          height={8}
+                        />
+                      ))}
+                    </>
+                  ) : null}
                 </g>
               ) : object.polygon ? (
                 <polygon className="annotation-polygon" key={object.id} points={object.polygon.map((point) => `${point.x},${point.y}`).join(" ")} />
@@ -1393,6 +1854,9 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
           </div>
         ) : null}
         <div className="inspector-actions">
+          <button type="button" onClick={duplicateSelectedObject} disabled={!selectedObjectId}>
+            复制对象
+          </button>
           <button type="button" onClick={deleteSelectedObject} disabled={!selectedObjectId}>
             删除对象
           </button>
@@ -1421,6 +1885,11 @@ export default function App() {
   const [backendTasks, setBackendTasks] = useState<BackendTask[]>([]);
   const [taskTrayState, setTaskTrayState] = useState<"idle" | "loading" | "error">("idle");
   const [taskTrayMessage, setTaskTrayMessage] = useState<string | null>(null);
+  const [backendConnection, setBackendConnection] = useState<BackendConnection>({
+    mode: "checking",
+    label: "连接中",
+    health: null,
+  });
 
   useEffect(() => {
     const onHashChange = () => setRoute(parseRoute());
@@ -1431,6 +1900,24 @@ export default function App() {
   useEffect(() => {
     refreshDatasets({ autoDownload: true });
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    detectBackendConnection().then((connection) => {
+      if (!cancelled) {
+        setBackendConnection(connection);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (route.name === "backendTasks") {
+      loadBackendTasks();
+    }
+  }, [route.name]);
 
   async function refreshDatasets(options: { autoDownload: boolean }) {
     setRuntimeMessage(null);
@@ -1453,7 +1940,10 @@ export default function App() {
       const imageEntries = await Promise.all(
         currentProjects.map(async (project) => [
           project.id,
-          await listProjectImages(project.id),
+          await listProjectImages(project.id, undefined, {
+            offset: 0,
+            limit: datasetPreviewLimit,
+          }),
         ] as const),
       );
       setBuiltinDatasets(builtin);
@@ -1494,13 +1984,31 @@ export default function App() {
     await handleDownload(datasetKey);
   }
 
+  async function handleImportImages(projectId: string, sourcePath: string) {
+    await importImages(projectId, sourcePath);
+    setDataSubmitOpen(false);
+    await refreshDatasets({ autoDownload: false });
+  }
+
+  async function handleImportYolo(projectId: string, sourcePath: string) {
+    await importYoloDataset(projectId, sourcePath);
+    setDataSubmitOpen(false);
+    await refreshDatasets({ autoDownload: false });
+  }
+
+  async function handleOpenLocalDataset(sourcePath: string, datasetType: string) {
+    await openLocalDataset(sourcePath, datasetType);
+    setDataSubmitOpen(false);
+    await refreshDatasets({ autoDownload: false });
+  }
+
   async function annotateProject(project: DatasetProject) {
-    const images = await listProjectImages(project.id);
+    const images = await listProjectImages(project.id, undefined, { offset: 0, limit: 1 });
     navigate(`#/annotate/${project.id}/${images[0]?.id ?? ""}`);
   }
 
   async function openProjectWindow(project: DatasetProject) {
-    const images = await listProjectImages(project.id);
+    const images = await listProjectImages(project.id, undefined, { offset: 0, limit: 1 });
     await openAnnotationWindow(project.id, images[0]?.id);
   }
 
@@ -1531,8 +2039,20 @@ export default function App() {
   }
 
   async function openBackendTasks() {
-    setTaskTrayOpen(true);
-    await loadBackendTasks();
+    try {
+      await openBackendTaskTray();
+    } catch (error) {
+      setTaskTrayOpen(true);
+      setTaskTrayState(isBackendUnavailableError(error) ? "error" : "loading");
+      setTaskTrayMessage(
+        isBackendUnavailableError(error)
+          ? "后端未连接，请在 Tauri 桌面环境启动应用。"
+          : null,
+      );
+      if (!isBackendUnavailableError(error)) {
+        await loadBackendTasks();
+      }
+    }
   }
 
   async function clearCompletedTasks() {
@@ -1551,9 +2071,24 @@ export default function App() {
     }
   }
 
+  if (route.name === "backendTasks") {
+    return (
+      <BackendTaskTray
+        message={taskTrayMessage}
+        onClearCompleted={clearCompletedTasks}
+        onClose={() => runDesktopCommand("close_window")}
+        onRefresh={loadBackendTasks}
+        state={taskTrayState}
+        tasks={backendTasks}
+        variant="window"
+      />
+    );
+  }
+
   return (
     <div className="app-shell">
       <TopBar
+        backendConnection={backendConnection}
         onBackendTasks={openBackendTasks}
         onCreateDataset={() => setCreateDialogOpen(true)}
         onDataSubmit={() => setDataSubmitOpen(true)}
@@ -1587,8 +2122,12 @@ export default function App() {
       {dataSubmitOpen ? (
         <DataSubmitDialog
           datasets={builtinDatasets}
+          projects={projects}
           onCancel={() => setDataSubmitOpen(false)}
           onDownload={handleSubmitDownload}
+          onImportImages={handleImportImages}
+          onImportYolo={handleImportYolo}
+          onOpenLocal={handleOpenLocalDataset}
         />
       ) : null}
       {projectInfoOpen ? <ProjectInfoDialog onClose={() => setProjectInfoOpen(false)} /> : null}

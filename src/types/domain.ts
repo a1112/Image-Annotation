@@ -1,4 +1,4 @@
-export type DatasetFormat = "yolo-detect" | "yolo-seg";
+export type DatasetFormat = "yolo-detect" | "yolo-seg" | "voc-detect";
 
 export type BuiltinDataset = {
   key: string;
@@ -52,6 +52,8 @@ export type DatasetImage = {
   height: number;
   split: string;
   status: string;
+  qaStatus: string;
+  reviewNote: string | null;
   tags: string[];
 };
 
@@ -75,6 +77,63 @@ export type AnnotationObject = {
   bbox?: BBox;
   polygon?: Point[];
   attributes: Record<string, string | number | boolean>;
+};
+
+export type AnnotationState = {
+  imageId: string;
+  revision: string | null;
+  objects: AnnotationObject[];
+  status: string;
+  updatedAt: string | null;
+};
+
+export type AnnotationSaveResult = {
+  revision: string;
+  savedAt: string;
+  auditEventId: string;
+};
+
+export type AnnotationVersion = {
+  id: string;
+  imageId: string;
+  revision: string;
+  objects: AnnotationObject[];
+  createdAt: string;
+};
+
+export type AnnotationTask = {
+  id: string;
+  name: string;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type TaskItem = {
+  id: string;
+  taskId: string;
+  imageId: string;
+  status: string;
+  qaStatus: string;
+  reviewNote: string | null;
+  lockedAt: string | null;
+};
+
+export type DatasetSnapshot = {
+  id: string;
+  name: string;
+  imageCount: number;
+  manifestPath: string;
+  createdAt: string;
+};
+
+export type DatasetExport = {
+  id: string;
+  snapshotId: string;
+  format: string;
+  status: string;
+  outputPath: string;
+  createdAt: string;
 };
 
 export type TagGroup = {

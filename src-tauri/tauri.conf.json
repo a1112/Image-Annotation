@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.imageannotation.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm exec vite -- --host 127.0.0.1 --port 1440",
     "devUrl": "http://localhost:1440",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
@@ -35,7 +35,7 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["../data/test_data/**"]
+        "scope": ["../data/test_data/**", "../data/workspaces/**", "**"]
       }
     }
   },

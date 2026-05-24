@@ -1,7 +1,7 @@
-use crate::{importers::yolo, project_fs, storage};
+use crate::{importers::{voc, yolo}, project_fs, storage};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use serde_json::{json, Value};
+use std::{collections::BTreeMap, fs, path::{Path, PathBuf}};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +30,8 @@ pub struct DatasetImage {
     pub height: u32,
     pub split: String,
     pub status: String,
+    pub qa_status: String,
+    pub review_note: Option<String>,
     pub tags: Vec<String>,
 }
 
@@ -139,6 +141,77 @@ pub struct ExportPreset {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AnnotationState {
+    pub image_id: String,
+    pub revision: Option<String>,
+    pub objects: Vec<AnnotationObject>,
+    pub status: String,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotationSaveResult {
+    pub revision: String,
+    pub saved_at: String,
+    pub audit_event_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotationVersion {
+    pub id: String,
+    pub image_id: String,
+    pub revision: String,
+    pub objects: Vec<AnnotationObject>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotationTask {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskItem {
+    pub id: String,
+    pub task_id: String,
+    pub image_id: String,
+    pub status: String,
+    pub qa_status: String,
+    pub review_note: Option<String>,
+    pub locked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetSnapshot {
+    pub id: String,
+    pub name: String,
+    pub image_count: u32,
+    pub manifest_path: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetExport {
+    pub id: String,
+    pub snapshot_id: String,
+    pub format: String,
+    pub status: String,
+    pub output_path: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectDetail {
     pub project: DatasetProject,
     pub tag_groups: Vec<TagGroup>,
@@ -222,6 +295,23 @@ impl SampleRepository {
                     .unwrap_or_else(|| manifest.clone());
                 let indexed_images = storage::read_images(&paths.sqlite, None).unwrap_or_default();
                 let indexed_classes = storage::read_classes(&paths.sqlite).unwrap_or_default();
+                let image_count = if indexed_images.is_empty() {
+                    indexed_manifest.image_count
+                } else {
+                    indexed_images.len() as u32
+                };
+                let annotated_count = indexed_images
+                    .iter()
+                    .filter(|image| image.status != "未标注" && image.status != "草稿")
+                    .count() as u32;
+                let review_count = indexed_images
+                    .iter()
+                    .filter(|image| image.qa_status == "待质检")
+                    .count() as u32;
+                let issue_count = indexed_images
+                    .iter()
+                    .filter(|image| image.qa_status == "驳回")
+                    .count() as u32;
                 let annotation_types = if indexed_manifest.format == "yolo-seg" {
                     vec!["Polygon".to_string(), "BBox".to_string()]
                 } else {
@@ -232,18 +322,14 @@ impl SampleRepository {
                     name: indexed_manifest.name.clone(),
                     description: format!("真实 {} 测试数据集", indexed_manifest.source_dataset_key),
                     annotation_types,
-                    image_count: if indexed_images.is_empty() {
-                        indexed_manifest.image_count
-                    } else {
-                        indexed_images.len() as u32
-                    },
-                    annotated_percent: if indexed_manifest.image_count > 0 {
-                        100
+                    image_count,
+                    annotated_percent: if image_count > 0 {
+                        ((annotated_count * 100) / image_count) as u8
                     } else {
                         0
                     },
-                    review_count: 0,
-                    issue_count: 0,
+                    review_count,
+                    issue_count,
                     class_count: if indexed_classes.is_empty() {
                         indexed_manifest.class_count as u16
                     } else {
@@ -275,6 +361,36 @@ impl SampleRepository {
         let labels = coco_labels();
         let stored_classes = storage::read_classes(&project_fs::project_paths(project_id).sqlite)
             .unwrap_or_default();
+        let paths = project_fs::project_paths(project_id);
+        let task_summaries = storage::list_task_records(&paths.sqlite)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|task| TaskSummary {
+                name: task.name,
+                owner: "本地工作台".to_string(),
+                status: task.status,
+                progress: project.annotated_percent,
+            })
+            .collect::<Vec<_>>();
+        let review_count = images
+            .iter()
+            .filter(|image| image.qa_status == "待质检")
+            .count() as u32;
+        let rejected_count = images
+            .iter()
+            .filter(|image| image.qa_status == "驳回")
+            .count() as u32;
+        let export_presets = storage::list_export_records(&paths.sqlite)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| ExportPreset {
+                name: item.id,
+                format: item.format,
+                scope: item.snapshot_id,
+                status: item.status,
+            })
+            .collect::<Vec<_>>();
+        let project_progress = project.annotated_percent;
 
         Some(ProjectDetail {
             project,
@@ -331,21 +447,50 @@ impl SampleRepository {
                     })
                     .collect()
             },
-            tasks: vec![TaskSummary {
-                name: "测试数据标注校验".to_string(),
-                owner: "数据生产平台".to_string(),
-                status: "Active".to_string(),
-                progress: 100,
-            }],
-            quality_checks: Vec::new(),
-            export_presets: Vec::new(),
+            tasks: if task_summaries.is_empty() {
+                vec![TaskSummary {
+                    name: "默认本地标注任务".to_string(),
+                    owner: "本地工作台".to_string(),
+                    status: "进行中".to_string(),
+                    progress: project_progress,
+                }]
+            } else {
+                task_summaries
+            },
+            quality_checks: [
+                ("待质检样本", "info", review_count),
+                ("驳回样本", "warning", rejected_count),
+            ]
+            .into_iter()
+            .filter(|(_, _, count)| *count > 0)
+            .map(|(name, severity, count)| QualityCheck {
+                name: name.to_string(),
+                severity: severity.to_string(),
+                count,
+            })
+            .collect(),
+            export_presets,
         })
     }
 
     pub fn project_images(&self, project_id: &str, group_id: Option<String>) -> Vec<DatasetImage> {
+        self.project_images_paged(project_id, group_id, None, None)
+    }
+
+    pub fn project_images_paged(
+        &self,
+        project_id: &str,
+        group_id: Option<String>,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> Vec<DatasetImage> {
         let paths = project_fs::project_paths(project_id);
-        let indexed_images =
-            storage::read_images(&paths.sqlite, group_id.as_deref()).unwrap_or_default();
+        let indexed_images = if let Some(limit) = limit {
+            storage::read_images_page(&paths.sqlite, group_id.as_deref(), offset.unwrap_or(0), limit)
+                .unwrap_or_default()
+        } else {
+            storage::read_images(&paths.sqlite, group_id.as_deref()).unwrap_or_default()
+        };
         if !indexed_images.is_empty() {
             return indexed_images
                 .into_iter()
@@ -356,23 +501,36 @@ impl SampleRepository {
                     height: image.height,
                     split: image.split.clone(),
                     status: image.status,
+                    qa_status: image.qa_status,
+                    review_note: image.review_note,
                     tags: vec![format!("split={}", image.split)],
                 })
                 .collect();
         }
         let mut images = Vec::new();
 
-        for entry in WalkDir::new(&paths.raw).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() || !is_image_path(&entry.path().to_path_buf()) {
-                continue;
-            }
-
+        let asset_root = project_asset_root(project_id, &paths);
+        let offset = offset.unwrap_or(0) as usize;
+        let limit = limit.unwrap_or(u32::MAX) as usize;
+        let mut skipped = 0usize;
+        for entry in WalkDir::new(&asset_root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file() && is_image_path(&entry.path().to_path_buf()))
+        {
             let path = entry.path().to_path_buf();
             let split = split_for_path(&path);
             if let Some(group_id) = &group_id {
                 if group_id != &split {
                     continue;
                 }
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if images.len() >= limit {
+                break;
             }
 
             let (width, height) = image::image_dimensions(&path).unwrap_or((0, 0));
@@ -392,6 +550,8 @@ impl SampleRepository {
                 height,
                 split: split.clone(),
                 status: "已标注".to_string(),
+                qa_status: String::new(),
+                review_note: None,
                 tags: vec![format!("split={split}")],
             });
         }
@@ -402,53 +562,145 @@ impl SampleRepository {
 
     pub fn image_path(&self, project_id: &str, image_id: &str) -> Option<PathBuf> {
         let paths = project_fs::project_paths(project_id);
-        WalkDir::new(paths.raw)
+        let asset_root = project_asset_root(project_id, &paths);
+        if let Ok(images) = storage::read_images(&paths.sqlite, None) {
+            if let Some(image) = images.into_iter().find(|image| image.id == image_id) {
+                let path = asset_root.join(image.file_name);
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+        }
+
+        WalkDir::new(&asset_root)
             .into_iter()
             .filter_map(Result::ok)
             .find(|entry| {
                 entry.file_type().is_file()
                     && is_image_path(&entry.path().to_path_buf())
-                    && entry
-                        .path()
-                        .file_stem()
-                        .map(|value| value.to_string_lossy() == image_id)
-                        .unwrap_or(false)
+                    && image_id_matches(&asset_root, entry.path(), image_id)
             })
             .map(|entry| entry.path().to_path_buf())
     }
 
     pub fn image_annotations(&self, project_id: &str, image_id: &str) -> Vec<AnnotationObject> {
+        self.image_annotation_state(project_id, image_id).objects
+    }
+
+    pub fn image_annotation_state(&self, project_id: &str, image_id: &str) -> AnnotationState {
         let paths = project_fs::project_paths(project_id);
+        if let Ok(Some(payload)) = storage::read_annotation_payload(&paths.sqlite, image_id) {
+            let objects = serde_json::from_str::<Vec<AnnotationObject>>(&payload.object_json)
+                .unwrap_or_default();
+            return AnnotationState {
+                image_id: image_id.to_string(),
+                revision: Some(payload.revision),
+                objects,
+                status: image_status(project_id, image_id).unwrap_or_else(|| "草稿".to_string()),
+                updated_at: Some(payload.updated_at),
+            };
+        }
+
         let native_path = paths.annotations.join(format!("{image_id}.json"));
         if let Ok(data) = fs::read_to_string(native_path) {
+            if let Ok(state) = serde_json::from_str::<AnnotationState>(&data) {
+                return state;
+            }
             if let Ok(objects) = serde_json::from_str::<Vec<AnnotationObject>>(&data) {
-                return objects;
+                return AnnotationState {
+                    image_id: image_id.to_string(),
+                    revision: None,
+                    objects,
+                    status: image_status(project_id, image_id)
+                        .unwrap_or_else(|| "草稿".to_string()),
+                    updated_at: None,
+                };
             }
         }
 
         let Some(image_path) = self.image_path(project_id, image_id) else {
-            return Vec::new();
+            return AnnotationState {
+                image_id: image_id.to_string(),
+                revision: None,
+                objects: Vec::new(),
+                status: "图片未找到".to_string(),
+                updated_at: None,
+            };
         };
-        let Some(label_path) = label_path_for_image(&paths.raw, &image_path) else {
-            return Vec::new();
+        if is_voc_project(project_id) {
+            let label_path = image_path.with_extension("xml");
+            if let Ok(xml) = fs::read_to_string(label_path) {
+                let labels = storage::read_classes(&paths.sqlite)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|class| class.label)
+                    .collect::<Vec<_>>();
+                let objects = voc::parse_voc_annotations(&xml, &labels).unwrap_or_default();
+                return AnnotationState {
+                    image_id: image_id.to_string(),
+                    revision: None,
+                    objects,
+                    status: image_status(project_id, image_id)
+                        .unwrap_or_else(|| "已标注".to_string()),
+                    updated_at: None,
+                };
+            }
+            return AnnotationState {
+                image_id: image_id.to_string(),
+                revision: None,
+                objects: Vec::new(),
+                status: image_status(project_id, image_id).unwrap_or_else(|| "未标注".to_string()),
+                updated_at: None,
+            };
+        }
+        let Some(label_path) = yolo_label_path_for_image(project_id, &image_path) else {
+            return AnnotationState {
+                image_id: image_id.to_string(),
+                revision: None,
+                objects: Vec::new(),
+                status: image_status(project_id, image_id).unwrap_or_else(|| "未标注".to_string()),
+                updated_at: None,
+            };
         };
         let Ok(label_data) = fs::read_to_string(label_path) else {
-            return Vec::new();
+            return AnnotationState {
+                image_id: image_id.to_string(),
+                revision: None,
+                objects: Vec::new(),
+                status: image_status(project_id, image_id).unwrap_or_else(|| "未标注".to_string()),
+                updated_at: None,
+            };
         };
 
         let (width, height) = image::image_dimensions(&image_path).unwrap_or((0, 0));
-        let labels = coco_labels();
+        let labels = storage::read_classes(&paths.sqlite)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|class| class.label)
+            .collect::<Vec<_>>();
+        let labels = if labels.is_empty() {
+            coco_labels()
+        } else {
+            labels
+        };
         let prefer_polygon = project_fs::read_manifest(project_id)
             .map(|manifest| manifest.format == "yolo-seg")
             .unwrap_or(false);
 
-        label_data
+        let objects = label_data
             .lines()
             .enumerate()
             .filter_map(|(index, line)| {
                 yolo::line_to_annotation(line, width, height, &labels, index, prefer_polygon).ok()
             })
-            .collect()
+            .collect();
+        AnnotationState {
+            image_id: image_id.to_string(),
+            revision: None,
+            objects,
+            status: image_status(project_id, image_id).unwrap_or_else(|| "已标注".to_string()),
+            updated_at: None,
+        }
     }
 
     pub fn save_image_annotations(
@@ -456,11 +708,297 @@ impl SampleRepository {
         project_id: &str,
         image_id: &str,
         objects: Vec<AnnotationObject>,
-    ) -> Result<(), String> {
+    ) -> Result<AnnotationSaveResult, String> {
+        self.save_image_annotations_with_revision(project_id, image_id, None, objects)
+    }
+
+    pub fn save_image_annotations_with_revision(
+        &self,
+        project_id: &str,
+        image_id: &str,
+        revision: Option<String>,
+        objects: Vec<AnnotationObject>,
+    ) -> Result<AnnotationSaveResult, String> {
         let paths = project_fs::ensure_project_dirs(project_id)?;
-        let data = serde_json::to_string_pretty(&objects).map_err(|err| err.to_string())?;
+        let object_json = serde_json::to_string(&objects).map_err(|err| err.to_string())?;
+        let result = storage::save_annotation_payload(
+            &paths.sqlite,
+            image_id,
+            revision.as_deref(),
+            &object_json,
+        )?;
+        let state = AnnotationState {
+            image_id: image_id.to_string(),
+            revision: Some(result.revision.clone()),
+            objects,
+            status: "草稿".to_string(),
+            updated_at: Some(result.saved_at.clone()),
+        };
+        let data = serde_json::to_string_pretty(&state).map_err(|err| err.to_string())?;
         fs::write(paths.annotations.join(format!("{image_id}.json")), data)
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string())?;
+        if is_voc_project(project_id) {
+            if let Some(image_path) = self.image_path(project_id, image_id) {
+                let (width, height) = image::image_dimensions(&image_path).unwrap_or((0, 0));
+                let xml = voc::annotations_to_voc_xml(&image_path, width, height, &state.objects)?;
+                fs::write(image_path.with_extension("xml"), xml).map_err(|err| err.to_string())?;
+            }
+        }
+        if is_yolo_detect_project(project_id) {
+            if let Some(image_path) = self.image_path(project_id, image_id) {
+                let (width, height) = image::image_dimensions(&image_path).unwrap_or((0, 0));
+                let label_path = yolo_label_write_path_for_image(project_id, &image_path);
+                if let Some(parent) = label_path.parent() {
+                    fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+                }
+                let label_data = yolo::annotations_to_yolo_lines(&state.objects, width, height)?;
+                fs::write(label_path, label_data).map_err(|err| err.to_string())?;
+            }
+        }
+        Ok(AnnotationSaveResult {
+            revision: result.revision,
+            saved_at: result.saved_at,
+            audit_event_id: result.audit_event_id,
+        })
+    }
+
+    pub fn submit_image_annotations(&self, project_id: &str, image_id: &str) -> Result<(), String> {
+        let paths = project_fs::project_paths(project_id);
+        storage::submit_image_for_review(&paths.sqlite, image_id)
+    }
+
+    pub fn annotation_history(
+        &self,
+        project_id: &str,
+        image_id: &str,
+    ) -> Result<Vec<AnnotationVersion>, String> {
+        let paths = project_fs::project_paths(project_id);
+        storage::read_annotation_versions(&paths.sqlite, image_id)?
+            .into_iter()
+            .map(|record| {
+                Ok(AnnotationVersion {
+                    id: record.id,
+                    image_id: record.image_id,
+                    revision: record.revision,
+                    objects: serde_json::from_str(&record.object_json)
+                        .map_err(|err| err.to_string())?,
+                    created_at: record.created_at,
+                })
+            })
+            .collect()
+    }
+
+    pub fn restore_annotation_version(
+        &self,
+        project_id: &str,
+        image_id: &str,
+        revision: &str,
+    ) -> Result<AnnotationSaveResult, String> {
+        let version = self
+            .annotation_history(project_id, image_id)?
+            .into_iter()
+            .find(|version| version.revision == revision)
+            .ok_or_else(|| format!("annotation revision not found: {revision}"))?;
+        let current_revision = self.image_annotation_state(project_id, image_id).revision;
+        self.save_image_annotations_with_revision(
+            project_id,
+            image_id,
+            current_revision,
+            version.objects,
+        )
+    }
+
+    pub fn create_annotation_task(
+        &self,
+        project_id: &str,
+        name: &str,
+    ) -> Result<AnnotationTask, String> {
+        let paths = project_fs::project_paths(project_id);
+        let images = self.project_images(project_id, None);
+        let image_ids: Vec<_> = images.iter().map(|image| image.id.as_str()).collect();
+        let record = storage::create_annotation_task_record(&paths.sqlite, name, &image_ids)?;
+        Ok(task_from_record(record))
+    }
+
+    pub fn annotation_tasks(&self, project_id: &str) -> Result<Vec<AnnotationTask>, String> {
+        let paths = project_fs::project_paths(project_id);
+        Ok(storage::list_task_records(&paths.sqlite)?
+            .into_iter()
+            .map(task_from_record)
+            .collect())
+    }
+
+    pub fn task_items(&self, project_id: &str, task_id: &str) -> Result<Vec<TaskItem>, String> {
+        let paths = project_fs::project_paths(project_id);
+        Ok(storage::list_task_item_records(&paths.sqlite, task_id)?
+            .into_iter()
+            .map(task_item_from_record)
+            .collect())
+    }
+
+    pub fn claim_task_item(
+        &self,
+        project_id: &str,
+        task_id: &str,
+        image_id: &str,
+    ) -> Result<(), String> {
+        let paths = project_fs::project_paths(project_id);
+        storage::claim_task_item(&paths.sqlite, task_id, image_id)
+    }
+
+    pub fn release_task_item(
+        &self,
+        project_id: &str,
+        task_id: &str,
+        image_id: &str,
+    ) -> Result<(), String> {
+        let paths = project_fs::project_paths(project_id);
+        storage::release_task_item(&paths.sqlite, task_id, image_id)
+    }
+
+    pub fn review_task_item(
+        &self,
+        project_id: &str,
+        image_id: &str,
+        decision: &str,
+        note: &str,
+    ) -> Result<(), String> {
+        let paths = project_fs::project_paths(project_id);
+        storage::review_image(&paths.sqlite, image_id, decision, note)
+    }
+
+    pub fn review_queue(&self, project_id: &str) -> Result<Vec<DatasetImage>, String> {
+        let paths = project_fs::project_paths(project_id);
+        Ok(storage::read_review_queue(&paths.sqlite)?
+            .into_iter()
+            .map(|image| DatasetImage {
+                id: image.id,
+                file_name: image.file_name,
+                width: image.width,
+                height: image.height,
+                split: image.split.clone(),
+                status: image.status,
+                qa_status: image.qa_status,
+                review_note: image.review_note,
+                tags: vec![format!("split={}", image.split)],
+            })
+            .collect())
+    }
+
+    pub fn create_dataset_snapshot(
+        &self,
+        project_id: &str,
+        name: &str,
+    ) -> Result<DatasetSnapshot, String> {
+        let paths = project_fs::ensure_project_dirs(project_id)?;
+        let images = self.project_images(project_id, None);
+        let annotations: Vec<_> = images
+            .iter()
+            .map(|image| {
+                let state = self.image_annotation_state(project_id, &image.id);
+                json!({
+                    "imageId": image.id,
+                    "fileName": image.file_name,
+                    "status": image.status,
+                    "revision": state.revision,
+                    "objects": state.objects,
+                })
+            })
+            .collect();
+        let manifest = json!({
+            "projectId": project_id,
+            "name": name,
+            "imageCount": images.len(),
+            "annotations": annotations,
+        });
+        let manifest_json = serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?;
+        let record =
+            storage::create_snapshot_record(&paths.sqlite, name, &manifest_json, images.len() as u32)?;
+        let snapshot_dir = paths.snapshots.join(&record.id);
+        fs::create_dir_all(&snapshot_dir).map_err(|err| err.to_string())?;
+        let manifest_path = snapshot_dir.join("manifest.json");
+        fs::write(&manifest_path, manifest_json).map_err(|err| err.to_string())?;
+        Ok(DatasetSnapshot {
+            id: record.id,
+            name: record.name,
+            image_count: record.image_count,
+            manifest_path: manifest_path.to_string_lossy().to_string(),
+            created_at: record.created_at,
+        })
+    }
+
+    pub fn dataset_snapshots(&self, project_id: &str) -> Result<Vec<DatasetSnapshot>, String> {
+        let paths = project_fs::project_paths(project_id);
+        Ok(storage::list_snapshot_records(&paths.sqlite)?
+            .into_iter()
+            .map(|record| DatasetSnapshot {
+                manifest_path: paths
+                    .snapshots
+                    .join(&record.id)
+                    .join("manifest.json")
+                    .to_string_lossy()
+                    .to_string(),
+                id: record.id,
+                name: record.name,
+                image_count: record.image_count,
+                created_at: record.created_at,
+            })
+            .collect())
+    }
+
+    pub fn export_dataset(
+        &self,
+        project_id: &str,
+        snapshot_id: &str,
+        format: &str,
+    ) -> Result<DatasetExport, String> {
+        let paths = project_fs::ensure_project_dirs(project_id)?;
+        let output_dir = paths.exports.join(format!("{snapshot_id}-{format}"));
+        fs::create_dir_all(&output_dir).map_err(|err| err.to_string())?;
+        let manifest_path = paths.snapshots.join(snapshot_id).join("manifest.json");
+        let manifest_json =
+            fs::read_to_string(&manifest_path).map_err(|err| err.to_string())?;
+        fs::write(output_dir.join("manifest.json"), &manifest_json)
+            .map_err(|err| err.to_string())?;
+        if format == "coco" {
+            fs::write(output_dir.join("annotations.json"), manifest_json)
+                .map_err(|err| err.to_string())?;
+        } else {
+            fs::write(
+                output_dir.join("dataset.yaml"),
+                format!("path: {}\ntrain: images\nnames: []\n", paths.raw.to_string_lossy()),
+            )
+            .map_err(|err| err.to_string())?;
+        }
+        let record = storage::create_export_record(
+            &paths.sqlite,
+            snapshot_id,
+            format,
+            &output_dir.to_string_lossy(),
+        )?;
+        Ok(DatasetExport {
+            id: record.id,
+            snapshot_id: record.snapshot_id,
+            format: record.format,
+            status: record.status,
+            output_path: record.output_path,
+            created_at: record.created_at,
+        })
+    }
+
+    pub fn dataset_exports(&self, project_id: &str) -> Result<Vec<DatasetExport>, String> {
+        let paths = project_fs::project_paths(project_id);
+        Ok(storage::list_export_records(&paths.sqlite)?
+            .into_iter()
+            .map(|record| DatasetExport {
+                id: record.id,
+                snapshot_id: record.snapshot_id,
+                format: record.format,
+                status: record.status,
+                output_path: record.output_path,
+                created_at: record.created_at,
+            })
+            .collect())
     }
 }
 
@@ -502,6 +1040,106 @@ fn label_path_for_image(
     }
     label.set_extension("txt");
     label.exists().then_some(label)
+}
+
+fn project_asset_root(project_id: &str, paths: &project_fs::ProjectPaths) -> PathBuf {
+    project_manifest(project_id)
+        .filter(|manifest| manifest.source_dataset_key == "local-linked")
+        .map(|manifest| PathBuf::from(manifest.root_path))
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| paths.raw.clone())
+}
+
+fn project_manifest(project_id: &str) -> Option<project_fs::ProjectManifest> {
+    let paths = project_fs::project_paths(project_id);
+    storage::read_project_manifest(&paths.sqlite)
+        .ok()
+        .flatten()
+        .or_else(|| project_fs::read_manifest(project_id))
+}
+
+fn is_voc_project(project_id: &str) -> bool {
+    project_manifest(project_id)
+        .map(|manifest| manifest.format == "voc-detect")
+        .unwrap_or(false)
+}
+
+fn is_yolo_detect_project(project_id: &str) -> bool {
+    project_manifest(project_id)
+        .map(|manifest| manifest.format == "yolo-detect")
+        .unwrap_or(false)
+}
+
+fn yolo_label_path_for_image(project_id: &str, image_path: &Path) -> Option<PathBuf> {
+    let manifest_root = project_manifest(project_id)
+        .map(|manifest| PathBuf::from(manifest.root_path))
+        .unwrap_or_else(|| project_fs::project_paths(project_id).raw);
+
+    label_path_for_image(&manifest_root, image_path).or_else(|| image_path.with_extension("txt").exists().then(|| image_path.with_extension("txt")))
+}
+
+fn yolo_label_write_path_for_image(project_id: &str, image_path: &Path) -> PathBuf {
+    let manifest_root = project_manifest(project_id)
+        .map(|manifest| PathBuf::from(manifest.root_path))
+        .unwrap_or_else(|| project_fs::project_paths(project_id).raw);
+
+    yolo_label_path_candidate(&manifest_root, image_path)
+        .unwrap_or_else(|| image_path.with_extension("txt"))
+}
+
+fn yolo_label_path_candidate(root: &Path, image_path: &Path) -> Option<PathBuf> {
+    let relative = image_path.strip_prefix(root).ok()?;
+    let mut parts: Vec<_> = relative.components().collect();
+    let image_index = parts
+        .iter()
+        .position(|component| component.as_os_str().to_string_lossy() == "images")?;
+    parts[image_index] = std::path::Component::Normal(std::ffi::OsStr::new("labels"));
+    let mut label = root.to_path_buf();
+    for component in parts {
+        label.push(component.as_os_str());
+    }
+    label.set_extension("txt");
+    Some(label)
+}
+
+fn image_id_matches(root: &Path, image_path: &Path, image_id: &str) -> bool {
+    if image_path
+        .file_stem()
+        .map(|value| value.to_string_lossy() == image_id)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let relative = image_path
+        .strip_prefix(root)
+        .map(|value| value.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    image_id_from_relative(&relative) == image_id
+}
+
+fn image_id_from_relative(relative: &str) -> String {
+    Path::new(relative)
+        .with_extension("")
+        .to_string_lossy()
+        .replace('\\', "/")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn image_status(project_id: &str, image_id: &str) -> Option<String> {
+    let path = project_fs::project_paths(project_id).sqlite;
+    storage::read_images(&path, None)
+        .ok()?
+        .into_iter()
+        .find(|image| image.id == image_id)
+        .map(|image| image.status)
 }
 
 pub fn coco_labels() -> Vec<String> {
@@ -599,6 +1237,28 @@ fn class_color(index: usize) -> String {
     COLORS[index % COLORS.len()].to_string()
 }
 
+fn task_from_record(record: storage::TaskRecord) -> AnnotationTask {
+    AnnotationTask {
+        id: record.id,
+        name: record.name,
+        status: record.status,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }
+}
+
+fn task_item_from_record(record: storage::TaskItemRecord) -> TaskItem {
+    TaskItem {
+        id: record.id,
+        task_id: record.task_id,
+        image_id: record.image_id,
+        status: record.status,
+        qa_status: record.qa_status,
+        review_note: record.review_note,
+        locked_at: record.locked_at,
+    }
+}
+
 pub fn backend_design() -> BackendDesign {
     BackendDesign {
         layers: vec![
@@ -608,7 +1268,7 @@ pub fn backend_design() -> BackendDesign {
             },
             BackendLayer {
                 name: "Project FS".to_string(),
-                responsibility: "The local data/test_data workspace stores manifests, raw downloaded files, native annotations, thumbnails, exports, and SQLite databases.".to_string(),
+                responsibility: "The local data/workspaces/default workspace stores project manifests, original assets, native annotations, thumbnails, snapshots, exports, and SQLite databases; data/test_data remains reserved for builtin test datasets.".to_string(),
             },
             BackendLayer {
                 name: "Importer".to_string(),
@@ -619,15 +1279,24 @@ pub fn backend_design() -> BackendDesign {
                 responsibility: "Repositories scan the local project structure and persist edited annotations in portable JSON sidecars.".to_string(),
             },
         ],
-        storage_plan: "Use data/test_data/projects/{projectId} for raw files, project.json manifests, project.sqlite metadata, annotations/native JSON, and export output.".to_string(),
+        storage_plan: "Use data/workspaces/default/projects/{projectId} for production projects and data/test_data/projects/{projectId} only for builtin demo datasets.".to_string(),
         command_plan: vec![
+            "backend_health".to_string(),
             "list_builtin_datasets".to_string(),
             "download_test_dataset".to_string(),
+            "create_project".to_string(),
+            "open_local_dataset".to_string(),
+            "import_images".to_string(),
+            "import_yolo_dataset".to_string(),
             "list_dataset_projects".to_string(),
             "get_project_detail".to_string(),
             "list_project_images".to_string(),
+            "get_image_annotation_state".to_string(),
             "get_image_annotations".to_string(),
             "save_image_annotations".to_string(),
+            "submit_image_annotations".to_string(),
+            "create_dataset_snapshot".to_string(),
+            "export_dataset".to_string(),
             "open_annotation_window".to_string(),
             "list_backend_tasks".to_string(),
             "clear_completed_backend_tasks".to_string(),

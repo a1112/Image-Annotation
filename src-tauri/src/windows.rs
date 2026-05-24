@@ -7,6 +7,10 @@ pub fn annotation_route(project_id: &str, image_id: Option<&str>) -> String {
     }
 }
 
+pub fn backend_tasks_route() -> String {
+    "#/backend-tasks".to_string()
+}
+
 #[cfg(not(mobile))]
 pub fn open_annotation_window(
     app: &AppHandle,
@@ -30,6 +34,35 @@ pub fn open_annotation_window(
     .title("标注工作台")
     .inner_size(1440.0, 920.0)
     .min_inner_size(1024.0, 720.0)
+    .resizable(true)
+    .decorations(false)
+    .transparent(true)
+    .shadow(true)
+    .build()
+    .map_err(|err| err.to_string())?;
+
+    Ok(())
+}
+
+#[cfg(not(mobile))]
+pub fn open_backend_tasks_window(app: &AppHandle) -> Result<(), String> {
+    let label = "backend-tasks";
+    let route = backend_tasks_route();
+
+    if let Some(window) = app.get_webview_window(label) {
+        window.show().map_err(|err| err.to_string())?;
+        window.set_focus().map_err(|err| err.to_string())?;
+        return Ok(());
+    }
+
+    WebviewWindowBuilder::new(
+        app,
+        label,
+        WebviewUrl::App(format!("index.html{route}").into()),
+    )
+    .title("后台任务")
+    .inner_size(520.0, 680.0)
+    .min_inner_size(420.0, 520.0)
     .resizable(true)
     .decorations(false)
     .transparent(true)
