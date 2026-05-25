@@ -123,6 +123,16 @@ fn annotation_window_route_uses_hash_router() {
 }
 
 #[test]
+fn annotation_window_reuse_script_jumps_to_requested_image() {
+    let script = image_annotation_lib::windows::annotation_navigation_script(
+        &annotation_route("coco128", Some("000000000009")),
+    );
+
+    assert!(script.contains("window.location.hash"));
+    assert!(script.contains("#/annotate/coco128/000000000009"));
+}
+
+#[test]
 fn backend_tasks_window_route_uses_hash_router() {
     assert_eq!(backend_tasks_route(), "#/backend-tasks");
 }

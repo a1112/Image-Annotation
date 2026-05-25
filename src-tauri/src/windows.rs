@@ -7,6 +7,11 @@ pub fn annotation_route(project_id: &str, image_id: Option<&str>) -> String {
     }
 }
 
+pub fn annotation_navigation_script(route: &str) -> String {
+    let route_json = serde_json::to_string(route).unwrap_or_else(|_| "\"#/annotate\"".to_string());
+    format!("window.location.hash = {route_json};")
+}
+
 pub fn backend_tasks_route() -> String {
     "#/backend-tasks".to_string()
 }
@@ -21,6 +26,9 @@ pub fn open_annotation_window(
     let route = annotation_route(project_id, image_id);
 
     if let Some(window) = app.get_webview_window(&label) {
+        window
+            .eval(&annotation_navigation_script(&route))
+            .map_err(|err| err.to_string())?;
         window.show().map_err(|err| err.to_string())?;
         window.set_focus().map_err(|err| err.to_string())?;
         return Ok(());

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -325,6 +325,26 @@ beforeEach(() => {
     }),
   );
   vi.clearAllMocks();
+  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(() => ({
+    beginPath: vi.fn(),
+    clearRect: vi.fn(),
+    closePath: vi.fn(),
+    drawImage: vi.fn(),
+    fill: vi.fn(),
+    fillRect: vi.fn(),
+    fillText: vi.fn(),
+    lineTo: vi.fn(),
+    moveTo: vi.fn(),
+    restore: vi.fn(),
+    save: vi.fn(),
+    scale: vi.fn(),
+    setLineDash: vi.fn(),
+    setTransform: vi.fn(),
+    stroke: vi.fn(),
+    strokeRect: vi.fn(),
+    strokeText: vi.fn(),
+    translate: vi.fn(),
+  }) as unknown as CanvasRenderingContext2D);
 });
 
 describe("desktop shell", () => {
@@ -602,6 +622,45 @@ describe("desktop shell", () => {
     );
   });
 
+  it("图片浏览页面可以打开图像预览弹窗", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(screen.getByRole("button", { name: "图片" }));
+    await user.click(await screen.findByRole("button", { name: "预览 000000000009.jpg" }));
+
+    const dialog = screen.getByRole("dialog", { name: "图像预览" });
+    expect(dialog).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "图像预览" })).toBeInTheDocument();
+    expect(within(dialog).getByAltText("预览 000000000009.jpg")).toHaveAttribute(
+      "src",
+      expect.stringContaining("asset://"),
+    );
+    expect(within(dialog).getByText("640 x 480")).toBeInTheDocument();
+    expect(within(dialog).getByText("对象数")).toBeInTheDocument();
+    expect(within(dialog).getByText("1")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("000000000009.jpg 标注预览")).toBeInTheDocument();
+  });
+
+  it("图像预览弹窗中的标记按钮打开对应独立标注控制台", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(screen.getByRole("button", { name: "图片" }));
+    await user.click(await screen.findByRole("button", { name: "预览 000000000009.jpg" }));
+    await user.click(within(screen.getByRole("dialog", { name: "图像预览" })).getByRole("button", { name: "标记" }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("open_annotation_window", {
+        projectId: "coco128",
+        imageId: "000000000009",
+      }),
+    );
+    expect(screen.getByRole("heading", { name: "COCO128" })).toBeInTheDocument();
+  });
+
   it("点击开始标注会请求 Tauri 打开独立标注窗口", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -620,11 +679,43 @@ describe("desktop shell", () => {
     render(<App />);
 
     expect(await screen.findByRole("heading", { name: "标注工作台" })).toBeInTheDocument();
-    expect(screen.getByAltText("000000000009.jpg")).toHaveAttribute(
-      "src",
-      expect.stringContaining("asset://"),
-    );
+    expect(screen.getByLabelText("000000000009.jpg 标注画布")).toBeInTheDocument();
+    expect(invoke).toHaveBeenCalledWith("get_file_asset_path", {
+      projectId: "coco128",
+      imageId: "000000000009",
+    });
     expect(screen.getAllByText("person").length).toBeGreaterThan(0);
+  });
+
+  it("直接访问标注 URL 时标注工作台作为独立界面渲染", async () => {
+    window.location.hash = "#/annotate/coco128/000000000009";
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "标注工作台" })).toBeInTheDocument();
+    expect(screen.queryByRole("banner")).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "主导航" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "最小化标注工作台" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "关闭标注工作台" })).toBeInTheDocument();
+  });
+
+  it("独立标注工作台标题区域支持拖拽窗口且不抢占按钮操作", async () => {
+    window.location.hash = "#/annotate/coco128/000000000009";
+
+    render(<App />);
+
+    fireEvent.mouseDown(await screen.findByRole("heading", { name: "标注工作台" }), {
+      button: 0,
+    });
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("start_drag_window"));
+
+    vi.mocked(invoke).mockClear();
+    fireEvent.mouseDown(screen.getByRole("button", { name: "保存标注" }), {
+      button: 0,
+    });
+
+    expect(invoke).not.toHaveBeenCalledWith("start_drag_window");
   });
 
   it("保存 bbox 标注会调用后端持久化命令", async () => {
@@ -705,6 +796,84 @@ describe("desktop shell", () => {
         }),
       ),
     );
+  });
+
+  it("标注图像区域使用画布视口并支持缩放", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+
+    render(<App />);
+
+    const canvas = await screen.findByTestId("annotation-canvas");
+    expect(canvas.tagName).toBe("CANVAS");
+    expect(screen.getByRole("button", { name: "缩小图像" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "图像适配窗口" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "放大图像" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "放大图像" }));
+
+    expect(await screen.findByText("125%")).toBeInTheDocument();
+  });
+
+  it("标注控制台支持 LabelImg 常用快捷键", async () => {
+    window.location.hash = "#/annotate/coco128/000000000009";
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "标注工作台" });
+
+    fireEvent.keyDown(window, { key: "w" });
+    expect(screen.getByRole("button", { name: "BBox" })).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.keyDown(window, { key: "d" });
+    await waitFor(() => expect(screen.getAllByText(/000000000025.jpg/).length).toBeGreaterThan(0));
+
+    fireEvent.keyDown(window, { key: "a" });
+    await waitFor(() => expect(screen.getAllByText(/000000000009.jpg/).length).toBeGreaterThan(0));
+
+    fireEvent.keyDown(window, { key: "+", ctrlKey: true });
+    expect(await screen.findByText("125%")).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "=", ctrlKey: true });
+    expect(await screen.findByText("100%")).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    expect(screen.getByLabelText("X 坐标")).toHaveValue(257);
+
+    fireEvent.keyDown(window, { key: "ArrowDown", shiftKey: true });
+    expect(screen.getByLabelText("Y 坐标")).toHaveValue(106);
+
+    fireEvent.keyDown(window, { key: "e", ctrlKey: true });
+    expect(screen.getByLabelText("对象标签")).toHaveFocus();
+
+    fireEvent.keyDown(window, { key: "s", ctrlKey: true });
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "save_image_annotations",
+        expect.objectContaining({
+          imageId: "000000000009",
+          objects: expect.arrayContaining([
+            expect.objectContaining({
+              bbox: expect.objectContaining({ x: 257, y: 106 }),
+            }),
+          ]),
+        }),
+      ),
+    );
+  });
+
+  it("标注快捷键不会抢占输入框的普通编辑键", async () => {
+    window.location.hash = "#/annotate/coco128/000000000009";
+
+    render(<App />);
+
+    const labelInput = await screen.findByLabelText("对象标签");
+    labelInput.focus();
+
+    fireEvent.keyDown(labelInput, { key: "Backspace" });
+
+    expect(screen.getByText("对象数")).toBeInTheDocument();
+    expect(screen.getByText("1")).toBeInTheDocument();
   });
 
   it("标注控制台支持精确编辑 bbox 坐标并保存", async () => {

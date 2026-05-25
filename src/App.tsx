@@ -15,6 +15,7 @@ import {
   Layers3,
   Maximize2,
   Minimize2,
+  Move,
   MousePointer2,
   Play,
   Plus,
@@ -26,10 +27,12 @@ import {
   Tags,
   Upload,
   X,
+  ZoomIn,
+  ZoomOut,
   Zap,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
-import type { KeyboardEvent, MouseEvent } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent, MouseEvent, WheelEvent } from "react";
 import {
   clearCompletedBackendTasks,
   createDatasetProject,
@@ -72,6 +75,15 @@ import { invoke } from "@tauri-apps/api/core";
 type ProjectTab = "概览" | "数据分组" | "图片" | "类别" | "任务" | "质检" | "快照" | "导出";
 type ToolMode = "select" | "bbox" | "polygon" | "pan";
 type DataRuntimeState = "loading" | "ready" | "downloading" | "backend-unavailable" | "download-error";
+type CanvasViewport = {
+  scale: number;
+  offsetX: number;
+  offsetY: number;
+};
+type CanvasSize = {
+  width: number;
+  height: number;
+};
 type DatasetCreationForm = {
   name: string;
   datasetType: "yolo-detect" | "yolo-seg";
@@ -242,6 +254,52 @@ function ThumbnailAnnotationOverlay({
   );
 }
 
+function ReadOnlyAnnotationOverlay({
+  image,
+  objects,
+}: {
+  image: DatasetImage;
+  objects: AnnotationObject[] | undefined;
+}) {
+  const visibleObjects = (objects ?? []).filter(
+    (object) => (object.type === "bbox" && object.bbox) || (object.type === "polygon" && object.polygon?.length),
+  );
+
+  if (visibleObjects.length === 0) {
+    return null;
+  }
+
+  return (
+    <svg
+      aria-label={`${image.fileName} 标注预览`}
+      className="preview-annotations"
+      preserveAspectRatio="none"
+      viewBox={`0 0 ${image.width || 640} ${image.height || 480}`}
+    >
+      {visibleObjects.map((object) => object.type === "bbox" && object.bbox ? (
+        <g key={object.id}>
+          <rect
+            aria-label={`${image.fileName} 标注框 ${object.label}`}
+            className="preview-annotation-box"
+            x={object.bbox.x}
+            y={object.bbox.y}
+            width={object.bbox.width}
+            height={object.bbox.height}
+          />
+          <text x={object.bbox.x + 6} y={Math.max(18, object.bbox.y - 6)}>{object.label}</text>
+        </g>
+      ) : object.polygon ? (
+        <polygon
+          aria-label={`${image.fileName} 多边形标注 ${object.label}`}
+          className="preview-annotation-polygon"
+          key={object.id}
+          points={object.polygon.map((point) => `${point.x},${point.y}`).join(" ")}
+        />
+      ) : null)}
+    </svg>
+  );
+}
+
 function normalizeBox(start: { x: number; y: number }, end: { x: number; y: number }) {
   const x = Math.min(start.x, end.x);
   const y = Math.min(start.y, end.y);
@@ -293,6 +351,190 @@ function bboxHandles(box: NonNullable<AnnotationObject["bbox"]>) {
     { handle: "sw" as const, x: box.x, y: box.y + box.height },
     { handle: "se" as const, x: box.x + box.width, y: box.y + box.height },
   ];
+}
+
+function isEditableShortcutTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) return false;
+  return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+}
+
+function fitCanvasViewport(imageWidth: number, imageHeight: number, canvasWidth: number, canvasHeight: number): CanvasViewport {
+  const padding = 36;
+  const safeWidth = Math.max(1, canvasWidth - padding * 2);
+  const safeHeight = Math.max(1, canvasHeight - padding * 2);
+  const scale = clamp(Math.min(safeWidth / imageWidth, safeHeight / imageHeight, 1), 0.1, 8);
+  return {
+    scale,
+    offsetX: Math.round((canvasWidth - imageWidth * scale) / 2),
+    offsetY: Math.round((canvasHeight - imageHeight * scale) / 2),
+  };
+}
+
+function zoomCanvasViewport(
+  viewport: CanvasViewport,
+  nextScale: number,
+  focalPoint: { x: number; y: number },
+): CanvasViewport {
+  const scale = clamp(nextScale, 0.1, 8);
+  const imageX = (focalPoint.x - viewport.offsetX) / viewport.scale;
+  const imageY = (focalPoint.y - viewport.offsetY) / viewport.scale;
+  return {
+    scale,
+    offsetX: focalPoint.x - imageX * scale,
+    offsetY: focalPoint.y - imageY * scale,
+  };
+}
+
+function drawAnnotationCanvas({
+  activeImage,
+  canvas,
+  ctx,
+  draftBox,
+  imageElement,
+  imageReady,
+  mode,
+  objects,
+  selectedObjectId,
+  size,
+  viewport,
+}: {
+  activeImage: DatasetImage | undefined;
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+  draftBox: { start: { x: number; y: number }; end: { x: number; y: number } } | null;
+  imageElement: HTMLImageElement | null;
+  imageReady: boolean;
+  mode: ToolMode;
+  objects: AnnotationObject[];
+  selectedObjectId: string | null;
+  size: CanvasSize;
+  viewport: CanvasViewport;
+}) {
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.max(1, Math.round(size.width));
+  const height = Math.max(1, Math.round(size.height));
+  const pixelWidth = Math.round(width * dpr);
+  const pixelHeight = Math.round(height * dpr);
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+  }
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "#111827";
+  ctx.fillRect(0, 0, width, height);
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
+  ctx.lineWidth = 1;
+  for (let x = 0; x < width; x += 48) {
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, height);
+    ctx.stroke();
+  }
+  for (let y = 0; y < height; y += 48) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(width, y);
+    ctx.stroke();
+  }
+
+  const imageWidth = activeImage?.width || 640;
+  const imageHeight = activeImage?.height || 480;
+  ctx.save();
+  ctx.translate(viewport.offsetX, viewport.offsetY);
+  ctx.scale(viewport.scale, viewport.scale);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+
+  if (imageReady && imageElement) {
+    ctx.drawImage(imageElement, 0, 0, imageWidth, imageHeight);
+  } else {
+    ctx.fillStyle = "#253044";
+    ctx.fillRect(0, 0, imageWidth, imageHeight);
+    ctx.fillStyle = "#94a3b8";
+    ctx.font = `${Math.max(13 / viewport.scale, 10)}px sans-serif`;
+    ctx.fillText("加载图片", 18 / viewport.scale, 28 / viewport.scale);
+  }
+
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.42)";
+  ctx.lineWidth = 1 / viewport.scale;
+  ctx.strokeRect(0, 0, imageWidth, imageHeight);
+
+  function drawBox(box: NonNullable<AnnotationObject["bbox"]>, label: string, selected: boolean, draft = false) {
+    ctx.save();
+    ctx.lineWidth = (selected ? 3 : 2) / viewport.scale;
+    ctx.strokeStyle = draft ? "#1769e0" : selected ? "#1769e0" : "#1fa7ff";
+    ctx.fillStyle = selected ? "rgba(23, 105, 224, 0.16)" : "rgba(31, 167, 255, 0.08)";
+    if (draft) {
+      ctx.setLineDash([6 / viewport.scale, 4 / viewport.scale]);
+      ctx.fillStyle = "rgba(23, 105, 224, 0.1)";
+    }
+    ctx.fillRect(box.x, box.y, box.width, box.height);
+    ctx.strokeRect(box.x, box.y, box.width, box.height);
+    ctx.setLineDash([]);
+
+    if (!draft) {
+      const fontSize = Math.max(14 / viewport.scale, 9);
+      const labelX = box.x + 4 / viewport.scale;
+      const labelY = Math.max(fontSize + 2 / viewport.scale, box.y - 4 / viewport.scale);
+      ctx.font = `700 ${fontSize}px sans-serif`;
+      ctx.lineJoin = "round";
+      ctx.strokeStyle = "rgba(17, 24, 39, 0.86)";
+      ctx.lineWidth = 4 / viewport.scale;
+      ctx.strokeText(label, labelX, labelY);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText(label, labelX, labelY);
+    }
+
+    if (selected) {
+      const handleSize = 8 / viewport.scale;
+      ctx.fillStyle = "#ffffff";
+      ctx.strokeStyle = "#1769e0";
+      ctx.lineWidth = 2 / viewport.scale;
+      bboxHandles(box).forEach((handle) => {
+        ctx.fillRect(handle.x - handleSize / 2, handle.y - handleSize / 2, handleSize, handleSize);
+        ctx.strokeRect(handle.x - handleSize / 2, handle.y - handleSize / 2, handleSize, handleSize);
+      });
+    }
+    ctx.restore();
+  }
+
+  objects.forEach((object) => {
+    if (object.type === "bbox" && object.bbox) {
+      drawBox(object.bbox, object.label, object.id === selectedObjectId);
+    } else if (object.polygon) {
+      ctx.save();
+      ctx.beginPath();
+      object.polygon.forEach((point, index) => {
+        if (index === 0) ctx.moveTo(point.x, point.y);
+        else ctx.lineTo(point.x, point.y);
+      });
+      ctx.closePath();
+      ctx.fillStyle = "rgba(204, 84, 216, 0.16)";
+      ctx.strokeStyle = "#cc54d8";
+      ctx.lineWidth = 2 / viewport.scale;
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+    }
+  });
+
+  if (draftBox) {
+    drawBox(normalizeBox(draftBox.start, draftBox.end), "", false, true);
+  }
+
+  if (mode === "pan") {
+    ctx.restore();
+    ctx.fillStyle = "rgba(17, 24, 39, 0.62)";
+    ctx.fillRect(12, height - 36, 120, 24);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "12px sans-serif";
+    ctx.fillText("拖拽平移画布", 24, height - 20);
+    return;
+  }
+
+  ctx.restore();
 }
 
 function DatasetCard({
@@ -949,6 +1191,70 @@ function BackendTaskTray({
   );
 }
 
+function ImagePreviewDialog({
+  image,
+  imageUrl,
+  objects,
+  onAnnotate,
+  onClose,
+}: {
+  image: DatasetImage;
+  imageUrl: string | undefined;
+  objects: AnnotationObject[] | undefined;
+  onAnnotate: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="modal-backdrop">
+      <section aria-labelledby="image-preview-title" className="dataset-dialog image-preview-dialog" role="dialog">
+        <div className="detail-header">
+          <div>
+            <span className="eyebrow">查看弹窗</span>
+            <h2 id="image-preview-title">图像预览</h2>
+          </div>
+          <button aria-label="关闭图像预览" type="button" onClick={onClose}>
+            <X size={16} />
+          </button>
+        </div>
+        <div className="image-preview-body">
+          <div
+            className="image-preview-stage"
+            style={{ aspectRatio: `${image.width || 640} / ${image.height || 480}` }}
+          >
+            {imageUrl ? <img alt={`预览 ${image.fileName}`} src={imageUrl} /> : <div className="road-scene" />}
+            <ReadOnlyAnnotationOverlay image={image} objects={objects} />
+          </div>
+          <aside className="image-preview-meta" aria-label="图像信息">
+            <h3>{image.fileName}</h3>
+            <dl>
+              <dt>尺寸</dt>
+              <dd>{image.width} x {image.height}</dd>
+              <dt>状态</dt>
+              <dd>{image.status}</dd>
+              <dt>分组</dt>
+              <dd>{image.split}</dd>
+              <dt>对象数</dt>
+              <dd>{objects?.length ?? 0}</dd>
+            </dl>
+            <div className="tag-list compact">
+              {image.tags.map((tag) => (
+                <span key={tag}>{tag}</span>
+              ))}
+            </div>
+          </aside>
+        </div>
+        <div className="dialog-actions">
+          <button type="button" onClick={onClose}>关闭</button>
+          <button className="primary" type="button" onClick={onAnnotate}>
+            <Tags size={16} />
+            标记
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function ProjectWorkspace({
   projectId,
   onOpenWindow,
@@ -963,9 +1269,11 @@ function ProjectWorkspace({
   const [workflowMessage, setWorkflowMessage] = useState<string | null>(null);
   const [tab, setTab] = useState<ProjectTab>("概览");
   const [imagePage, setImagePage] = useState(0);
+  const [previewImageId, setPreviewImageId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<{ title: string; message: string } | null>(null);
   const imageUrls = useImageAssetUrls(projectId, images, images.length);
   const imageAnnotations = useImageAnnotations(projectId, images, images.length);
+  const previewImage = images.find((image) => image.id === previewImageId) ?? null;
 
   useEffect(() => {
     setImagePage(0);
@@ -1020,6 +1328,18 @@ function ProjectWorkspace({
     const nextExport = await exportDataset(projectId, snapshotId, format);
     setExports((current) => [nextExport, ...current]);
     setWorkflowMessage(`已导出 ${format.toUpperCase()} 数据包`);
+  }
+
+  async function openAnnotationConsole(imageId: string) {
+    try {
+      await openAnnotationWindow(projectId, imageId);
+    } catch (error) {
+      if (isBackendUnavailableError(error)) {
+        navigate(`#/annotate/${projectId}/${imageId}`);
+        return;
+      }
+      throw error;
+    }
   }
 
   if (loadError) {
@@ -1081,8 +1401,18 @@ function ProjectWorkspace({
             onCreateSnapshot: handleCreateSnapshot,
             onExport: handleExport,
             onImagePageChange: setImagePage,
+            onPreviewImage: setPreviewImageId,
           })}
         </section>
+        {previewImage ? (
+          <ImagePreviewDialog
+            image={previewImage}
+            imageUrl={imageUrls[previewImage.id]}
+            objects={imageAnnotations[previewImage.id]}
+            onAnnotate={() => openAnnotationConsole(previewImage.id)}
+            onClose={() => setPreviewImageId(null)}
+          />
+        ) : null}
       </section>
     </main>
   );
@@ -1103,6 +1433,7 @@ function renderProjectTab(
     onCreateSnapshot: () => void;
     onExport: (format: "yolo" | "coco") => void;
     onImagePageChange: (page: number) => void;
+    onPreviewImage: (imageId: string) => void;
   },
 ) {
   switch (tab) {
@@ -1142,7 +1473,10 @@ function renderProjectTab(
       return (
         <div>
           <div className="tab-header-row">
-            <h2>图片浏览</h2>
+            <div className="tab-title-stack">
+              <h2>图片浏览</h2>
+              <p>查看图像、预览已有标注，并从预览进入标记控制台。</p>
+            </div>
             <div className="pager-actions">
               <span>
                 第 {workflow.imagePage + 1} 页 / {formatNumber(detail.project.imageCount)} 张
@@ -1161,14 +1495,15 @@ function renderProjectTab(
           </div>
           <div className="image-grid">
             {images.map((image) => (
-              <div
+              <article
                 className="image-tile"
                 key={image.id}
                 onDoubleClick={() => navigate(`#/annotate/${detail.project.id}/${image.id}`)}
-                role="button"
                 tabIndex={0}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter") navigate(`#/annotate/${detail.project.id}/${image.id}`);
+                  if (event.key === "Enter" && event.currentTarget === event.target) {
+                    navigate(`#/annotate/${detail.project.id}/${image.id}`);
+                  }
                 }}
               >
                 <div className="sample-thumb traffic-a">
@@ -1179,7 +1514,19 @@ function renderProjectTab(
                 </div>
                 <span>{image.fileName}</span>
                 <em>{image.status}</em>
-              </div>
+                <div className="image-tile-actions">
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      workflow.onPreviewImage(image.id);
+                    }}
+                  >
+                    <Eye size={15} />
+                    预览 {image.fileName}
+                  </button>
+                </div>
+              </article>
             ))}
           </div>
         </div>
@@ -1314,6 +1661,17 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
   const activeImage = images.find((image) => image.id === activeImageId) ?? images[0];
   const filmstripUrls = useImageAssetUrls(projectId, images, 12);
   const selectedObject = objects.find((object) => object.id === selectedObjectId) ?? null;
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const canvasShellRef = useRef<HTMLDivElement | null>(null);
+  const imageElementRef = useRef<HTMLImageElement | null>(null);
+  const selectedLabelInputRef = useRef<HTMLInputElement | null>(null);
+  const [canvasSize, setCanvasSize] = useState<CanvasSize>({ width: 800, height: 600 });
+  const [viewport, setViewport] = useState<CanvasViewport>({ scale: 1, offsetX: 80, offsetY: 60 });
+  const [imageReady, setImageReady] = useState(false);
+  const [panState, setPanState] = useState<{
+    start: { x: number; y: number };
+    original: CanvasViewport;
+  } | null>(null);
 
   useEffect(() => {
     setImagesLoaded(false);
@@ -1367,6 +1725,87 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
   }, [projectId, activeImageId, imageId]);
 
   useEffect(() => {
+    function measureCanvas() {
+      const rect = canvasShellRef.current?.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return;
+      setCanvasSize((current) => {
+        const width = Math.round(rect.width);
+        const height = Math.round(rect.height);
+        if (current.width === width && current.height === height) return current;
+        return { width, height };
+      });
+    }
+
+    measureCanvas();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", measureCanvas);
+      return () => window.removeEventListener("resize", measureCanvas);
+    }
+
+    const observer = new ResizeObserver(measureCanvas);
+    if (canvasShellRef.current) observer.observe(canvasShellRef.current);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!activeImage) return;
+    setViewport(fitCanvasViewport(activeImage.width, activeImage.height, canvasSize.width, canvasSize.height));
+  }, [activeImage?.id, activeImage?.width, activeImage?.height, canvasSize.width, canvasSize.height]);
+
+  useEffect(() => {
+    if (!assetUrl) {
+      imageElementRef.current = null;
+      setImageReady(false);
+      return;
+    }
+
+    let cancelled = false;
+    const image = new Image();
+    image.decoding = "async";
+    image.onload = () => {
+      if (cancelled) return;
+      imageElementRef.current = image;
+      setImageReady(true);
+    };
+    image.onerror = () => {
+      if (cancelled) return;
+      imageElementRef.current = null;
+      setImageReady(false);
+    };
+    setImageReady(false);
+    image.src = assetUrl;
+    return () => {
+      cancelled = true;
+    };
+  }, [assetUrl]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    let ctx: CanvasRenderingContext2D | null = null;
+    try {
+      ctx = canvas.getContext("2d");
+    } catch {
+      ctx = null;
+    }
+    if (!ctx) return;
+
+    drawAnnotationCanvas({
+      activeImage,
+      canvas,
+      ctx,
+      draftBox,
+      imageElement: imageElementRef.current,
+      imageReady,
+      mode,
+      objects,
+      selectedObjectId,
+      size: canvasSize,
+      viewport,
+    });
+  }, [activeImage, canvasSize, draftBox, imageReady, mode, objects, selectedObjectId, viewport]);
+
+  useEffect(() => {
     function handleBeforeUnload(event: BeforeUnloadEvent) {
       if (!dirty) return;
       event.preventDefault();
@@ -1400,21 +1839,102 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
 
   useEffect(() => {
     function handleKeyDown(event: globalThis.KeyboardEvent) {
-      if (event.key === "Delete" || event.key === "Backspace") {
-        deleteSelectedObject();
-      }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "d") {
-        event.preventDefault();
-        duplicateSelectedObject();
-      }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+      const key = event.key.toLowerCase();
+      const commandKey = event.ctrlKey || event.metaKey;
+      const editableTarget = isEditableShortcutTarget(event.target);
+
+      if (commandKey && key === "s") {
         event.preventDefault();
         void save();
+        return;
+      }
+
+      if (commandKey && key === "d") {
+        event.preventDefault();
+        duplicateSelectedObject();
+        return;
+      }
+
+      if (commandKey && key === "e") {
+        event.preventDefault();
+        selectedLabelInputRef.current?.focus();
+        selectedLabelInputRef.current?.select();
+        return;
+      }
+
+      if (commandKey && (key === "+" || (key === "=" && event.shiftKey))) {
+        event.preventDefault();
+        zoomImage(1.25);
+        return;
+      }
+
+      if (commandKey && key === "-") {
+        event.preventDefault();
+        zoomImage(0.8);
+        return;
+      }
+
+      if (commandKey && key === "=") {
+        event.preventDefault();
+        resetImageZoom();
+        return;
+      }
+
+      if (commandKey && key === "f") {
+        event.preventDefault();
+        fitImageToCanvas();
+        return;
+      }
+
+      if (editableTarget) return;
+
+      if (key === "delete" || key === "backspace") {
+        event.preventDefault();
+        deleteSelectedObject();
+        return;
+      }
+
+      if (key === "w") {
+        event.preventDefault();
+        setMode("bbox");
+        return;
+      }
+
+      if (key === "a") {
+        event.preventDefault();
+        goToImage(-1);
+        return;
+      }
+
+      if (key === "d") {
+        event.preventDefault();
+        goToImage(1);
+        return;
+      }
+
+      if (key === " ") {
+        event.preventDefault();
+        setAnnotationStatus("已验证");
+        setSaveMessage("已按 LabelImg 快捷键标记为已验证");
+        return;
+      }
+
+      const arrowMove: Record<string, { dx: number; dy: number }> = {
+        arrowup: { dx: 0, dy: -1 },
+        arrowright: { dx: 1, dy: 0 },
+        arrowdown: { dx: 0, dy: 1 },
+        arrowleft: { dx: -1, dy: 0 },
+      };
+      const move = arrowMove[key];
+      if (move) {
+        event.preventDefault();
+        const step = event.shiftKey ? 10 : 1;
+        moveSelectedObject(move.dx * step, move.dy * step);
       }
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selectedObjectId, objects, revision, activeImageId, imageId]);
+  }, [selectedObjectId, selectedObject, objects, revision, activeImageId, imageId, activeImage, dirty, images, saveAndNext, canvasSize]);
 
   function goToImage(offset: number) {
     if (!activeImage) return;
@@ -1444,7 +1964,7 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
     );
   }
 
-  function eventClientPosition(event: MouseEvent<Element>) {
+  function eventClientPosition(event: MouseEvent<Element> | WheelEvent<Element>) {
     const nativeEvent = event.nativeEvent as globalThis.MouseEvent & {
       x?: number;
       pageX?: number;
@@ -1472,30 +1992,86 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
     return { clientX, clientY };
   }
 
-  function pointFromEvent(event: MouseEvent<SVGSVGElement>) {
+  function pointFromEvent(event: MouseEvent<HTMLCanvasElement>) {
     const width = activeImage?.width || 640;
     const height = activeImage?.height || 480;
     const rect = event.currentTarget.getBoundingClientRect();
-    const rectWidth = rect.width || width;
-    const rectHeight = rect.height || height;
     const { clientX, clientY } = eventClientPosition(event);
     return {
-      x: clamp(((clientX - rect.left) / rectWidth) * width, 0, width),
-      y: clamp(((clientY - rect.top) / rectHeight) * height, 0, height),
+      x: clamp(((clientX - rect.left) - viewport.offsetX) / viewport.scale, 0, width),
+      y: clamp(((clientY - rect.top) - viewport.offsetY) / viewport.scale, 0, height),
     };
   }
 
-  function beginCanvasInteraction(event: MouseEvent<SVGSVGElement>) {
+  function canvasLocalPoint(event: MouseEvent<HTMLCanvasElement> | WheelEvent<HTMLCanvasElement>) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const { clientX, clientY } = eventClientPosition(event);
+    return {
+      x: clientX - rect.left,
+      y: clientY - rect.top,
+    };
+  }
+
+  function hitTestObject(point: { x: number; y: number }) {
+    const handleRadius = Math.max(5 / viewport.scale, 3);
+    for (const object of [...objects].reverse()) {
+      if (!object.bbox) continue;
+      if (object.id === selectedObjectId) {
+        const handle = bboxHandles(object.bbox).find(
+          (item) => Math.abs(point.x - item.x) <= handleRadius && Math.abs(point.y - item.y) <= handleRadius,
+        );
+        if (handle) return { object, handle: handle.handle };
+      }
+      const box = object.bbox;
+      if (point.x >= box.x && point.x <= box.x + box.width && point.y >= box.y && point.y <= box.y + box.height) {
+        return { object, handle: null };
+      }
+    }
+    return null;
+  }
+
+  function beginCanvasInteraction(event: MouseEvent<HTMLCanvasElement>) {
+    if (event.button !== 0) return;
+    const localPoint = canvasLocalPoint(event);
+    if (mode === "pan" || event.altKey) {
+      setPanState({ start: localPoint, original: viewport });
+      return;
+    }
+
+    const point = pointFromEvent(event);
+    const target = hitTestObject(point);
+    if (target?.object.bbox) {
+      setMode("select");
+      setSelectedObjectId(target.object.id);
+      setDragState({
+        objectId: target.object.id,
+        kind: target.handle ? "resize" : "move",
+        handle: target.handle ?? undefined,
+        start: point,
+        original: target.object.bbox,
+      });
+      return;
+    }
+
     if (mode !== "bbox") {
       setSelectedObjectId(null);
       return;
     }
 
-    const point = pointFromEvent(event);
     setDraftBox({ start: point, end: point });
   }
 
-  function updateCanvasInteraction(event: MouseEvent<SVGSVGElement>) {
+  function updateCanvasInteraction(event: MouseEvent<HTMLCanvasElement>) {
+    if (panState) {
+      const point = canvasLocalPoint(event);
+      setViewport({
+        ...panState.original,
+        offsetX: panState.original.offsetX + point.x - panState.start.x,
+        offsetY: panState.original.offsetY + point.y - panState.start.y,
+      });
+      return;
+    }
+
     const point = pointFromEvent(event);
     if (draftBox) {
       setDraftBox({ ...draftBox, end: point });
@@ -1528,7 +2104,7 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
     }
   }
 
-  function finishCanvasInteraction(event: MouseEvent<SVGSVGElement>) {
+  function finishCanvasInteraction(event: MouseEvent<HTMLCanvasElement>) {
     if (draftBox) {
       const box = normalizeBox(draftBox.start, pointFromEvent(event));
       setDraftBox(null);
@@ -1548,57 +2124,34 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
     }
 
     setDragState(null);
+    setPanState(null);
   }
 
-  function beginObjectDrag(event: MouseEvent<SVGRectElement>, object: AnnotationObject) {
-    if (!object.bbox) return;
-    event.stopPropagation();
-    setMode("select");
-    setSelectedObjectId(object.id);
-    const ownerSvg = event.currentTarget.ownerSVGElement;
-    const width = activeImage?.width || 640;
-    const height = activeImage?.height || 480;
-    const rect = ownerSvg?.getBoundingClientRect();
-    const rectWidth = rect?.width || width;
-    const rectHeight = rect?.height || height;
-    const { clientX, clientY } = eventClientPosition(event);
-    setDragState({
-      objectId: object.id,
-      kind: "move",
-      start: {
-        x: clamp(((clientX - (rect?.left ?? 0)) / rectWidth) * width, 0, width),
-        y: clamp(((clientY - (rect?.top ?? 0)) / rectHeight) * height, 0, height),
-      },
-      original: object.bbox,
+  function zoomImage(factor: number) {
+    setViewport((current) => zoomCanvasViewport(current, current.scale * factor, {
+      x: canvasSize.width / 2,
+      y: canvasSize.height / 2,
+    }));
+  }
+
+  function fitImageToCanvas() {
+    if (!activeImage) return;
+    setViewport(fitCanvasViewport(activeImage.width, activeImage.height, canvasSize.width, canvasSize.height));
+  }
+
+  function resetImageZoom() {
+    setViewport({
+      scale: 1,
+      offsetX: (canvasSize.width - (activeImage?.width || 640)) / 2,
+      offsetY: (canvasSize.height - (activeImage?.height || 480)) / 2,
     });
   }
 
-  function beginObjectResize(
-    event: MouseEvent<SVGRectElement>,
-    object: AnnotationObject,
-    handle: "nw" | "ne" | "sw" | "se",
-  ) {
-    if (!object.bbox) return;
-    event.stopPropagation();
-    setMode("select");
-    setSelectedObjectId(object.id);
-    const ownerSvg = event.currentTarget.ownerSVGElement;
-    const width = activeImage?.width || 640;
-    const height = activeImage?.height || 480;
-    const rect = ownerSvg?.getBoundingClientRect();
-    const rectWidth = rect?.width || width;
-    const rectHeight = rect?.height || height;
-    const { clientX, clientY } = eventClientPosition(event);
-    setDragState({
-      objectId: object.id,
-      kind: "resize",
-      handle,
-      start: {
-        x: clamp(((clientX - (rect?.left ?? 0)) / rectWidth) * width, 0, width),
-        y: clamp(((clientY - (rect?.top ?? 0)) / rectHeight) * height, 0, height),
-      },
-      original: object.bbox,
-    });
+  function handleCanvasWheel(event: WheelEvent<HTMLCanvasElement>) {
+    event.preventDefault();
+    const localPoint = canvasLocalPoint(event);
+    const factor = event.deltaY > 0 ? 0.9 : 1.1;
+    setViewport((current) => zoomCanvasViewport(current, current.scale * factor, localPoint));
   }
 
   function updateSelectedLabel(label: string) {
@@ -1642,6 +2195,24 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
     );
   }
 
+  function moveSelectedObject(dx: number, dy: number) {
+    if (!selectedObjectId || !activeImage) return;
+    setDirty(true);
+    setObjects((current) =>
+      current.map((object) => {
+        if (object.id !== selectedObjectId || !object.bbox) return object;
+        return {
+          ...object,
+          bbox: {
+            ...object.bbox,
+            x: Number(clamp(object.bbox.x + dx, 0, activeImage.width - object.bbox.width).toFixed(1)),
+            y: Number(clamp(object.bbox.y + dy, 0, activeImage.height - object.bbox.height).toFixed(1)),
+          },
+        };
+      }),
+    );
+  }
+
   function deleteSelectedObject() {
     if (!selectedObjectId) return;
     setDirty(true);
@@ -1672,12 +2243,22 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
     setDirty(true);
   }
 
+  function beginWindowDrag(event: MouseEvent<HTMLElement>) {
+    if (event.button !== 0) return;
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    if (target?.closest("[data-no-drag], button, input, textarea, select, a, label")) {
+      return;
+    }
+    void runDesktopCommand("start_drag_window");
+  }
+
   return (
     <main className="annotation-page">
       <aside className="tool-rail" aria-label="Annotation tools">
         {[
           { label: "选择", icon: MousePointer2, mode: "select" as ToolMode },
           { label: "BBox", icon: BoxSelect, mode: "bbox" as ToolMode },
+          { label: "平移", icon: Move, mode: "pan" as ToolMode },
           { label: "Polygon", icon: Square, mode: "polygon" as ToolMode },
           { label: "智能工具", icon: Zap, mode: "select" as ToolMode },
           { label: "显示", icon: Eye, mode: "select" as ToolMode },
@@ -1699,12 +2280,12 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
         })}
       </aside>
       <section className="workspace-area">
-        <div className="annotation-toolbar">
+        <div className="annotation-toolbar" data-tauri-drag-region onMouseDown={beginWindowDrag}>
           <div>
             <h1>标注工作台</h1>
             <span>{projectId} / {activeImage?.fileName ?? "加载图片"} / {annotationStatus}</span>
           </div>
-          <div className="annotation-actions">
+          <div className="annotation-actions" data-no-drag>
             {saveMessage ? <span>{saveMessage}</span> : null}
             {dirty ? <span className="dirty-state">未保存</span> : null}
             <label className="inline-toggle">
@@ -1728,62 +2309,49 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
             <button type="button" onClick={() => save({ next: true })}>
               保存并下一张
             </button>
+            <span className="annotation-window-controls">
+              <button aria-label="最小化标注工作台" type="button" onClick={() => runDesktopCommand("minimize_window")}>
+                <Minimize2 size={16} />
+              </button>
+              <button aria-label="最大化标注工作台" type="button" onClick={() => runDesktopCommand("toggle_maximize_window")}>
+                <Maximize2 size={16} />
+              </button>
+              <button aria-label="关闭标注工作台" type="button" onClick={() => runDesktopCommand("close_window")}>
+                <X size={16} />
+              </button>
+            </span>
           </div>
         </div>
         <div className="image-stage">
-          <div
-            className="real-image-stage"
-            style={{ aspectRatio: activeImage ? `${activeImage.width} / ${activeImage.height}` : undefined }}
-          >
-            {assetUrl && activeImage ? <img alt={activeImage.fileName} src={assetUrl} /> : <div className="road-scene" />}
-            <svg
-              className={`annotation-overlay ${mode === "bbox" ? "drawing" : ""}`}
+          <div className="canvas-stage-shell" ref={canvasShellRef}>
+            <canvas
+              aria-label={activeImage ? `${activeImage.fileName} 标注画布` : "标注画布"}
+              className={`annotation-canvas ${mode === "bbox" ? "drawing" : ""} ${mode === "pan" || panState ? "panning" : ""}`}
               data-testid="annotation-canvas"
+              height={canvasSize.height}
               onMouseDown={beginCanvasInteraction}
               onMouseMove={updateCanvasInteraction}
               onMouseUp={finishCanvasInteraction}
-              viewBox={`0 0 ${activeImage?.width || 640} ${activeImage?.height || 480}`}
-              preserveAspectRatio="none"
-            >
-              {objects.map((object) => object.type === "bbox" && object.bbox ? (
-                <g key={object.id}>
-                  <rect
-                    aria-label={`${object.label} bbox`}
-                    className={`annotation-rect ${object.id === selectedObjectId ? "selected" : ""}`}
-                    onMouseDown={(event) => beginObjectDrag(event, object)}
-                    x={object.bbox.x}
-                    y={object.bbox.y}
-                    width={object.bbox.width}
-                    height={object.bbox.height}
-                  />
-                  <text x={object.bbox.x + 4} y={Math.max(14, object.bbox.y - 4)}>{object.label}</text>
-                  {object.id === selectedObjectId ? (
-                    <>
-                      {bboxHandles(object.bbox).map((handle) => (
-                        <rect
-                          aria-label={`${handle.handle} resize`}
-                          className="annotation-handle"
-                          key={handle.handle}
-                          onMouseDown={(event) => beginObjectResize(event, object, handle.handle)}
-                          x={handle.x - 4}
-                          y={handle.y - 4}
-                          width={8}
-                          height={8}
-                        />
-                      ))}
-                    </>
-                  ) : null}
-                </g>
-              ) : object.polygon ? (
-                <polygon className="annotation-polygon" key={object.id} points={object.polygon.map((point) => `${point.x},${point.y}`).join(" ")} />
-              ) : null)}
-              {draftBox ? (
-                <rect
-                  className="annotation-rect draft"
-                  {...normalizeBox(draftBox.start, draftBox.end)}
-                />
-              ) : null}
-            </svg>
+              onMouseLeave={finishCanvasInteraction}
+              onWheel={handleCanvasWheel}
+              ref={canvasRef}
+              width={canvasSize.width}
+            />
+            <div className="canvas-controls" data-no-drag>
+              <button aria-label="缩小图像" type="button" onClick={() => zoomImage(0.8)}>
+                <ZoomOut size={16} />
+              </button>
+              <button aria-label="图像适配窗口" type="button" onClick={fitImageToCanvas}>
+                适配
+              </button>
+              <button aria-label="重置为原始大小" type="button" onClick={resetImageZoom}>
+                1:1
+              </button>
+              <button aria-label="放大图像" type="button" onClick={() => zoomImage(1.25)}>
+                <ZoomIn size={16} />
+              </button>
+              <span className="zoom-readout">{Math.round(viewport.scale * 100)}%</span>
+            </div>
           </div>
         </div>
         <div className="filmstrip">
@@ -1827,6 +2395,7 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
               aria-label="对象标签"
               disabled={!selectedObject}
               onChange={(event) => updateSelectedLabel(event.target.value)}
+              ref={selectedLabelInputRef}
               value={selectedObject?.label ?? ""}
             />
           </dd>
@@ -2085,6 +2654,10 @@ export default function App() {
     );
   }
 
+  if (route.name === "annotate") {
+    return <AnnotationWorkspace imageId={route.imageId} projectId={route.projectId} />;
+  }
+
   return (
     <div className="app-shell">
       <TopBar
@@ -2109,7 +2682,6 @@ export default function App() {
           />
         )}
         {route.name === "project" && <ProjectWorkspace onOpenWindow={openProjectWindow} projectId={route.projectId} />}
-        {route.name === "annotate" && <AnnotationWorkspace imageId={route.imageId} projectId={route.projectId} />}
       </div>
       {createDialogOpen ? (
         <CreateDatasetDialog
