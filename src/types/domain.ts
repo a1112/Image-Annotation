@@ -57,6 +57,11 @@ export type DatasetImage = {
   tags: string[];
 };
 
+export type ClassSample = {
+  image: DatasetImage;
+  matchCount: number;
+};
+
 export type BBox = {
   x: number;
   y: number;

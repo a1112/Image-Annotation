@@ -6,6 +6,7 @@ import type {
   DatasetExport,
   BackendTask,
   BuiltinDataset,
+  ClassSample,
   DatasetImage,
   DatasetProject,
   DatasetSnapshot,
@@ -98,6 +99,19 @@ export async function listProjectImages(
     groupId: groupId ?? null,
     offset: page?.offset ?? null,
     limit: page?.limit ?? null,
+  });
+}
+
+export async function listClassSamples(
+  projectId: string,
+  query: { classId?: number; label: string; offset?: number; limit?: number },
+): Promise<ClassSample[]> {
+  return invokeRequired("list_class_samples", {
+    projectId,
+    classId: query.classId ?? null,
+    label: query.label,
+    offset: query.offset ?? null,
+    limit: query.limit ?? null,
   });
 }
 
