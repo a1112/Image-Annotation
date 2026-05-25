@@ -114,6 +114,7 @@ pub struct TagGroup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClassStat {
+    pub id: u32,
     pub label: String,
     pub color: String,
     pub count: u32,
@@ -436,6 +437,7 @@ impl SampleRepository {
                     .take(12)
                     .enumerate()
                     .map(|(index, label)| ClassStat {
+                        id: index as u32,
                         label,
                         color: class_color(index),
                         count: 0,
@@ -447,6 +449,7 @@ impl SampleRepository {
                     .into_iter()
                     .take(12)
                     .map(|class| ClassStat {
+                        id: class.id,
                         label: class.label,
                         color: class.color,
                         count: 0,

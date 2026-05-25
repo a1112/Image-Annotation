@@ -89,7 +89,7 @@ vi.mock("@tauri-apps/api/core", () => ({
             exportEnabled: true,
           },
         ],
-        classes: [{ label: "person", color: "#cc54d8", count: 12, attributes: [] }],
+        classes: [{ id: 0, label: "person", color: "#cc54d8", count: 12, attributes: [] }],
         tasks: [],
         qualityChecks: [],
         exportPresets: [],
@@ -158,6 +158,25 @@ vi.mock("@tauri-apps/api/core", () => ({
         status: "已标注",
         tags: ["split=train"],
       }));
+    }
+
+    if (command === "list_class_samples") {
+      return [
+        {
+          image: {
+            id: "000000000009",
+            fileName: "000000000009.jpg",
+            width: 640,
+            height: 480,
+            split: "train",
+            status: "已标注",
+            qaStatus: "",
+            reviewNote: null,
+            tags: ["split=train"],
+          },
+          matchCount: 2,
+        },
+      ];
     }
 
     if (command === "get_file_asset_path") {
@@ -576,6 +595,30 @@ describe("desktop shell", () => {
     await user.click(screen.getByRole("button", { name: "导出" }));
     expect(screen.getByText("导出预设")).toBeInTheDocument();
     expect(screen.getByText("暂无导出记录")).toBeInTheDocument();
+  });
+
+  it("类别页可以按类别查看样本并打开预览", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(screen.getByRole("button", { name: "类别" }));
+    await user.click(screen.getByRole("button", { name: "查看 person 样本" }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("list_class_samples", {
+        projectId: "coco128",
+        classId: 0,
+        label: "person",
+        offset: 0,
+        limit: 48,
+      }),
+    );
+    expect(await screen.findByRole("heading", { name: "person 样本" })).toBeInTheDocument();
+    expect(screen.getByText("2 个匹配对象")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "预览 000000000009.jpg" }));
+    expect(screen.getByRole("dialog", { name: "图像预览" })).toBeInTheDocument();
   });
 
   it("图片浏览页面使用真实图像缩略图", async () => {

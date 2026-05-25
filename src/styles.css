@@ -1349,7 +1349,34 @@ button:hover {
 }
 
 .table-row strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   color: #182230;
+}
+
+.class-sample-layout {
+  display: grid;
+  gap: 18px;
+}
+
+.class-row button {
+  justify-self: end;
+}
+
+.class-color {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+}
+
+.class-sample-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.empty-state.error {
+  color: #c24132;
 }
 
 .quality-card {

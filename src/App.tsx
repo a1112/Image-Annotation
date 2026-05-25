@@ -49,6 +49,7 @@ import {
   isBackendUnavailableError,
   listBackendTasks,
   listBuiltinDatasets,
+  listClassSamples,
   listDatasetProjects,
   listExports,
   listProjectImages,
@@ -64,6 +65,8 @@ import type {
   AnnotationObject,
   BackendTask,
   BuiltinDataset,
+  ClassSample,
+  ClassStat,
   DatasetExport,
   DatasetImage,
   DatasetProject,
@@ -1271,13 +1274,63 @@ function ProjectWorkspace({
   const [imagePage, setImagePage] = useState(0);
   const [previewImageId, setPreviewImageId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<{ title: string; message: string } | null>(null);
+  const [selectedClass, setSelectedClass] = useState<ClassStat | null>(null);
+  const [classSamples, setClassSamples] = useState<ClassSample[]>([]);
+  const [classSamplePage, setClassSamplePage] = useState(0);
+  const [classSampleState, setClassSampleState] = useState<"idle" | "loading" | "error">("idle");
+  const [classSampleMessage, setClassSampleMessage] = useState<string | null>(null);
+  const classSampleImages = useMemo(() => classSamples.map((sample) => sample.image), [classSamples]);
   const imageUrls = useImageAssetUrls(projectId, images, images.length);
   const imageAnnotations = useImageAnnotations(projectId, images, images.length);
-  const previewImage = images.find((image) => image.id === previewImageId) ?? null;
+  const classSampleUrls = useImageAssetUrls(projectId, classSampleImages, classSampleImages.length);
+  const classSampleAnnotations = useImageAnnotations(projectId, classSampleImages, classSampleImages.length);
+  const previewImage =
+    images.find((image) => image.id === previewImageId)
+    ?? classSampleImages.find((image) => image.id === previewImageId)
+    ?? null;
 
   useEffect(() => {
     setImagePage(0);
+    setSelectedClass(null);
+    setClassSamples([]);
+    setClassSamplePage(0);
   }, [projectId]);
+
+  useEffect(() => {
+    if (!selectedClass) {
+      setClassSamples([]);
+      setClassSampleState("idle");
+      setClassSampleMessage(null);
+      return;
+    }
+
+    let cancelled = false;
+    setClassSampleState("loading");
+    setClassSampleMessage(null);
+    listClassSamples(projectId, {
+      classId: selectedClass.id,
+      label: selectedClass.label,
+      offset: classSamplePage * projectImagePageSize,
+      limit: projectImagePageSize,
+    })
+      .then((samples) => {
+        if (!cancelled) {
+          setClassSamples(samples);
+          setClassSampleState("idle");
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setClassSamples([]);
+          setClassSampleState("error");
+          setClassSampleMessage(error instanceof Error ? error.message : String(error));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, selectedClass, classSamplePage]);
 
   useEffect(() => {
     setLoadError(null);
@@ -1393,22 +1446,35 @@ function ProjectWorkspace({
         </div>
         <section className="project-surface">
           {renderProjectTab(tab, detail, images, imageUrls, imageAnnotations, {
+            classSampleAnnotations,
+            classSampleMessage,
+            classSamplePage,
+            classSampleState,
+            classSampleUrls,
+            classSamples,
             exports,
             imagePage,
             imagePageSize: projectImagePageSize,
+            selectedClass,
             snapshots,
             workflowMessage,
+            onClassSamplePageChange: setClassSamplePage,
             onCreateSnapshot: handleCreateSnapshot,
             onExport: handleExport,
             onImagePageChange: setImagePage,
+            onOpenClassSample: openAnnotationConsole,
             onPreviewImage: setPreviewImageId,
+            onSelectClass: (row) => {
+              setSelectedClass(row);
+              setClassSamplePage(0);
+            },
           })}
         </section>
         {previewImage ? (
           <ImagePreviewDialog
             image={previewImage}
-            imageUrl={imageUrls[previewImage.id]}
-            objects={imageAnnotations[previewImage.id]}
+            imageUrl={imageUrls[previewImage.id] ?? classSampleUrls[previewImage.id]}
+            objects={imageAnnotations[previewImage.id] ?? classSampleAnnotations[previewImage.id]}
             onAnnotate={() => openAnnotationConsole(previewImage.id)}
             onClose={() => setPreviewImageId(null)}
           />
@@ -1425,11 +1491,21 @@ function renderProjectTab(
   imageUrls: Record<string, string>,
   imageAnnotations: Record<string, AnnotationObject[]>,
   workflow: {
+    selectedClass: ClassStat | null;
+    classSamples: ClassSample[];
+    classSamplePage: number;
+    classSampleState: "idle" | "loading" | "error";
+    classSampleMessage: string | null;
+    classSampleUrls: Record<string, string>;
+    classSampleAnnotations: Record<string, AnnotationObject[]>;
     snapshots: DatasetSnapshot[];
     exports: DatasetExport[];
     imagePage: number;
     imagePageSize: number;
     workflowMessage: string | null;
+    onSelectClass: (row: ClassStat) => void;
+    onClassSamplePageChange: (page: number) => void;
+    onOpenClassSample: (imageId: string) => void;
     onCreateSnapshot: () => void;
     onExport: (format: "yolo" | "coco") => void;
     onImagePageChange: (page: number) => void;
@@ -1532,18 +1608,86 @@ function renderProjectTab(
         </div>
       );
     case "类别":
+      const matchedObjectCount = workflow.classSamples.reduce((sum, sample) => sum + sample.matchCount, 0);
       return (
-        <div>
-          <h2>类别体系</h2>
-          <div className="data-table">
-            {detail.classes.map((row) => (
-              <div className="table-row" key={row.label}>
-                <strong>{row.label}</strong>
-                <span>{row.count} 个对象</span>
-                <span>{row.attributes.join(", ") || "默认属性"}</span>
-              </div>
-            ))}
+        <div className="class-sample-layout">
+          <div>
+            <h2>类别体系</h2>
+            <div className="data-table">
+              {detail.classes.map((row) => (
+                <div className="table-row class-row" key={row.label}>
+                  <strong>
+                    <span className="class-color" style={{ backgroundColor: row.color }} />
+                    {row.label}
+                  </strong>
+                  <span>{row.count} 个对象</span>
+                  <span>{row.attributes.join(", ") || "默认属性"}</span>
+                  <button
+                    aria-label={`查看 ${row.label} 样本`}
+                    type="button"
+                    onClick={() => workflow.onSelectClass(row)}
+                  >
+                    查看样本
+                  </button>
+                </div>
+              ))}
+            </div>
           </div>
+          {workflow.selectedClass ? (
+            <section className="class-sample-panel" aria-label={`${workflow.selectedClass.label} 样本`}>
+              <div className="tab-header-row">
+                <div className="tab-title-stack">
+                  <h2>{workflow.selectedClass.label} 样本</h2>
+                  <p>{workflow.classSamples.length} 张图片 / {matchedObjectCount} 个匹配对象</p>
+                </div>
+                <div className="pager-actions">
+                  <span>第 {workflow.classSamplePage + 1} 页</span>
+                  <button
+                    type="button"
+                    onClick={() => workflow.onClassSamplePageChange(Math.max(0, workflow.classSamplePage - 1))}
+                    disabled={workflow.classSamplePage === 0 || workflow.classSampleState === "loading"}
+                  >
+                    上一页
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => workflow.onClassSamplePageChange(workflow.classSamplePage + 1)}
+                    disabled={workflow.classSamples.length < workflow.imagePageSize || workflow.classSampleState === "loading"}
+                  >
+                    下一页
+                  </button>
+                </div>
+              </div>
+              {workflow.classSampleState === "loading" ? <p className="empty-state">加载类别样本...</p> : null}
+              {workflow.classSampleState === "error" ? <p className="empty-state error">{workflow.classSampleMessage}</p> : null}
+              {workflow.classSampleState === "idle" && workflow.classSamples.length === 0 ? (
+                <p className="empty-state">暂无匹配样本</p>
+              ) : null}
+              <div className="image-grid">
+                {workflow.classSamples.map((sample) => (
+                  <article className="image-tile" key={sample.image.id}>
+                    <div className="sample-thumb traffic-a">
+                      {workflow.classSampleUrls[sample.image.id] ? (
+                        <img alt={sample.image.fileName} decoding="async" loading="lazy" src={workflow.classSampleUrls[sample.image.id]} />
+                      ) : null}
+                      <ThumbnailAnnotationOverlay image={sample.image} objects={workflow.classSampleAnnotations[sample.image.id]} />
+                    </div>
+                    <span>{sample.image.fileName}</span>
+                    <em>{sample.matchCount} 个匹配对象</em>
+                    <div className="image-tile-actions">
+                      <button type="button" onClick={() => workflow.onPreviewImage(sample.image.id)}>
+                        <Eye size={15} />
+                        预览 {sample.image.fileName}
+                      </button>
+                      <button type="button" onClick={() => workflow.onOpenClassSample(sample.image.id)}>
+                        标记
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </section>
+          ) : null}
         </div>
       );
     case "任务":

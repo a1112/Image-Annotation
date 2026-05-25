@@ -152,6 +152,7 @@ export type TagGroup = {
 };
 
 export type ClassStat = {
+  id?: number;
   label: string;
   color: string;
   count: number;
