@@ -11,7 +11,7 @@ pub mod windows;
 use datasets::{BuiltinDataset, DownloadJob};
 use domain::{
     AnnotationObject, AnnotationSaveResult, AnnotationState, AnnotationTask, AnnotationVersion,
-    BackendDesign, BackendTask, DatasetExport, DatasetImage, DatasetProject, DatasetSnapshot,
+    BackendDesign, BackendTask, ClassSample, DatasetExport, DatasetImage, DatasetProject, DatasetSnapshot,
     ProjectDetail, SampleRepository, TaskItem,
 };
 use platform::NativeBackdropStatus;
@@ -446,6 +446,19 @@ fn list_project_images(
 }
 
 #[tauri::command]
+fn list_class_samples(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    class_id: Option<u32>,
+    label: String,
+    offset: Option<u32>,
+    limit: Option<u32>,
+) -> Result<Vec<ClassSample>, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    Ok(repository.class_samples(&project_id, class_id, &label, offset, limit))
+}
+
+#[tauri::command]
 fn get_image_annotations(
     repository: State<'_, RepositoryState>,
     project_id: String,
@@ -768,6 +781,7 @@ pub fn run() {
                 generate_thumbnails,
                 get_dataset_download_job,
                 list_project_images,
+                list_class_samples,
                 get_image_annotations,
                 get_image_annotation_state,
                 save_image_annotations,

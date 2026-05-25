@@ -310,6 +310,16 @@ fn dispatch_command(
             serde_json::to_value(repository.project_images_paged(&project_id, group_id, offset, limit))
                 .map_err(|err| err.to_string())
         }
+        "list_class_samples" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let class_id = optional_u32_arg(&args, "classId");
+            let label = string_arg(&args, "label")?;
+            let offset = optional_u32_arg(&args, "offset");
+            let limit = optional_u32_arg(&args, "limit");
+            let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
+            serde_json::to_value(repository.class_samples(&project_id, class_id, &label, offset, limit))
+                .map_err(|err| err.to_string())
+        }
         "get_image_annotations" => {
             let project_id = string_arg(&args, "projectId")?;
             let image_id = string_arg(&args, "imageId")?;

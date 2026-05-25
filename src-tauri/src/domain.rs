@@ -37,6 +37,13 @@ pub struct DatasetImage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ClassSample {
+    pub image: DatasetImage,
+    pub match_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BBox {
     pub x: f64,
     pub y: f64,
@@ -475,6 +482,37 @@ impl SampleRepository {
 
     pub fn project_images(&self, project_id: &str, group_id: Option<String>) -> Vec<DatasetImage> {
         self.project_images_paged(project_id, group_id, None, None)
+    }
+
+    pub fn class_samples(
+        &self,
+        project_id: &str,
+        class_id: Option<u32>,
+        label: &str,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> Vec<ClassSample> {
+        let offset = offset.unwrap_or(0) as usize;
+        let limit = limit.unwrap_or(u32::MAX) as usize;
+        self.project_images(project_id, None)
+            .into_iter()
+            .filter_map(|image| {
+                let match_count = self
+                    .image_annotation_state(project_id, &image.id)
+                    .objects
+                    .into_iter()
+                    .filter(|object| {
+                        class_id
+                            .map(|id| object.class_id == id)
+                            .unwrap_or(false)
+                            || object.label == label
+                    })
+                    .count() as u32;
+                (match_count > 0).then_some(ClassSample { image, match_count })
+            })
+            .skip(offset)
+            .take(limit)
+            .collect()
     }
 
     pub fn project_images_paged(
@@ -1309,4 +1347,123 @@ fn now_unix_string() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs().to_string())
         .unwrap_or_else(|_| "0".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lists_images_that_contain_selected_class_with_match_counts() {
+        let repository = SampleRepository::new();
+        let project_id = "class-sample-unit";
+        let paths = project_fs::project_paths(project_id);
+        let _ = std::fs::remove_dir_all(&paths.root);
+        project_fs::ensure_workspace_project_dirs(project_id).unwrap();
+        storage::initialize_project_database(&paths.sqlite).unwrap();
+
+        let manifest = project_fs::ProjectManifest {
+            id: project_id.to_string(),
+            name: "Class Sample Unit".to_string(),
+            source_dataset_key: "local-demo".to_string(),
+            format: "yolo-detect".to_string(),
+            root_path: paths.root.to_string_lossy().to_string(),
+            created_at: now_unix_string(),
+            class_count: 2,
+            image_count: 2,
+        };
+        let images = vec![
+            storage::StoredImage {
+                id: "image-a".to_string(),
+                file_name: "image-a.png".to_string(),
+                width: 640,
+                height: 480,
+                split: "train".to_string(),
+                status: "已标注".to_string(),
+                qa_status: String::new(),
+                review_note: None,
+            },
+            storage::StoredImage {
+                id: "image-b".to_string(),
+                file_name: "image-b.png".to_string(),
+                width: 640,
+                height: 480,
+                split: "train".to_string(),
+                status: "已标注".to_string(),
+                qa_status: String::new(),
+                review_note: None,
+            },
+        ];
+        let classes = vec![
+            storage::StoredClass {
+                id: 0,
+                label: "person".to_string(),
+                color: "#1fa7ff".to_string(),
+            },
+            storage::StoredClass {
+                id: 1,
+                label: "car".to_string(),
+                color: "#cc54d8".to_string(),
+            },
+        ];
+        storage::upsert_project_index(&paths.sqlite, &manifest, &images, &classes).unwrap();
+
+        repository
+            .save_image_annotations_with_revision(
+                project_id,
+                "image-a",
+                None,
+                vec![
+                    AnnotationObject::bbox(
+                        "ann-1".to_string(),
+                        0,
+                        "person".to_string(),
+                        BBox {
+                            x: 1.0,
+                            y: 1.0,
+                            width: 10.0,
+                            height: 10.0,
+                        },
+                    ),
+                    AnnotationObject::bbox(
+                        "ann-2".to_string(),
+                        0,
+                        "person".to_string(),
+                        BBox {
+                            x: 2.0,
+                            y: 2.0,
+                            width: 10.0,
+                            height: 10.0,
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        repository
+            .save_image_annotations_with_revision(
+                project_id,
+                "image-b",
+                None,
+                vec![AnnotationObject::bbox(
+                    "ann-3".to_string(),
+                    1,
+                    "car".to_string(),
+                    BBox {
+                        x: 1.0,
+                        y: 1.0,
+                        width: 10.0,
+                        height: 10.0,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let samples = repository.class_samples(project_id, Some(0), "person", Some(0), Some(48));
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].image.id, "image-a");
+        assert_eq!(samples[0].match_count, 2);
+
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
 }
