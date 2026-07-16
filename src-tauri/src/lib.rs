@@ -14,6 +14,7 @@ use domain::{
     BackendDesign, BackendTask, ClassSample, DatasetExport, DatasetImage, DatasetProject,
     DatasetSnapshot, ProjectDetail, SampleRepository, TaskItem,
 };
+use importers::adapter::SourceSyncResult;
 use platform::NativeBackdropStatus;
 use serde::Serialize;
 use std::sync::Mutex;
@@ -693,6 +694,15 @@ fn export_dataset(
 }
 
 #[tauri::command]
+fn sync_dataset_source(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+) -> Result<SourceSyncResult, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.sync_dataset_source(&project_id)
+}
+
+#[tauri::command]
 fn list_exports(
     repository: State<'_, RepositoryState>,
     project_id: String,
@@ -870,6 +880,7 @@ pub fn run() {
                 create_dataset_snapshot,
                 list_snapshots,
                 export_dataset,
+                sync_dataset_source,
                 list_exports,
                 get_file_asset_path,
                 open_annotation_window,
@@ -943,6 +954,7 @@ pub fn run() {
             create_dataset_snapshot,
             list_snapshots,
             export_dataset,
+            sync_dataset_source,
             list_exports,
             get_file_asset_path,
             open_annotation_window,

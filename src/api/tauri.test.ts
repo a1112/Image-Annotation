@@ -1,7 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { detectBackendConnection, getFileAssetUrl, listClassSamples, listDatasetProjects, openAnnotationWindow } from "./tauri";
+import {
+  detectBackendConnection,
+  getFileAssetUrl,
+  listClassSamples,
+  listDatasetProjects,
+  openAnnotationWindow,
+  syncDatasetSource,
+} from "./tauri";
 import { invoke } from "@tauri-apps/api/core";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -34,6 +41,20 @@ describe("backend fallback", () => {
       label: "person",
       offset: 0,
       limit: 48,
+    });
+  });
+
+  it("COCO 源同步调用数据集级后端命令", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      path: "F:/datasets/annotations.json",
+      sourceVersion: "100:200",
+    });
+
+    const result = await syncDatasetSource("linked-coco");
+
+    expect(result.sourceVersion).toBe("100:200");
+    expect(invoke).toHaveBeenCalledWith("sync_dataset_source", {
+      projectId: "linked-coco",
     });
   });
 

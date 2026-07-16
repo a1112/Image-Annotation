@@ -501,6 +501,12 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
             serde_json::to_value(repository.export_dataset(&project_id, &snapshot_id, &format)?)
                 .map_err(|err| err.to_string())
         }
+        "sync_dataset_source" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
+            serde_json::to_value(repository.sync_dataset_source(&project_id)?)
+                .map_err(|err| err.to_string())
+        }
         "list_backend_tasks" => {
             let mut tasks = runtime.tasks.lock().map_err(|err| err.to_string())?.clone();
             tasks.sort_by(|left, right| right.started_at.cmp(&left.started_at));

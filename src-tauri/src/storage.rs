@@ -475,6 +475,33 @@ pub fn read_image_source(path: &Path, image_id: &str) -> Result<Option<StoredIma
         .map_err(|err| err.to_string())
 }
 
+pub fn read_image_sources(path: &Path) -> Result<Vec<StoredImageSource>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    initialize_project_database(path)?;
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT image_id, relative_path, external_id, annotation_path, source_version FROM image_sources ORDER BY image_id",
+        )
+        .map_err(|err| err.to_string())?;
+    let sources = statement
+        .query_map([], |row| {
+            Ok(StoredImageSource {
+                image_id: row.get(0)?,
+                relative_path: row.get(1)?,
+                external_id: row.get(2)?,
+                annotation_path: row.get(3)?,
+                source_version: row.get(4)?,
+            })
+        })
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    Ok(sources)
+}
+
 pub fn read_images(path: &Path, split: Option<&str>) -> Result<Vec<StoredImage>, String> {
     if !path.exists() {
         return Ok(Vec::new());

@@ -1,5 +1,5 @@
 use crate::{
-    importers::{labelme, voc_adapter, yolo_adapter},
+    importers::{adapter::SourceSyncResult, coco, labelme, voc_adapter, yolo_adapter},
     project_fs, storage,
 };
 use serde::{Deserialize, Serialize};
@@ -716,6 +716,28 @@ impl SampleRepository {
             "labelme" => {
                 labelme::load_annotations(&root, &image_path, &labels).map(|loaded| loaded.objects)
             }
+            "coco" => {
+                let source = storage::read_dataset_source(&paths.sqlite)
+                    .ok()
+                    .flatten()
+                    .ok_or_else(|| "COCO dataset source mapping not found".to_string());
+                let mapping = storage::read_image_source(&paths.sqlite, image_id)
+                    .ok()
+                    .flatten()
+                    .ok_or_else(|| format!("COCO image source mapping not found: {image_id}"));
+                source.and_then(|source| {
+                    mapping.and_then(|mapping| {
+                        let annotation_path = source
+                            .annotation_path
+                            .map(|path| root.join(path))
+                            .ok_or_else(|| "COCO annotation path not found".to_string())?;
+                        let external_id = mapping.external_id.ok_or_else(|| {
+                            format!("COCO external image id not found: {image_id}")
+                        })?;
+                        coco::load_image_annotations(&root, &annotation_path, &external_id)
+                    })
+                })
+            }
             _ => Ok(Vec::new()),
         }
         .unwrap_or_default();
@@ -840,6 +862,49 @@ impl SampleRepository {
     pub fn submit_image_annotations(&self, project_id: &str, image_id: &str) -> Result<(), String> {
         let paths = project_fs::project_paths(project_id);
         storage::submit_image_for_review(&paths.sqlite, image_id)
+    }
+
+    pub fn sync_dataset_source(&self, project_id: &str) -> Result<SourceSyncResult, String> {
+        let paths = project_fs::project_paths(project_id);
+        let source = storage::read_dataset_source(&paths.sqlite)?
+            .ok_or_else(|| format!("dataset source mapping not found: {project_id}"))?;
+        if source.format != "coco" {
+            return Err(format!(
+                "dataset-level source sync is not supported for {}",
+                source.format
+            ));
+        }
+        let root = PathBuf::from(&source.root_path);
+        let annotation_path = source
+            .annotation_path
+            .as_ref()
+            .map(|path| root.join(path))
+            .ok_or_else(|| "COCO annotation path not found".to_string())?;
+        let mut mappings = storage::read_image_sources(&paths.sqlite)?;
+        let expected_version = mappings
+            .iter()
+            .map(|mapping| mapping.source_version.as_str())
+            .find(|value| !value.is_empty());
+        let mut objects_by_image = BTreeMap::new();
+        for mapping in &mappings {
+            let external_id = mapping
+                .external_id
+                .as_ref()
+                .ok_or_else(|| format!("COCO external image id not found: {}", mapping.image_id))?
+                .clone();
+            objects_by_image.insert(
+                external_id,
+                self.image_annotation_state(project_id, &mapping.image_id)
+                    .objects,
+            );
+        }
+        let result =
+            coco::sync_dataset(&root, &annotation_path, &objects_by_image, expected_version)?;
+        for mapping in &mut mappings {
+            mapping.source_version = result.source_version.clone();
+        }
+        storage::replace_image_sources(&paths.sqlite, &mappings)?;
+        Ok(result)
     }
 
     pub fn annotation_history(
@@ -1320,6 +1385,7 @@ pub fn backend_design() -> BackendDesign {
             "submit_image_annotations".to_string(),
             "create_dataset_snapshot".to_string(),
             "export_dataset".to_string(),
+            "sync_dataset_source".to_string(),
             "open_annotation_window".to_string(),
             "list_backend_tasks".to_string(),
             "clear_completed_backend_tasks".to_string(),

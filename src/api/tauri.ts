@@ -37,6 +37,11 @@ export type BackendHealth = {
   capabilities: string[];
 };
 
+export type SourceSyncResult = {
+  path: string;
+  sourceVersion: string;
+};
+
 export type BackendConnection =
   | { mode: "checking"; label: string; health: null }
   | { mode: "tauri"; label: string; health: BackendHealth }
@@ -256,6 +261,10 @@ export async function exportDataset(
   format: "yolo" | "coco",
 ): Promise<DatasetExport> {
   return invokeRequired("export_dataset", { projectId, snapshotId, format });
+}
+
+export async function syncDatasetSource(projectId: string): Promise<SourceSyncResult> {
+  return invokeRequired("sync_dataset_source", { projectId });
 }
 
 async function invokeRequired<T>(

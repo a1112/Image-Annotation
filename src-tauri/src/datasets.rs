@@ -1,11 +1,11 @@
 use crate::{
     domain,
-    importers::{detect, labelme, voc, voc_adapter, yolo_adapter},
+    importers::{coco, detect, labelme, voc, voc_adapter, yolo_adapter},
     project_fs, storage,
 };
 use serde::Serialize;
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeSet},
+    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet},
     fs,
     hash::{Hash, Hasher},
     io::{self, Cursor},
@@ -500,10 +500,25 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
         } else {
             (0, Vec::new(), 0)
         };
+    let coco_dataset = if detected_format == "coco" {
+        let annotation_path = detection
+            .annotation_path
+            .as_ref()
+            .ok_or_else(|| "COCO annotation path was not detected".to_string())?;
+        Some(coco::inspect_dataset(&root, annotation_path)?)
+    } else {
+        None
+    };
     let mut classes = if xml_count > 0 {
         indexed_voc_labels_from_files(&scan_files)
     } else if detected_format == "labelme" {
         labelme_classes
+    } else if let Some(dataset) = &coco_dataset {
+        dataset
+            .categories
+            .iter()
+            .map(|category| category.label.clone())
+            .collect()
     } else {
         indexed_yolo_labels(&root)
     };
@@ -520,6 +535,8 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
         yolo_label_count
     } else if detected_format == "labelme" {
         labelme_count
+    } else if let Some(dataset) = &coco_dataset {
+        dataset.annotation_count
     } else {
         0
     };
@@ -583,7 +600,10 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
         split_count,
         warnings,
         problems,
-        unsupported_object_count: labelme_unsupported_count,
+        unsupported_object_count: coco_dataset
+            .as_ref()
+            .map(|dataset| dataset.unsupported_annotations.len() as u32)
+            .unwrap_or(labelme_unsupported_count),
         detection_confidence,
         annotation_path: detection
             .annotation_path
@@ -598,7 +618,18 @@ pub fn rescan_project_assets(project_id: &str) -> Result<domain::DatasetProject,
         .ok_or_else(|| format!("project manifest not found: {project_id}"))?;
     let is_local_linked = manifest.source_dataset_key == "local-linked";
     let local_root = PathBuf::from(&manifest.root_path);
-    let images = if is_local_linked {
+    let coco_dataset = if is_local_linked && manifest.format == "coco" {
+        let annotation_path = coco::find_annotation_path(&local_root)?;
+        Some((
+            annotation_path.clone(),
+            coco::inspect_dataset(&local_root, &annotation_path)?,
+        ))
+    } else {
+        None
+    };
+    let images = if let Some((_, dataset)) = &coco_dataset {
+        indexed_coco_images(dataset)
+    } else if is_local_linked {
         if !local_root.exists() {
             return Err(format!(
                 "local dataset directory not found: {}",
@@ -609,7 +640,15 @@ pub fn rescan_project_assets(project_id: &str) -> Result<domain::DatasetProject,
     } else {
         indexed_images(&paths.raw)
     };
-    let mut classes = if is_local_linked {
+    let mut classes = if let Some((_, dataset)) = &coco_dataset {
+        classes_from_labels(
+            dataset
+                .categories
+                .iter()
+                .map(|category| category.label.clone())
+                .collect(),
+        )
+    } else if is_local_linked {
         classes_from_labels(local_labels_for_format(&local_root, &manifest.format))
     } else {
         Vec::new()
@@ -625,7 +664,11 @@ pub fn rescan_project_assets(project_id: &str) -> Result<domain::DatasetProject,
     project_fs::write_manifest_to_path(&manifest, &paths.manifest)?;
     storage::initialize_project_database(&paths.sqlite)?;
     storage::upsert_project_index(&paths.sqlite, &manifest, &images, &classes)?;
-    persist_local_source_mappings(&paths.sqlite, &manifest, &images)?;
+    if let Some((annotation_path, dataset)) = &coco_dataset {
+        persist_coco_source_mappings(&paths.sqlite, &manifest, &images, annotation_path, dataset)?;
+    } else {
+        persist_local_source_mappings(&paths.sqlite, &manifest, &images)?;
+    }
     domain::SampleRepository::new()
         .dataset_projects()
         .into_iter()
@@ -695,10 +738,32 @@ pub fn open_local_dataset(
         "voc-detect" => "voc-detect",
         "yolo-seg" => "yolo-seg",
         "labelme" => "labelme",
+        "coco" => "coco",
         _ => "yolo-detect",
     };
-    let images = indexed_local_images(&canonical, format);
-    let labels = local_labels_for_format(&canonical, format);
+    let coco_dataset = if format == "coco" {
+        let annotation_path = coco::find_annotation_path(&canonical)?;
+        Some((
+            annotation_path.clone(),
+            coco::inspect_dataset(&canonical, &annotation_path)?,
+        ))
+    } else {
+        None
+    };
+    let images = if let Some((_, dataset)) = &coco_dataset {
+        indexed_coco_images(dataset)
+    } else {
+        indexed_local_images(&canonical, format)
+    };
+    let labels = if let Some((_, dataset)) = &coco_dataset {
+        dataset
+            .categories
+            .iter()
+            .map(|category| category.label.clone())
+            .collect()
+    } else {
+        local_labels_for_format(&canonical, format)
+    };
     let labels = if labels.is_empty() {
         demo_class_labels()
     } else {
@@ -723,7 +788,11 @@ pub fn open_local_dataset(
     project_fs::write_manifest_to_path(&manifest, &paths.manifest)?;
     storage::initialize_project_database(&paths.sqlite)?;
     storage::upsert_project_index(&paths.sqlite, &manifest, &images, &classes)?;
-    persist_local_source_mappings(&paths.sqlite, &manifest, &images)?;
+    if let Some((annotation_path, dataset)) = &coco_dataset {
+        persist_coco_source_mappings(&paths.sqlite, &manifest, &images, annotation_path, dataset)?;
+    } else {
+        persist_local_source_mappings(&paths.sqlite, &manifest, &images)?;
+    }
     storage::record_import(
         &paths.sqlite,
         &canonical.to_string_lossy(),
@@ -984,6 +1053,34 @@ fn indexed_local_images(root: &Path, format: &str) -> Vec<storage::StoredImage> 
     images
 }
 
+fn indexed_coco_images(dataset: &coco::CocoDataset) -> Vec<storage::StoredImage> {
+    let unsupported_image_ids = dataset
+        .unsupported_annotations
+        .iter()
+        .map(|annotation| annotation.image_id.as_str())
+        .collect::<BTreeSet<_>>();
+    dataset
+        .images
+        .iter()
+        .map(|image| storage::StoredImage {
+            id: image_id_from_relative(&image.file_name.replace('\\', "/")),
+            file_name: image.file_name.replace('\\', "/"),
+            width: image.width,
+            height: image.height,
+            split: split_for_path(Path::new(&image.file_name)),
+            status: if image.objects.is_empty()
+                && !unsupported_image_ids.contains(image.external_id.as_str())
+            {
+                "未标注".to_string()
+            } else {
+                "已标注".to_string()
+            },
+            qa_status: String::new(),
+            review_note: None,
+        })
+        .collect()
+}
+
 fn local_image_has_annotation(root: &Path, image_path: &Path, format: &str) -> bool {
     match format {
         "voc-detect" => voc_adapter::annotation_path(root, image_path).exists(),
@@ -1052,6 +1149,52 @@ fn persist_local_source_mappings(
                 ),
                 source_version,
             }
+        })
+        .collect::<Vec<_>>();
+    storage::replace_image_sources(sqlite, &mappings)
+}
+
+fn persist_coco_source_mappings(
+    sqlite: &Path,
+    manifest: &project_fs::ProjectManifest,
+    images: &[storage::StoredImage],
+    annotation_path: &Path,
+    dataset: &coco::CocoDataset,
+) -> Result<(), String> {
+    let root = PathBuf::from(&manifest.root_path);
+    let relative_annotation_path = annotation_path
+        .strip_prefix(&root)
+        .unwrap_or(annotation_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    storage::write_dataset_source(
+        sqlite,
+        &storage::StoredDatasetSource {
+            format: "coco".to_string(),
+            mode: "linked".to_string(),
+            root_path: manifest.root_path.clone(),
+            annotation_path: Some(relative_annotation_path.clone()),
+            options_json: "{}".to_string(),
+        },
+    )?;
+    let external_ids = dataset
+        .images
+        .iter()
+        .map(|image| {
+            (
+                image.file_name.replace('\\', "/"),
+                image.external_id.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mappings = images
+        .iter()
+        .map(|image| storage::StoredImageSource {
+            image_id: image.id.clone(),
+            relative_path: image.file_name.clone(),
+            external_id: external_ids.get(&image.file_name).cloned(),
+            annotation_path: Some(relative_annotation_path.clone()),
+            source_version: dataset.source_version.clone(),
         })
         .collect::<Vec<_>>();
     storage::replace_image_sources(sqlite, &mappings)
@@ -1679,6 +1822,129 @@ mod tests {
         assert_eq!(output["shapes"][0]["customShapeField"], "keep");
         assert_eq!(output["shapes"][2]["shape_type"], "point");
         assert_eq!(output["shapes"][2]["flags"]["visible"], true);
+
+        let _ = fs::remove_dir_all(paths.root);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn opens_local_coco_and_synchronizes_only_on_explicit_request() {
+        let source_root = std::env::temp_dir().join("image_annotation_coco_open_test");
+        let _ = fs::remove_dir_all(&source_root);
+        fs::create_dir_all(source_root.join("images")).unwrap();
+        fs::create_dir_all(source_root.join("annotations")).unwrap();
+        write_demo_image(&source_root.join("images").join("a.png"), 1).unwrap();
+        write_demo_image(&source_root.join("images").join("b.png"), 2).unwrap();
+        let annotation_path = source_root.join("annotations").join("instances.json");
+        fs::write(
+            &annotation_path,
+            serde_json::to_string_pretty(&json!({
+                "info": {"description": "linked fixture"},
+                "licenses": [{"id": 1, "name": "fixture"}],
+                "images": [
+                    {"id": 11, "file_name": "images/a.png", "width": 640, "height": 420},
+                    {"id": 12, "file_name": "images/b.png", "width": 640, "height": 420}
+                ],
+                "categories": [
+                    {"id": 3, "name": "defect"},
+                    {"id": 7, "name": "scratch"}
+                ],
+                "annotations": [
+                    {
+                        "id": 101,
+                        "image_id": 11,
+                        "category_id": 3,
+                        "bbox": [10.0, 20.0, 30.0, 40.0],
+                        "area": 1200.0,
+                        "iscrowd": 0
+                    },
+                    {
+                        "id": 102,
+                        "image_id": 12,
+                        "category_id": 7,
+                        "segmentation": [[5.0, 5.0, 50.0, 5.0, 45.0, 40.0]],
+                        "bbox": [5.0, 5.0, 45.0, 35.0],
+                        "area": 900.0,
+                        "iscrowd": 0
+                    },
+                    {
+                        "id": 103,
+                        "image_id": 12,
+                        "category_id": 7,
+                        "segmentation": {"counts": "abc", "size": [420, 640]},
+                        "area": 268800.0,
+                        "iscrowd": 1
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let stale_project_id = linked_project_id(&fs::canonicalize(&source_root).unwrap());
+        let _ = fs::remove_dir_all(project_fs::project_paths(&stale_project_id).root);
+
+        let analysis = analyze_data_source(&[source_root.to_string_lossy().to_string()]).unwrap();
+        assert_eq!(analysis.detected_format, "coco");
+        assert_eq!(analysis.image_count, 2);
+        assert_eq!(analysis.annotation_count, 3);
+        assert_eq!(analysis.class_count, 2);
+        assert_eq!(analysis.unsupported_object_count, 1);
+
+        let project = open_local_dataset(&source_root.to_string_lossy(), "coco").unwrap();
+        let paths = project_fs::project_paths(&project.id);
+        let source = storage::read_dataset_source(&paths.sqlite)
+            .unwrap()
+            .unwrap();
+        let mapping = storage::read_image_source(&paths.sqlite, "images_a")
+            .unwrap()
+            .unwrap();
+        let repository = domain::SampleRepository::new();
+        let state = repository.image_annotation_state(&project.id, "images_a");
+
+        assert_eq!(project.image_count, 2);
+        assert_eq!(project.class_count, 2);
+        assert_eq!(source.format, "coco");
+        assert_eq!(
+            source.annotation_path.as_deref(),
+            Some("annotations/instances.json")
+        );
+        assert_eq!(mapping.external_id.as_deref(), Some("11"));
+        assert_eq!(state.objects.len(), 1);
+        assert_eq!(state.objects[0].label, "defect");
+
+        rescan_project_assets(&project.id).unwrap();
+        let rescanned_mapping = storage::read_image_source(&paths.sqlite, "images_a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rescanned_mapping.external_id.as_deref(), Some("11"));
+        assert_eq!(
+            storage::read_dataset_source(&paths.sqlite)
+                .unwrap()
+                .unwrap()
+                .annotation_path
+                .as_deref(),
+            Some("annotations/instances.json")
+        );
+
+        let mut edited = state.objects;
+        edited[0].bbox.as_mut().unwrap().x = 25.0;
+        repository
+            .save_image_annotations_with_revision(&project.id, "images_a", None, edited)
+            .unwrap();
+        let before_sync: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&annotation_path).unwrap()).unwrap();
+        assert_eq!(before_sync["annotations"][0]["bbox"][0], 10.0);
+
+        repository.sync_dataset_source(&project.id).unwrap();
+        let after_sync: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&annotation_path).unwrap()).unwrap();
+        assert_eq!(after_sync["annotations"][0]["bbox"][0], 25.0);
+        assert_eq!(after_sync["annotations"][1]["segmentation"][0][0], 5.0);
+        assert_eq!(
+            after_sync["annotations"][2]["segmentation"]["counts"],
+            "abc"
+        );
+        assert_eq!(after_sync["info"]["description"], "linked fixture");
 
         let _ = fs::remove_dir_all(paths.root);
         let _ = fs::remove_dir_all(source_root);

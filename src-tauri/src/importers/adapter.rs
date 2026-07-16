@@ -1,4 +1,5 @@
 use crate::domain;
+use serde::Serialize;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -59,7 +60,8 @@ pub trait AnnotationFormatAdapter {
     fn detect(&self, selection: &SourceSelection) -> DetectionResult;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SourceSyncResult {
     pub path: PathBuf,
     pub source_version: String,

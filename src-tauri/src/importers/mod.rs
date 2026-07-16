@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod coco;
 pub mod detect;
 pub mod labelme;
 pub mod voc;
