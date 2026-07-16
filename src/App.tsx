@@ -80,6 +80,7 @@ import type {
   DatasetSnapshot,
   DataSourceAnalysis,
   DataSourceTreeNode,
+  ExportOptions,
   ProjectDetail,
 } from "./types/domain";
 import { invoke } from "@tauri-apps/api/core";
@@ -1779,15 +1780,15 @@ function ProjectWorkspace({
     setWorkflowMessage(`已创建快照 ${snapshot.name}`);
   }
 
-  async function handleExport(format: "yolo" | "coco") {
+  async function handleExport(options: ExportOptions) {
     const snapshotId = snapshots[0]?.id;
     if (!snapshotId) {
       setWorkflowMessage("请先创建快照，再执行导出。");
       return;
     }
-    const nextExport = await exportDataset(projectId, snapshotId, format);
+    const nextExport = await exportDataset(projectId, snapshotId, options);
     setExports((current) => [nextExport, ...current]);
-    setWorkflowMessage(`已导出 ${format.toUpperCase()} 数据包`);
+    setWorkflowMessage(`已导出 ${formatDatasetFormat(options.format)} 数据包`);
   }
 
   async function openAnnotationConsole(imageId: string) {
@@ -1891,7 +1892,7 @@ function renderProjectTab(
     onClassSamplePageChange: (page: number) => void;
     onOpenClassSample: (imageId: string) => void;
     onCreateSnapshot: () => void;
-    onExport: (format: "yolo" | "coco") => void;
+    onExport: (options: ExportOptions) => void;
     onImagePageChange: (page: number) => void;
     onPreviewImage: (imageId: string) => void;
   },
@@ -2104,28 +2105,7 @@ function renderProjectTab(
         </div>
       );
     case "导出":
-      return (
-        <div>
-          <h2>导出预设</h2>
-          <div className="action-row">
-            <button type="button" onClick={() => workflow.onExport("yolo")}>导出 YOLO</button>
-            <button type="button" onClick={() => workflow.onExport("coco")}>导出 COCO</button>
-          </div>
-          {workflow.workflowMessage ? <p className="workflow-message">{workflow.workflowMessage}</p> : null}
-          {workflow.exports.length === 0 ? <p>暂无导出记录</p> : (
-            <div className="export-grid">
-              {workflow.exports.map((item) => (
-                <article className="export-card" key={item.id}>
-                  <h3>{item.format.toUpperCase()}</h3>
-                  <p>{item.outputPath}</p>
-                  <span>{item.snapshotId}</span>
-                  <strong>{item.status}</strong>
-                </article>
-              ))}
-            </div>
-          )}
-        </div>
-      );
+      return <ExportPanel exports={workflow.exports} message={workflow.workflowMessage} onExport={workflow.onExport} />;
     case "快照":
       return (
         <div>
@@ -2162,6 +2142,90 @@ function renderProjectTab(
         </div>
       );
   }
+}
+
+function ExportPanel({
+  exports,
+  message,
+  onExport,
+}: {
+  exports: DatasetExport[];
+  message: string | null;
+  onExport: (options: ExportOptions) => void;
+}) {
+  const [format, setFormat] = useState<ExportOptions["format"]>("yolo-detect");
+  const [polygonPolicy, setPolygonPolicy] = useState<ExportOptions["polygonPolicy"]>(null);
+  const [includeImages, setIncludeImages] = useState(true);
+  const needsPolygonPolicy = format === "yolo-detect" || format === "voc-detect";
+  return (
+    <div>
+      <h2>导出数据集</h2>
+      <div className="export-settings">
+        <label>
+          <span>目标格式</span>
+          <select
+            aria-label="导出格式"
+            value={format}
+            onChange={(event) => {
+              setFormat(event.target.value as ExportOptions["format"]);
+              setPolygonPolicy(null);
+            }}
+          >
+            <option value="yolo-detect">YOLO Detect</option>
+            <option value="yolo-seg">YOLO Segmentation</option>
+            <option value="voc-detect">Pascal VOC</option>
+            <option value="coco">COCO JSON</option>
+            <option value="labelme">LabelMe JSON</option>
+          </select>
+        </label>
+        {needsPolygonPolicy ? (
+          <label>
+            <span>多边形处理</span>
+            <select
+              aria-label="多边形处理"
+              value={polygonPolicy ?? ""}
+              onChange={(event) => setPolygonPolicy(
+                event.target.value ? event.target.value as "bbox" | "skip" : null,
+              )}
+            >
+              <option value="">遇到多边形时阻止导出</option>
+              <option value="bbox">转换为外接框</option>
+              <option value="skip">跳过多边形</option>
+            </select>
+          </label>
+        ) : null}
+        <label className="inline-toggle">
+          <input
+            checked={includeImages}
+            onChange={(event) => setIncludeImages(event.target.checked)}
+            type="checkbox"
+          />
+          包含图片文件
+        </label>
+        <button
+          className="primary"
+          type="button"
+          onClick={() => onExport({ format, polygonPolicy, includeImages })}
+        >
+          <Download size={16} />
+          开始导出
+        </button>
+      </div>
+      {message ? <p className="workflow-message">{message}</p> : null}
+      {exports.length === 0 ? <p>暂无导出记录</p> : (
+        <div className="export-grid">
+          {exports.map((item) => (
+            <article className="export-card" key={item.id}>
+              <h3>{item.format.toUpperCase()}</h3>
+              <p>{item.outputPath}</p>
+              <span>{item.snapshotId}</span>
+              <strong>{item.status}</strong>
+            </article>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function AnnotationWorkspace({

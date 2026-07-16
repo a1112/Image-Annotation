@@ -1,4 +1,5 @@
 use crate::{
+    exporters::{self, ExportOptions, SnapshotData},
     importers::{adapter::SourceSyncResult, coco, labelme, voc_adapter, yolo_adapter},
     project_fs, storage,
 };
@@ -1032,6 +1033,10 @@ impl SampleRepository {
     ) -> Result<DatasetSnapshot, String> {
         let paths = project_fs::ensure_project_dirs(project_id)?;
         let images = self.project_images(project_id, None);
+        let classes = storage::read_classes(&paths.sqlite)?
+            .into_iter()
+            .map(|class| class.label)
+            .collect::<Vec<_>>();
         let annotations: Vec<_> = images
             .iter()
             .map(|image| {
@@ -1039,6 +1044,9 @@ impl SampleRepository {
                 json!({
                     "imageId": image.id,
                     "fileName": image.file_name,
+                    "width": image.width,
+                    "height": image.height,
+                    "split": image.split,
                     "status": image.status,
                     "revision": state.revision,
                     "objects": state.objects,
@@ -1049,6 +1057,7 @@ impl SampleRepository {
             "projectId": project_id,
             "name": name,
             "imageCount": images.len(),
+            "classes": classes,
             "annotations": annotations,
         });
         let manifest_json =
@@ -1095,32 +1104,59 @@ impl SampleRepository {
         &self,
         project_id: &str,
         snapshot_id: &str,
-        format: &str,
+        options: &ExportOptions,
     ) -> Result<DatasetExport, String> {
         let paths = project_fs::ensure_project_dirs(project_id)?;
-        let output_dir = paths.exports.join(format!("{snapshot_id}-{format}"));
-        fs::create_dir_all(&output_dir).map_err(|err| err.to_string())?;
+        let output_dir = paths
+            .exports
+            .join(format!("{snapshot_id}-{}", options.format));
+        let pending_dir = paths
+            .exports
+            .join(format!(".{snapshot_id}-{}.pending", options.format));
         let manifest_path = paths.snapshots.join(snapshot_id).join("manifest.json");
         let manifest_json = fs::read_to_string(&manifest_path).map_err(|err| err.to_string())?;
-        fs::write(output_dir.join("manifest.json"), &manifest_json)
-            .map_err(|err| err.to_string())?;
-        if format == "coco" {
-            fs::write(output_dir.join("annotations.json"), manifest_json)
-                .map_err(|err| err.to_string())?;
-        } else {
-            fs::write(
-                output_dir.join("dataset.yaml"),
-                format!(
-                    "path: {}\ntrain: images\nnames: []\n",
-                    paths.raw.to_string_lossy()
-                ),
-            )
-            .map_err(|err| err.to_string())?;
+        let mut snapshot: SnapshotData =
+            serde_json::from_str(&manifest_json).map_err(|err| err.to_string())?;
+        if snapshot.classes.is_empty() {
+            snapshot.classes = storage::read_classes(&paths.sqlite)?
+                .into_iter()
+                .map(|class| class.label)
+                .collect();
         }
+        let indexed_images = storage::read_images(&paths.sqlite, None)?;
+        for image in &mut snapshot.images {
+            if let Some(indexed) = indexed_images.iter().find(|item| item.id == image.image_id) {
+                if image.width == 0 {
+                    image.width = indexed.width;
+                }
+                if image.height == 0 {
+                    image.height = indexed.height;
+                }
+                if image.split.is_empty() {
+                    image.split.clone_from(&indexed.split);
+                }
+            }
+        }
+        let source_root = project_asset_root(project_id, &paths);
+        if pending_dir.exists() {
+            fs::remove_dir_all(&pending_dir).map_err(|err| err.to_string())?;
+        }
+        let export_result =
+            exporters::export_snapshot(&snapshot, &source_root, &pending_dir, options);
+        if let Err(error) = export_result {
+            let _ = fs::remove_dir_all(&pending_dir);
+            return Err(error);
+        }
+        fs::write(pending_dir.join("snapshot-manifest.json"), &manifest_json)
+            .map_err(|err| err.to_string())?;
+        if output_dir.exists() {
+            fs::remove_dir_all(&output_dir).map_err(|err| err.to_string())?;
+        }
+        fs::rename(&pending_dir, &output_dir).map_err(|err| err.to_string())?;
         let record = storage::create_export_record(
             &paths.sqlite,
             snapshot_id,
-            format,
+            &options.format,
             &output_dir.to_string_lossy(),
         )?;
         Ok(DatasetExport {
@@ -1516,5 +1552,116 @@ mod tests {
         assert_eq!(samples[0].match_count, 2);
 
         let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn repository_exports_snapshot_with_explicit_polygon_policy() {
+        let name = format!("export-fixture-{}", now_unix_string());
+        let project =
+            crate::datasets::create_dataset_project(&name, "yolo-seg", "demo-polygon").unwrap();
+        let repository = SampleRepository::new();
+        let snapshot = repository
+            .create_dataset_snapshot(&project.id, "export fixture")
+            .unwrap();
+
+        let blocked = repository.export_dataset(
+            &project.id,
+            &snapshot.id,
+            &ExportOptions {
+                format: "yolo-detect".to_string(),
+                polygon_policy: None,
+                include_images: false,
+            },
+        );
+        assert!(blocked.unwrap_err().contains("polygonPolicy"));
+
+        let exported = repository
+            .export_dataset(
+                &project.id,
+                &snapshot.id,
+                &ExportOptions {
+                    format: "yolo-detect".to_string(),
+                    polygon_policy: Some("bbox".to_string()),
+                    include_images: true,
+                },
+            )
+            .unwrap();
+        assert!(Path::new(&exported.output_path)
+            .join("labels")
+            .join("train")
+            .join("demo_001.txt")
+            .exists());
+        assert!(Path::new(&exported.output_path)
+            .join("export-manifest.json")
+            .exists());
+        let retained_marker = Path::new(&exported.output_path).join("retained.txt");
+        fs::write(&retained_marker, "previous export").unwrap();
+        let blocked_again = repository.export_dataset(
+            &project.id,
+            &snapshot.id,
+            &ExportOptions {
+                format: "yolo-detect".to_string(),
+                polygon_policy: None,
+                include_images: false,
+            },
+        );
+        assert!(blocked_again.unwrap_err().contains("polygonPolicy"));
+        assert_eq!(
+            fs::read_to_string(&retained_marker).unwrap(),
+            "previous export"
+        );
+
+        let _ = fs::remove_dir_all(project_fs::project_paths(&project.id).root);
+    }
+
+    #[test]
+    fn repository_enriches_legacy_snapshot_before_export() {
+        let name = format!("legacy-export-fixture-{}", now_unix_string());
+        let project =
+            crate::datasets::create_dataset_project(&name, "yolo-seg", "demo-polygon").unwrap();
+        let repository = SampleRepository::new();
+        let snapshot = repository
+            .create_dataset_snapshot(&project.id, "legacy export fixture")
+            .unwrap();
+        let manifest_path = Path::new(&snapshot.manifest_path);
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
+        manifest.as_object_mut().unwrap().remove("classes");
+        for image in manifest["annotations"].as_array_mut().unwrap() {
+            let image = image.as_object_mut().unwrap();
+            image.remove("width");
+            image.remove("height");
+            image.remove("split");
+        }
+        fs::write(
+            manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let exported = repository
+            .export_dataset(
+                &project.id,
+                &snapshot.id,
+                &ExportOptions {
+                    format: "yolo-seg".to_string(),
+                    polygon_policy: None,
+                    include_images: false,
+                },
+            )
+            .unwrap();
+
+        let output = Path::new(&exported.output_path);
+        assert!(output
+            .join("labels")
+            .join("train")
+            .join("demo_001.txt")
+            .exists());
+        assert!(!fs::read_to_string(output.join("classes.txt"))
+            .unwrap()
+            .trim()
+            .is_empty());
+
+        let _ = fs::remove_dir_all(project_fs::project_paths(&project.id).root);
     }
 }

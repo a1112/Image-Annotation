@@ -303,7 +303,7 @@ vi.mock("@tauri-apps/api/core", () => ({
       return {
         id: "export-1",
         snapshotId: args?.snapshotId,
-        format: args?.format,
+        format: (args?.options as { format?: string } | undefined)?.format,
         status: "completed",
         outputPath: "F:/project/Image-Annotation/data/workspaces/default/projects/coco128/exports/export-1",
         createdAt: "1778638139",
@@ -985,7 +985,7 @@ describe("desktop shell", () => {
     expect(screen.getByText("暂无质检问题")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "导出" }));
-    expect(screen.getByText("导出预设")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "导出数据集" })).toBeInTheDocument();
     expect(screen.getByText("暂无导出记录")).toBeInTheDocument();
   });
 
@@ -1010,7 +1010,7 @@ describe("desktop shell", () => {
 
     await user.click(within(topbar).getByRole("button", { name: "导出数据集" }));
 
-    expect(await screen.findByText("导出预设")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "导出数据集" })).toBeInTheDocument();
   });
 
   it("数据集详情页顶部栏返回按钮回到数据集列表", async () => {
@@ -1402,13 +1402,23 @@ describe("desktop shell", () => {
     );
 
     await user.click(screen.getByRole("button", { name: "导出" }));
-    await user.click(screen.getByRole("button", { name: "导出 YOLO" }));
+    const formatSelect = screen.getByLabelText("导出格式");
+    expect(within(formatSelect).getByRole("option", { name: "YOLO Segmentation" })).toBeInTheDocument();
+    expect(within(formatSelect).getByRole("option", { name: "Pascal VOC" })).toBeInTheDocument();
+    expect(within(formatSelect).getByRole("option", { name: "COCO JSON" })).toBeInTheDocument();
+    expect(within(formatSelect).getByRole("option", { name: "LabelMe JSON" })).toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText("多边形处理"), "bbox");
+    await user.click(screen.getByRole("button", { name: "开始导出" }));
 
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("export_dataset", {
         projectId: "coco128",
         snapshotId: "snapshot-1",
-        format: "yolo",
+        options: {
+          format: "yolo-detect",
+          polygonPolicy: "bbox",
+          includeImages: true,
+        },
       }),
     );
   });

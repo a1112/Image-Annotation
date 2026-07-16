@@ -1298,6 +1298,23 @@ button:hover {
   gap: 8px;
 }
 
+.export-settings {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 240px)) auto auto;
+  align-items: end;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.export-settings label:not(.inline-toggle) {
+  display: grid;
+  gap: 6px;
+}
+
+.export-settings .inline-toggle {
+  min-height: 34px;
+}
+
 .annotation-page {
   display: grid;
   grid-template-columns: 54px minmax(0, 1fr) 300px;
@@ -2251,7 +2268,8 @@ dd input {
 
   .source-picker,
   .import-review,
-  .import-settings {
+  .import-settings,
+  .export-settings {
     grid-template-columns: 1fr;
   }
 

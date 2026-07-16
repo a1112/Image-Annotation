@@ -182,6 +182,12 @@ export type DatasetExport = {
   createdAt: string;
 };
 
+export type ExportOptions = {
+  format: "yolo-detect" | "yolo-seg" | "voc-detect" | "coco" | "labelme";
+  polygonPolicy: "bbox" | "skip" | null;
+  includeImages: boolean;
+};
+
 export type TagGroup = {
   id: string;
   name: string;

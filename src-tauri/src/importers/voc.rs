@@ -42,13 +42,13 @@ struct VocSize {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct VocObject {
     name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pose: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     truncated: Option<u8>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     difficult: Option<u8>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     confidence: Option<f64>,
     bndbox: VocBndBox,
 }

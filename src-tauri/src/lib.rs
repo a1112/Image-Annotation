@@ -1,6 +1,7 @@
 pub mod annotations;
 pub mod datasets;
 pub mod domain;
+pub mod exporters;
 pub mod http_backend;
 pub mod importers;
 mod platform;
@@ -14,6 +15,7 @@ use domain::{
     BackendDesign, BackendTask, ClassSample, DatasetExport, DatasetImage, DatasetProject,
     DatasetSnapshot, ProjectDetail, SampleRepository, TaskItem,
 };
+use exporters::ExportOptions;
 use importers::adapter::SourceSyncResult;
 use platform::NativeBackdropStatus;
 use serde::Serialize;
@@ -690,10 +692,10 @@ fn export_dataset(
     repository: State<'_, RepositoryState>,
     project_id: String,
     snapshot_id: String,
-    format: String,
+    options: ExportOptions,
 ) -> Result<DatasetExport, String> {
     let repository = repository.lock().map_err(|err| err.to_string())?;
-    repository.export_dataset(&project_id, &snapshot_id, &format)
+    repository.export_dataset(&project_id, &snapshot_id, &options)
 }
 
 #[tauri::command]

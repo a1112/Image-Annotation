@@ -4,6 +4,7 @@ import type {
   AnnotationSaveResult,
   AnnotationState,
   DatasetExport,
+  ExportOptions,
   BackendTask,
   BuiltinDataset,
   ClassSample,
@@ -264,9 +265,9 @@ export async function listExports(projectId: string): Promise<DatasetExport[]> {
 export async function exportDataset(
   projectId: string,
   snapshotId: string,
-  format: "yolo" | "coco",
+  options: ExportOptions,
 ): Promise<DatasetExport> {
-  return invokeRequired("export_dataset", { projectId, snapshotId, format });
+  return invokeRequired("export_dataset", { projectId, snapshotId, options });
 }
 
 export async function syncDatasetSource(projectId: string): Promise<SourceSyncResult> {

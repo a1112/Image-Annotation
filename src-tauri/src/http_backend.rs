@@ -1,6 +1,7 @@
 use crate::{
     datasets::{self, DownloadJob},
     domain::{AnnotationObject, BackendTask, DatasetProject, DatasetSnapshot, SampleRepository},
+    exporters::ExportOptions,
     project_fs,
 };
 use serde_json::{json, Value};
@@ -500,9 +501,14 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
         "export_dataset" => {
             let project_id = string_arg(&args, "projectId")?;
             let snapshot_id = string_arg(&args, "snapshotId")?;
-            let format = string_arg(&args, "format")?;
+            let options: ExportOptions = serde_json::from_value(
+                args.get("options")
+                    .cloned()
+                    .ok_or_else(|| "missing argument: options".to_string())?,
+            )
+            .map_err(|err| err.to_string())?;
             let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
-            serde_json::to_value(repository.export_dataset(&project_id, &snapshot_id, &format)?)
+            serde_json::to_value(repository.export_dataset(&project_id, &snapshot_id, &options)?)
                 .map_err(|err| err.to_string())
         }
         "sync_dataset_source" => {
