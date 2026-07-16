@@ -1,4 +1,8 @@
-use crate::{domain, importers::voc, project_fs, storage};
+use crate::{
+    domain,
+    importers::{detect, voc},
+    project_fs, storage,
+};
 use serde::Serialize;
 use std::{
     collections::{hash_map::DefaultHasher, BTreeSet},
@@ -476,6 +480,7 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
             .unwrap_or_else(|| paths[0].parent().unwrap_or(Path::new("")).to_path_buf())
     };
     let scan_files = collect_source_files(&paths);
+    let detection = detect::detect_source(&paths)?;
     let image_count = scan_files
         .iter()
         .filter(|path| domain::is_image_path(path))
@@ -493,17 +498,8 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
     } else {
         indexed_yolo_labels(&root)
     };
-    let detected_format = if xml_count > 0 {
-        "voc-detect"
-    } else if yolo_label_count > 0 || !classes.is_empty() {
-        "yolo-detect"
-    } else if image_count > 0 {
-        "image-directory"
-    } else {
-        "unknown"
-    }
-    .to_string();
-    if classes.is_empty() && detected_format == "yolo-detect" {
+    let detected_format = detection.format;
+    if classes.is_empty() && (detected_format == "yolo-detect" || detected_format == "yolo-seg") {
         classes = indexed_yolo_label_ids_from_files(&scan_files)
             .into_iter()
             .max()
@@ -512,15 +508,17 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
     }
     let annotation_count = if detected_format == "voc-detect" {
         xml_count
-    } else if detected_format == "yolo-detect" {
+    } else if detected_format == "yolo-detect" || detected_format == "yolo-seg" {
         yolo_label_count
     } else {
         0
     };
     let split_count = detected_splits(&scan_files).len() as u32;
     let recommended_action = if source_kind == "folder"
-        && (detected_format == "voc-detect" || detected_format == "yolo-detect")
-    {
+        && matches!(
+            detected_format.as_str(),
+            "voc-detect" | "yolo-detect" | "yolo-seg" | "coco" | "labelme"
+        ) {
         "open-local"
     } else {
         "copy-images"
@@ -560,7 +558,7 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
             message: message.clone(),
         })
         .collect();
-    let detection_confidence = if detected_format == "unknown" { 0 } else { 80 };
+    let detection_confidence = detection.confidence;
 
     Ok(DataSourceAnalysis {
         source_paths: source_paths.to_vec(),
@@ -577,7 +575,9 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
         problems,
         unsupported_object_count: 0,
         detection_confidence,
-        annotation_path: None,
+        annotation_path: detection
+            .annotation_path
+            .map(|path| path.to_string_lossy().to_string()),
         tree: build_source_tree(&paths, &root),
     })
 }
