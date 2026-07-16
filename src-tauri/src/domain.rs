@@ -1,5 +1,5 @@
 use crate::{
-    importers::{voc_adapter, yolo_adapter},
+    importers::{labelme, voc_adapter, yolo_adapter},
     project_fs, storage,
 };
 use serde::{Deserialize, Serialize};
@@ -713,6 +713,9 @@ impl SampleRepository {
             "yolo-detect" | "yolo-seg" => {
                 yolo_adapter::load_annotations(&root, &image_path, format, &labels)
             }
+            "labelme" => {
+                labelme::load_annotations(&root, &image_path, &labels).map(|loaded| loaded.objects)
+            }
             _ => Ok(Vec::new()),
         }
         .unwrap_or_default();
@@ -792,6 +795,12 @@ impl SampleRepository {
                     &root,
                     &image_path,
                     "yolo-seg",
+                    &state.objects,
+                    expected_version,
+                )?),
+                "labelme" => Some(labelme::sync_annotations(
+                    &root,
+                    &image_path,
                     &state.objects,
                     expected_version,
                 )?),

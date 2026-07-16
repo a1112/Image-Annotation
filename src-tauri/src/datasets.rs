@@ -1,6 +1,6 @@
 use crate::{
     domain,
-    importers::{detect, voc, voc_adapter, yolo_adapter},
+    importers::{detect, labelme, voc, voc_adapter, yolo_adapter},
     project_fs, storage,
 };
 use serde::Serialize;
@@ -493,12 +493,20 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
         .iter()
         .filter(|path| has_extension(path, "txt") && path_contains_segment(path, "labels"))
         .count() as u32;
+    let detected_format = detection.format;
+    let (labelme_count, labelme_classes, labelme_unsupported_count) =
+        if detected_format == "labelme" {
+            inspect_labelme_files(&scan_files)
+        } else {
+            (0, Vec::new(), 0)
+        };
     let mut classes = if xml_count > 0 {
         indexed_voc_labels_from_files(&scan_files)
+    } else if detected_format == "labelme" {
+        labelme_classes
     } else {
         indexed_yolo_labels(&root)
     };
-    let detected_format = detection.format;
     if classes.is_empty() && (detected_format == "yolo-detect" || detected_format == "yolo-seg") {
         classes = indexed_yolo_label_ids_from_files(&scan_files)
             .into_iter()
@@ -510,6 +518,8 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
         xml_count
     } else if detected_format == "yolo-detect" || detected_format == "yolo-seg" {
         yolo_label_count
+    } else if detected_format == "labelme" {
+        labelme_count
     } else {
         0
     };
@@ -573,7 +583,7 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
         split_count,
         warnings,
         problems,
-        unsupported_object_count: 0,
+        unsupported_object_count: labelme_unsupported_count,
         detection_confidence,
         annotation_path: detection
             .annotation_path
@@ -684,6 +694,7 @@ pub fn open_local_dataset(
     let format = match dataset_type {
         "voc-detect" => "voc-detect",
         "yolo-seg" => "yolo-seg",
+        "labelme" => "labelme",
         _ => "yolo-detect",
     };
     let images = indexed_local_images(&canonical, format);
@@ -773,7 +784,7 @@ fn create_demo_files(raw_root: &Path, format: &str, demo_template: &str) -> Resu
 
 fn annotation_types_for_format(format: &str) -> Vec<String> {
     match format {
-        "yolo-seg" => vec!["Polygon".to_string(), "BBox".to_string()],
+        "yolo-seg" | "labelme" => vec!["Polygon".to_string(), "BBox".to_string()],
         "image-classification" => vec!["Classification".to_string()],
         _ => vec!["BBox".to_string()],
     }
@@ -977,6 +988,7 @@ fn local_image_has_annotation(root: &Path, image_path: &Path, format: &str) -> b
     match format {
         "voc-detect" => voc_adapter::annotation_path(root, image_path).exists(),
         "yolo-detect" | "yolo-seg" => yolo_adapter::annotation_path(root, image_path).exists(),
+        "labelme" => labelme::annotation_path(root, image_path).exists(),
         _ => false,
     }
 }
@@ -985,6 +997,7 @@ fn local_labels_for_format(root: &Path, format: &str) -> Vec<String> {
     match format {
         "voc-detect" => indexed_voc_labels(root),
         "yolo-detect" | "yolo-seg" => indexed_yolo_labels(root),
+        "labelme" => indexed_labelme_labels(root),
         _ => Vec::new(),
     }
 }
@@ -1015,6 +1028,7 @@ fn persist_local_source_mappings(
             let annotation_path = match manifest.format.as_str() {
                 "voc-detect" => voc_adapter::annotation_path(&root, &image_path),
                 "yolo-detect" | "yolo-seg" => yolo_adapter::annotation_path(&root, &image_path),
+                "labelme" => labelme::annotation_path(&root, &image_path),
                 _ => image_path.with_extension("json"),
             };
             let source_version = match manifest.format.as_str() {
@@ -1022,6 +1036,7 @@ fn persist_local_source_mappings(
                 "yolo-detect" | "yolo-seg" => {
                     yolo_adapter::current_source_version(&root, &image_path)
                 }
+                "labelme" => labelme::current_source_version(&root, &image_path),
                 _ => String::new(),
             };
             storage::StoredImageSource {
@@ -1085,6 +1100,46 @@ fn indexed_voc_labels_from_files(paths: &[PathBuf]) -> Vec<String> {
         }
     }
     labels.into_iter().collect()
+}
+
+fn indexed_labelme_labels(root: &Path) -> Vec<String> {
+    let mut labels = BTreeSet::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() || !has_extension(entry.path(), "json") {
+            continue;
+        }
+        if let Ok(data) = fs::read_to_string(entry.path()) {
+            if let Ok(items) = labelme::labels_from_json(&data) {
+                labels.extend(items);
+            }
+        }
+    }
+    labels.into_iter().collect()
+}
+
+fn inspect_labelme_files(paths: &[PathBuf]) -> (u32, Vec<String>, u32) {
+    let mut annotation_count = 0;
+    let mut labels = BTreeSet::new();
+    let mut unsupported_count = 0;
+    for path in paths.iter().filter(|path| has_extension(path, "json")) {
+        let Ok(data) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(file_labels) = labelme::labels_from_json(&data) else {
+            continue;
+        };
+        let Ok(parsed) = labelme::parse_labelme(&data, &file_labels) else {
+            continue;
+        };
+        annotation_count += 1;
+        unsupported_count += parsed.unsupported_shapes.len() as u32;
+        labels.extend(file_labels);
+    }
+    (
+        annotation_count,
+        labels.into_iter().collect(),
+        unsupported_count,
+    )
 }
 
 fn indexed_yolo_labels(root: &Path) -> Vec<String> {
@@ -1526,6 +1581,104 @@ mod tests {
             .unwrap();
         let xml = fs::read_to_string(source_root.join("sample.xml")).unwrap();
         assert!(xml.contains("<xmin>25</xmin>"));
+
+        let _ = fs::remove_dir_all(paths.root);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn opens_and_round_trips_local_labelme_folder() {
+        let source_root = std::env::temp_dir().join("image_annotation_labelme_open_test");
+        let _ = fs::remove_dir_all(&source_root);
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("sample.png");
+        write_demo_image(&image_path, 1).unwrap();
+        fs::write(
+            source_root.join("sample.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": "5.4.1",
+                "flags": {"reviewed": true},
+                "shapes": [
+                    {
+                        "label": "defect",
+                        "points": [[10.0, 20.0], [40.0, 60.0]],
+                        "group_id": 7,
+                        "shape_type": "rectangle",
+                        "flags": {"occluded": false},
+                        "customShapeField": "keep"
+                    },
+                    {
+                        "label": "scratch",
+                        "points": [[80.0, 90.0], [120.0, 95.0], [110.0, 140.0]],
+                        "group_id": null,
+                        "shape_type": "polygon",
+                        "flags": {}
+                    },
+                    {
+                        "label": "landmark",
+                        "points": [[200.0, 210.0]],
+                        "group_id": null,
+                        "shape_type": "point",
+                        "flags": {"visible": true}
+                    }
+                ],
+                "imagePath": "sample.png",
+                "imageData": null,
+                "imageHeight": 420,
+                "imageWidth": 640,
+                "customFileField": {"owner": "fixture"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let stale_project_id = linked_project_id(&fs::canonicalize(&source_root).unwrap());
+        let _ = fs::remove_dir_all(project_fs::project_paths(&stale_project_id).root);
+
+        let analysis = analyze_data_source(&[source_root.to_string_lossy().to_string()]).unwrap();
+        assert_eq!(analysis.detected_format, "labelme");
+        assert_eq!(analysis.annotation_count, 1);
+        assert_eq!(analysis.class_count, 3);
+        assert_eq!(analysis.unsupported_object_count, 1);
+
+        let project = open_local_dataset(&source_root.to_string_lossy(), "labelme").unwrap();
+        let paths = project_fs::project_paths(&project.id);
+        let stored = storage::read_images(&paths.sqlite, None).unwrap();
+        let source = storage::read_dataset_source(&paths.sqlite)
+            .unwrap()
+            .unwrap();
+        let mapping = storage::read_image_source(&paths.sqlite, "sample")
+            .unwrap()
+            .unwrap();
+        let repository = domain::SampleRepository::new();
+        let state = repository.image_annotation_state(&project.id, "sample");
+
+        assert_eq!(project.class_count, 3);
+        assert_eq!(stored[0].status, "已标注");
+        assert_eq!(source.format, "labelme");
+        assert_eq!(mapping.annotation_path.as_deref(), Some("sample.json"));
+        assert!(!mapping.source_version.is_empty());
+        assert_eq!(state.objects.len(), 2);
+        assert_eq!(state.objects[0].label, "defect");
+        assert_eq!(state.objects[0].object_type, "bbox");
+        assert_eq!(state.objects[1].label, "scratch");
+        assert_eq!(state.objects[1].object_type, "polygon");
+
+        let mut edited = state.objects;
+        edited[0].bbox.as_mut().unwrap().x = 25.0;
+        repository
+            .save_image_annotations_with_revision(&project.id, "sample", None, edited)
+            .unwrap();
+
+        let output: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(source_root.join("sample.json")).unwrap())
+                .unwrap();
+        assert_eq!(output["flags"]["reviewed"], true);
+        assert_eq!(output["customFileField"]["owner"], "fixture");
+        assert_eq!(output["shapes"][0]["points"][0][0], 25.0);
+        assert_eq!(output["shapes"][0]["group_id"], 7);
+        assert_eq!(output["shapes"][0]["customShapeField"], "keep");
+        assert_eq!(output["shapes"][2]["shape_type"], "point");
+        assert_eq!(output["shapes"][2]["flags"]["visible"], true);
 
         let _ = fs::remove_dir_all(paths.root);
         let _ = fs::remove_dir_all(source_root);
