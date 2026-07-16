@@ -138,6 +138,8 @@ impl AnnotationFormatAdapter for YoloDetector {
         let mut bbox_lines = 0u32;
         let mut polygon_lines = 0u32;
         let mut first_label = None;
+        let mut first_bbox = None;
+        let mut first_polygon = None;
         for path in selection
             .files
             .iter()
@@ -146,7 +148,11 @@ impl AnnotationFormatAdapter for YoloDetector {
             let Ok(data) = fs::read_to_string(path) else {
                 continue;
             };
-            for line in data.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            for (line_index, line) in data.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
                 let values = line
                     .split_whitespace()
                     .map(str::parse::<f64>)
@@ -157,9 +163,11 @@ impl AnnotationFormatAdapter for YoloDetector {
                 if values.len() == 5 {
                     bbox_lines += 1;
                     first_label.get_or_insert_with(|| path.clone());
+                    first_bbox.get_or_insert_with(|| (path.clone(), line_index + 1));
                 } else if values.len() >= 7 && values.len() % 2 == 1 {
                     polygon_lines += 1;
                     first_label.get_or_insert_with(|| path.clone());
+                    first_polygon.get_or_insert_with(|| (path.clone(), line_index + 1));
                 }
             }
         }
@@ -176,12 +184,15 @@ impl AnnotationFormatAdapter for YoloDetector {
                 first_label,
                 "YOLO class + polygon point pairs",
             ),
-            (bbox, polygon) if bbox > 0 && polygon > 0 => detected(
-                "unknown",
-                40,
-                first_label,
-                "YOLO 标签混合了 BBox 和 Polygon",
-            ),
+            (bbox, polygon) if bbox > 0 && polygon > 0 => {
+                let (path, line) = first_polygon.or(first_bbox).unwrap();
+                detected(
+                    "unknown",
+                    40,
+                    first_label,
+                    &format!("YOLO 标签混合了 BBox 和 Polygon: {}:{line}", path.display()),
+                )
+            }
             _ => not_detected(self.format()),
         }
     }
@@ -288,6 +299,19 @@ mod tests {
 
         let _ = fs::remove_dir_all(coco);
         let _ = fs::remove_dir_all(labelme);
+    }
+
+    #[test]
+    fn mixed_yolo_detection_reports_conflicting_file_and_line() {
+        let root = create_yolo_fixture(false);
+        let label = root.join("labels").join("train").join("a.txt");
+        fs::write(&label, "0 0.5 0.5 0.4 0.3\n0 0.1 0.1 0.8 0.1 0.5 0.9\n").unwrap();
+
+        let detection = detect_source(std::slice::from_ref(&root)).unwrap();
+
+        assert_eq!(detection.format, "unknown");
+        assert!(detection.reason.contains("a.txt:2"));
+        let _ = fs::remove_dir_all(root);
     }
 
     fn create_yolo_fixture(segmentation: bool) -> PathBuf {

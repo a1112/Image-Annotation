@@ -65,6 +65,7 @@ pub fn sync_annotations(
     let (width, height) = image::image_dimensions(image_path).map_err(|err| err.to_string())?;
     let data = match format {
         "yolo-detect" => yolo::annotations_to_yolo_lines(objects, width, height)?,
+        "yolo-seg" => yolo::annotations_to_yolo_polygon_lines(objects, width, height)?,
         _ => {
             return Err(format!(
                 "source synchronization is not implemented for {format}"
@@ -119,6 +120,39 @@ mod tests {
         assert_eq!(actual.width, expected.width);
         assert_eq!(actual.height, expected.height);
         assert!(!root.join("labels").join("train").join("a.txt.tmp").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn yolo_adapter_round_trips_segmentation_polygons() {
+        let root = temp_root("yolo-seg-adapter");
+        let image_path = root.join("images").join("train").join("a.png");
+        let label_path = root.join("labels").join("train").join("a.txt");
+        fs::create_dir_all(image_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(label_path.parent().unwrap()).unwrap();
+        image::RgbaImage::new(100, 200).save(&image_path).unwrap();
+        fs::write(
+            &label_path,
+            "2 0.100000 0.100000 0.800000 0.100000 0.500000 0.450000\n",
+        )
+        .unwrap();
+        let labels = vec![
+            "defect".to_string(),
+            "region".to_string(),
+            "scratch".to_string(),
+        ];
+
+        let objects = load_annotations(&root, &image_path, "yolo-seg", &labels).unwrap();
+        let result = sync_annotations(&root, &image_path, "yolo-seg", &objects, None).unwrap();
+        let reparsed = load_annotations(&root, &image_path, "yolo-seg", &labels).unwrap();
+
+        assert_eq!(result.path, label_path);
+        assert_eq!(reparsed[0].label, "scratch");
+        assert_eq!(reparsed[0].polygon.as_ref().unwrap().len(), 3);
+        assert_eq!(
+            fs::read_to_string(result.path).unwrap(),
+            "2 0.100000 0.100000 0.800000 0.100000 0.500000 0.450000\n"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

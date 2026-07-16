@@ -788,6 +788,13 @@ impl SampleRepository {
                     &state.objects,
                     expected_version,
                 )?),
+                "yolo-seg" => Some(yolo_adapter::sync_annotations(
+                    &root,
+                    &image_path,
+                    "yolo-seg",
+                    &state.objects,
+                    expected_version,
+                )?),
                 _ => None,
             };
             if let Some(synced) = synced {

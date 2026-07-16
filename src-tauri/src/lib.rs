@@ -1144,17 +1144,24 @@ mod tests {
 
     #[test]
     fn backend_repository_exposes_dataset_project_details() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let project = datasets::create_dataset_project(
+            &format!("Repository Detail {unique}"),
+            "yolo-detect",
+            "demo-bbox",
+        )
+        .unwrap();
         let repository = domain::SampleRepository::new();
-        let projects = repository.dataset_projects();
-        assert!(projects.iter().all(|project| !project.id.is_empty()));
+        let detail = repository
+            .project_detail(&project.id)
+            .expect("project detail exists for owned test project");
 
-        if let Some(project) = projects.first() {
-            let detail = repository
-                .project_detail(&project.id)
-                .expect("project detail exists for listed project");
-            assert_eq!(detail.project.id, project.id);
-            assert!(detail.tag_groups.iter().any(|group| group.name == "train"));
-        }
+        assert_eq!(detail.project.id, project.id);
+        assert!(detail.tag_groups.iter().any(|group| group.name == "train"));
+        let _ = std::fs::remove_dir_all(project_fs::project_paths(&project.id).root);
     }
 
     #[test]
