@@ -464,6 +464,13 @@ pub fn import_files_into_project(
 }
 
 pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis, String> {
+    analyze_data_source_with_override(source_paths, None)
+}
+
+pub fn analyze_data_source_with_override(
+    source_paths: &[String],
+    format_override: Option<&str>,
+) -> Result<DataSourceAnalysis, String> {
     if source_paths.is_empty() {
         return Err("请选择文件夹或文件".to_string());
     }
@@ -493,7 +500,21 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
         .iter()
         .filter(|path| has_extension(path, "txt") && path_contains_segment(path, "labels"))
         .count() as u32;
-    let detected_format = detection.format;
+    let detected_format = match format_override {
+        Some(
+            format @ ("voc-detect" | "yolo-detect" | "yolo-seg" | "coco" | "labelme"
+            | "image-directory"),
+        ) => format.to_string(),
+        Some(format) => return Err(format!("unsupported annotation format override: {format}")),
+        None => detection.format.clone(),
+    };
+    let annotation_path = if detected_format == "coco" {
+        Some(coco::find_annotation_path(&root)?)
+    } else if format_override.is_none() {
+        detection.annotation_path.clone()
+    } else {
+        None
+    };
     let (labelme_count, labelme_classes, labelme_unsupported_count) =
         if detected_format == "labelme" {
             inspect_labelme_files(&scan_files)
@@ -501,8 +522,7 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
             (0, Vec::new(), 0)
         };
     let coco_dataset = if detected_format == "coco" {
-        let annotation_path = detection
-            .annotation_path
+        let annotation_path = annotation_path
             .as_ref()
             .ok_or_else(|| "COCO annotation path was not detected".to_string())?;
         Some(coco::inspect_dataset(&root, annotation_path)?)
@@ -605,9 +625,7 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
             .map(|dataset| dataset.unsupported_annotations.len() as u32)
             .unwrap_or(labelme_unsupported_count),
         detection_confidence,
-        annotation_path: detection
-            .annotation_path
-            .map(|path| path.to_string_lossy().to_string()),
+        annotation_path: annotation_path.map(|path| path.to_string_lossy().to_string()),
         tree: build_source_tree(&paths, &root),
     })
 }

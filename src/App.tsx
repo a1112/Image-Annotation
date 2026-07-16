@@ -21,6 +21,7 @@ import {
   MousePointer2,
   Play,
   Plus,
+  RefreshCw,
   Save,
   Settings,
   ShieldCheck,
@@ -63,6 +64,7 @@ import {
   pickDataSource,
   saveImageAnnotations,
   submitImageAnnotations,
+  syncDatasetSource,
 } from "./api/tauri";
 import type { BackendConnection } from "./api/tauri";
 import type {
@@ -72,6 +74,7 @@ import type {
   ClassSample,
   ClassStat,
   DatasetExport,
+  DatasetFormat,
   DatasetImage,
   DatasetProject,
   DatasetSnapshot,
@@ -705,6 +708,7 @@ function TopBar({
   onDatasets,
   onProjectAnnotate,
   onProjectOpenWindow,
+  onProjectSync,
   onProjectTab,
 }: {
   activeProjectId?: string;
@@ -716,11 +720,13 @@ function TopBar({
   onDatasets: () => void;
   onProjectAnnotate: (projectId: string, imageId?: string) => void;
   onProjectOpenWindow: (project: DatasetProject) => void;
+  onProjectSync: (projectId: string) => void;
   onProjectTab: (projectId: string, tab: ProjectTab) => void;
 }) {
   const showWindowControls = backendConnection.mode === "tauri";
   const isProjectScope = Boolean(activeProjectId);
   const activeProject = activeProjectContext?.project ?? null;
+  const canSyncSource = activeProject?.tags.includes("format: coco") ?? false;
 
   return (
     <header className="topbar" data-tauri-drag-region onMouseDown={beginDesktopWindowDrag}>
@@ -762,6 +768,12 @@ function TopBar({
               <Plus size={16} />
               添加数据
             </button>
+            {canSyncSource ? (
+              <button type="button" onClick={() => onProjectSync(activeProjectId)}>
+                <RefreshCw size={16} />
+                同步源标注
+              </button>
+            ) : null}
             <button type="button" onClick={() => onProjectTab(activeProjectId, "快照")}>
               <Save size={16} />
               快照管理
@@ -1003,6 +1015,7 @@ function ProjectInfoDialog({ onClose }: { onClose: () => void }) {
 }
 
 type DataImportAction = "open-local" | "copy-images" | "copy-yolo";
+type ImportDatasetFormat = Exclude<DatasetFormat, "image-classification"> | "image-directory";
 
 function DataSubmitDialog({
   datasets,
@@ -1019,7 +1032,10 @@ function DataSubmitDialog({
   datasets: BuiltinDataset[];
   projects: DatasetProject[];
   onCancel: () => void;
-  onAnalyzeSource: (sourcePaths: string[]) => Promise<DataSourceAnalysis>;
+  onAnalyzeSource: (
+    sourcePaths: string[],
+    formatOverride?: DataSourceAnalysis["detectedFormat"],
+  ) => Promise<DataSourceAnalysis>;
   onDownload: (datasetKey: string) => void;
   onImportFiles: (projectId: string, sourcePaths: string[]) => void;
   onImportImages: (projectId: string, sourcePath: string) => void;
@@ -1029,18 +1045,21 @@ function DataSubmitDialog({
 }) {
   const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
   const [analysis, setAnalysis] = useState<DataSourceAnalysis | null>(null);
-  const [datasetType, setDatasetType] = useState<"voc-detect" | "yolo-detect" | "image-directory">("voc-detect");
+  const [datasetType, setDatasetType] = useState<ImportDatasetFormat>("voc-detect");
   const [importAction, setImportAction] = useState<DataImportAction>("open-local");
   const [analyzeState, setAnalyzeState] = useState<"idle" | "loading" | "error">("idle");
   const [message, setMessage] = useState<string | null>(null);
   const [dropActive, setDropActive] = useState(false);
 
-  const analyzeSourcePaths = useCallback(async (sourcePaths: string[]) => {
+  const analyzeSourcePaths = useCallback(async (
+    sourcePaths: string[],
+    formatOverride?: DataSourceAnalysis["detectedFormat"],
+  ) => {
     if (!sourcePaths.length) return;
     setAnalyzeState("loading");
     setMessage(null);
     try {
-      const nextAnalysis = await onAnalyzeSource(sourcePaths);
+      const nextAnalysis = await onAnalyzeSource(sourcePaths, formatOverride);
       setAnalysis(nextAnalysis);
       setDatasetType(normalizeDetectedDatasetType(nextAnalysis.detectedFormat));
       setImportAction(defaultImportAction(nextAnalysis));
@@ -1146,9 +1165,20 @@ function DataSubmitDialog({
     onImportImages(projectId, analysis.rootPath);
   }
 
+  const problems = analysis?.problems
+    ?? analysis?.warnings.map((warning) => ({
+      severity: "warning" as const,
+      code: "warning",
+      path: null,
+      record: null,
+      message: warning,
+    }))
+    ?? [];
+  const hasBlockingProblems = problems.some((problem) => problem.severity === "error");
   const canConfirm = Boolean(
     analysis
       && analysis.imageCount > 0
+      && !hasBlockingProblems
       && (importAction === "open-local" || projectId),
   );
 
@@ -1208,21 +1238,37 @@ function DataSubmitDialog({
                   <div><strong>{analysis.classCount}</strong><span>类别</span></div>
                   <div><strong>{analysis.splitCount || 1}</strong><span>分组</span></div>
                 </div>
+                {analysis.unsupportedObjectCount ? (
+                  <div className="unsupported-count">
+                    {analysis.unsupportedObjectCount} 个不可编辑对象
+                  </div>
+                ) : null}
               </div>
               <div className="import-settings">
                 <label>
                   <span>导入方式</span>
-                  <select value={importAction} onChange={(event) => setImportAction(event.target.value as DataImportAction)}>
+                  <select aria-label="导入方式" value={importAction} onChange={(event) => setImportAction(event.target.value as DataImportAction)}>
                     <option value="open-local">链接本机目录（原地写回标注）</option>
                     <option value="copy-images">复制图片到目标项目</option>
-                    {analysis.detectedFormat === "yolo-detect" ? <option value="copy-yolo">复制 YOLO 数据集到目标项目</option> : null}
+                    {analysis.detectedFormat === "yolo-detect" ? <option value="copy-yolo">复制完整 YOLO 数据集到目标项目</option> : null}
                   </select>
                 </label>
                 <label>
-                  <span>数据类型</span>
-                  <select value={datasetType} onChange={(event) => setDatasetType(event.target.value as typeof datasetType)}>
+                  <span>数据格式</span>
+                  <select
+                    aria-label="数据格式"
+                    value={datasetType}
+                    onChange={(event) => {
+                      const nextFormat = event.target.value as ImportDatasetFormat;
+                      setDatasetType(nextFormat);
+                      void analyzeSourcePaths(analysis.sourcePaths, nextFormat);
+                    }}
+                  >
                     <option value="voc-detect">Pascal VOC BBox XML</option>
                     <option value="yolo-detect">YOLO BBox TXT</option>
+                    <option value="yolo-seg">YOLO Segmentation</option>
+                    <option value="coco">COCO JSON</option>
+                    <option value="labelme">LabelMe JSON</option>
                     <option value="image-directory">仅图片目录</option>
                   </select>
                 </label>
@@ -1244,11 +1290,7 @@ function DataSubmitDialog({
                   {analysis.classes.length > 12 ? <span>+{analysis.classes.length - 12}</span> : null}
                 </div>
               ) : null}
-              {analysis.warnings.length ? (
-                <div className="import-warnings">
-                  {analysis.warnings.map((warning) => <span key={warning}>{warning}</span>)}
-                </div>
-              ) : null}
+              {problems.length ? <ImportProblems problems={problems} /> : null}
               <div className="dialog-actions">
                 <button type="button" onClick={() => setAnalysis(null)}>重新选择</button>
                 <button className="primary" type="button" onClick={confirmImport} disabled={!canConfirm}>
@@ -1314,9 +1356,34 @@ function pathsFromDrop(dataTransfer: DataTransfer) {
     .filter(Boolean);
 }
 
-function normalizeDetectedDatasetType(format: DataSourceAnalysis["detectedFormat"]): "voc-detect" | "yolo-detect" | "image-directory" {
-  if (format === "yolo-detect") return "yolo-detect";
-  if (format === "voc-detect") return "voc-detect";
+function ImportProblems({ problems }: { problems: NonNullable<DataSourceAnalysis["problems"]> }) {
+  const labels = { error: "错误", warning: "警告", info: "信息" } as const;
+  return (
+    <div className="import-problems">
+      {(["error", "warning", "info"] as const).map((severity) => {
+        const items = problems.filter((problem) => problem.severity === severity);
+        if (!items.length) return null;
+        return (
+          <section className={`problem-group ${severity}`} key={severity}>
+            <h4>{labels[severity]}</h4>
+            {items.map((problem) => (
+              <div className="problem-row" key={`${problem.code}-${problem.path}-${problem.record}-${problem.message}`}>
+                <CircleAlert size={15} />
+                <span>{problem.message}</span>
+                {problem.path ? <code>{problem.path}{problem.record ? `:${problem.record}` : ""}</code> : null}
+              </div>
+            ))}
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
+function normalizeDetectedDatasetType(format: DataSourceAnalysis["detectedFormat"]): ImportDatasetFormat {
+  if (format === "yolo-detect" || format === "yolo-seg" || format === "voc-detect" || format === "coco" || format === "labelme") {
+    return format;
+  }
   return "image-directory";
 }
 
@@ -1328,6 +1395,9 @@ function defaultImportAction(analysis: DataSourceAnalysis): DataImportAction {
 function formatDatasetFormat(format: DataSourceAnalysis["detectedFormat"]) {
   if (format === "voc-detect") return "Pascal VOC BBox";
   if (format === "yolo-detect") return "YOLO BBox";
+  if (format === "yolo-seg") return "YOLO Segmentation";
+  if (format === "coco") return "COCO JSON";
+  if (format === "labelme") return "LabelMe JSON";
   if (format === "image-directory") return "图片目录";
   return "未识别";
 }
@@ -3050,8 +3120,15 @@ export default function App() {
     return pickDataSource(selectionType);
   }
 
-  async function handleAnalyzeDataSource(sourcePaths: string[]) {
-    return analyzeDataSource(sourcePaths);
+  async function handleAnalyzeDataSource(
+    sourcePaths: string[],
+    formatOverride?: DataSourceAnalysis["detectedFormat"],
+  ) {
+    return analyzeDataSource(sourcePaths, formatOverride);
+  }
+
+  async function handleSyncDatasetSource(projectId: string) {
+    await syncDatasetSource(projectId);
   }
 
   async function annotateProject(project: DatasetProject) {
@@ -3161,6 +3238,7 @@ export default function App() {
         onDatasets={() => navigate("#/datasets")}
         onProjectAnnotate={openProjectAnnotationRoute}
         onProjectOpenWindow={openProjectWindow}
+        onProjectSync={handleSyncDatasetSource}
         onProjectTab={openProjectTab}
       />
       <div className="app-body">

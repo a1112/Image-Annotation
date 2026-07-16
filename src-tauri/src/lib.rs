@@ -387,8 +387,11 @@ fn pick_data_source(selection_type: String) -> Result<Option<Vec<String>>, Strin
 }
 
 #[tauri::command]
-fn analyze_data_source(source_paths: Vec<String>) -> Result<DataSourceAnalysis, String> {
-    datasets::analyze_data_source(&source_paths)
+fn analyze_data_source(
+    source_paths: Vec<String>,
+    format_override: Option<String>,
+) -> Result<DataSourceAnalysis, String> {
+    datasets::analyze_data_source_with_override(&source_paths, format_override.as_deref())
 }
 
 #[tauri::command]

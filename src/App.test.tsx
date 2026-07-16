@@ -8,6 +8,16 @@ const tauriState = vi.hoisted(() => ({
   backendAvailable: true,
   builtinDownloaded: true,
   localOpened: false,
+  analysisFormat: "voc-detect",
+  analysisProblems: [] as Array<{
+    severity: "error" | "warning" | "info";
+    code: string;
+    path: string | null;
+    record: string | null;
+    message: string;
+  }>,
+  unsupportedObjectCount: 0,
+  projectFormat: "yolo-detect",
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -58,7 +68,7 @@ vi.mock("@tauri-apps/api/core", () => ({
           classCount: 80,
           tagGroupCount: 3,
           status: "已导入",
-          tags: ["source: ultralytics", "format: yolo-detect", "split: train"],
+          tags: ["source: ultralytics", `format: ${tauriState.projectFormat}`, "split: train"],
         },
       ];
       if (tauriState.localOpened) {
@@ -117,7 +127,7 @@ vi.mock("@tauri-apps/api/core", () => ({
           classCount: 80,
           tagGroupCount: 3,
           status: "已导入",
-          tags: ["source: ultralytics", "format: yolo-detect", "split: train"],
+          tags: ["source: ultralytics", `format: ${tauriState.projectFormat}`, "split: train"],
         },
         tagGroups: [
           {
@@ -339,11 +349,12 @@ vi.mock("@tauri-apps/api/core", () => ({
     }
 
     if (command === "analyze_data_source") {
+      const detectedFormat = String(args?.formatOverride ?? tauriState.analysisFormat);
       return {
         sourcePaths: args?.sourcePaths,
         rootPath: "L:\\data_tool\\datas\\lg\\1580_2d\\新建文件夹\\2D数据标注原始\\out",
         sourceKind: "folder",
-        detectedFormat: "voc-detect",
+        detectedFormat,
         recommendedAction: "open-local",
         imageCount: 128,
         annotationCount: 128,
@@ -351,6 +362,9 @@ vi.mock("@tauri-apps/api/core", () => ({
         classes: ["defect"],
         splitCount: 1,
         warnings: [],
+        problems: tauriState.analysisProblems,
+        unsupportedObjectCount: tauriState.unsupportedObjectCount,
+        detectionConfidence: 96,
         tree: [
           {
             name: "out",
@@ -392,6 +406,13 @@ vi.mock("@tauri-apps/api/core", () => ({
         tagGroupCount: 3,
         status: "已导入",
         tags: ["source: local-files", "format: yolo-detect", "split: train"],
+      };
+    }
+
+    if (command === "sync_dataset_source") {
+      return {
+        path: "L:\\datasets\\annotations\\instances.json",
+        sourceVersion: "100:200",
       };
     }
 
@@ -447,6 +468,10 @@ beforeEach(() => {
   tauriState.backendAvailable = true;
   tauriState.builtinDownloaded = true;
   tauriState.localOpened = false;
+  tauriState.analysisFormat = "voc-detect";
+  tauriState.analysisProblems = [];
+  tauriState.unsupportedObjectCount = 0;
+  tauriState.projectFormat = "yolo-detect";
   vi.stubGlobal(
     "fetch",
     vi.fn(async () => {
@@ -796,6 +821,98 @@ describe("desktop shell", () => {
 
     expect(await screen.findByRole("option", { name: "链接本机目录（原地写回标注）" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "YOLO BBox TXT" })).toBeInTheDocument();
+  });
+
+  it("数据提交确认支持 COCO、LabelMe 和 YOLO Segmentation 格式覆盖", async () => {
+    const user = userEvent.setup();
+    tauriState.analysisFormat = "coco";
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(screen.getByRole("button", { name: /选择文件夹/ }));
+
+    expect(await screen.findByRole("heading", { name: "COCO JSON" })).toBeInTheDocument();
+    const formatSelect = screen.getByLabelText("数据格式");
+    expect(within(formatSelect).getByRole("option", { name: "LabelMe JSON" })).toBeInTheDocument();
+    expect(within(formatSelect).getByRole("option", { name: "YOLO Segmentation" })).toBeInTheDocument();
+
+    await user.selectOptions(formatSelect, "labelme");
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("analyze_data_source", {
+        sourcePaths: ["L:\\data_tool\\datas\\lg\\1580_2d\\新建文件夹\\2D数据标注原始\\out"],
+        formatOverride: "labelme",
+      }),
+    );
+    expect(await screen.findByRole("heading", { name: "LabelMe JSON" })).toBeInTheDocument();
+  });
+
+  it("导入问题按严重级别展示且错误会阻止确认", async () => {
+    const user = userEvent.setup();
+    tauriState.analysisFormat = "labelme";
+    tauriState.unsupportedObjectCount = 4;
+    tauriState.analysisProblems = [
+      {
+        severity: "error",
+        code: "missing-image",
+        path: "images/missing.png",
+        record: "12",
+        message: "图片文件不存在",
+      },
+      {
+        severity: "warning",
+        code: "unsupported-shape",
+        path: "sample.json",
+        record: "3",
+        message: "point shape 将保留但不可编辑",
+      },
+      {
+        severity: "info",
+        code: "linked-source",
+        path: null,
+        record: null,
+        message: "源文件将在确认后建立链接",
+      },
+    ];
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(screen.getByRole("button", { name: /选择文件夹/ }));
+
+    expect(await screen.findByText("4 个不可编辑对象")).toBeInTheDocument();
+    expect(screen.getByText("错误")).toBeInTheDocument();
+    expect(screen.getByText("警告")).toBeInTheDocument();
+    expect(screen.getByText("信息")).toBeInTheDocument();
+    expect(screen.getByText("图片文件不存在")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "确认导入" })).toBeDisabled();
+  });
+
+  it("YOLO 数据源同时提供链接和复制模式", async () => {
+    const user = userEvent.setup();
+    tauriState.analysisFormat = "yolo-detect";
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(screen.getByRole("button", { name: /选择文件夹/ }));
+
+    const modeSelect = await screen.findByLabelText("导入方式");
+    expect(within(modeSelect).getByRole("option", { name: "链接本机目录（原地写回标注）" })).toBeInTheDocument();
+    expect(within(modeSelect).getByRole("option", { name: "复制完整 YOLO 数据集到目标项目" })).toBeInTheDocument();
+  });
+
+  it("COCO 数据集顶部提供显式源同步操作", async () => {
+    const user = userEvent.setup();
+    tauriState.projectFormat = "coco";
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(await screen.findByRole("button", { name: "同步源标注" }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("sync_dataset_source", {
+        projectId: "coco128",
+      }),
+    );
   });
 
   it("低频工程说明移动到工程信息弹窗", async () => {

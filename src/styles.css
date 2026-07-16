@@ -473,6 +473,20 @@ button:hover {
   font-size: 18px;
 }
 
+.unsupported-count {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  margin-top: 10px;
+  padding: 0 9px;
+  border: 1px solid #fed7aa;
+  border-radius: 6px;
+  background: #fff7ed;
+  color: #9a3412;
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .import-settings {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -505,6 +519,62 @@ button:hover {
 .import-warnings span {
   background: #fff7ed;
   color: #9a3412;
+}
+
+.import-problems {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.problem-group {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid #dbe4ef;
+  border-radius: 7px;
+  background: #ffffff;
+}
+
+.problem-group h4 {
+  margin: 0;
+  font-size: 12px;
+}
+
+.problem-group.error {
+  border-color: #fecaca;
+  background: #fff7f7;
+  color: #b91c1c;
+}
+
+.problem-group.warning {
+  border-color: #fed7aa;
+  background: #fffaf3;
+  color: #9a3412;
+}
+
+.problem-group.info {
+  border-color: #bfdbfe;
+  background: #f7fbff;
+  color: #1d4ed8;
+}
+
+.problem-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 7px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.problem-row code {
+  max-width: 220px;
+  overflow: hidden;
+  color: currentColor;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .source-tree {
@@ -2173,6 +2243,29 @@ dd input {
 @media (max-width: 960px) {
   body {
     min-width: 0;
+  }
+
+  .data-submit-dialog {
+    max-height: calc(100vh - 24px);
+  }
+
+  .source-picker,
+  .import-review,
+  .import-settings {
+    grid-template-columns: 1fr;
+  }
+
+  .source-tree {
+    max-height: 280px;
+  }
+
+  .problem-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .problem-row code {
+    grid-column: 2;
+    max-width: 100%;
   }
 
   .annotation-page {

@@ -435,8 +435,12 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
         }
         "analyze_data_source" => {
             let source_paths = string_vec_arg(&args, "sourcePaths")?;
-            serde_json::to_value(datasets::analyze_data_source(&source_paths)?)
-                .map_err(|err| err.to_string())
+            let format_override = optional_string_arg(&args, "formatOverride");
+            serde_json::to_value(datasets::analyze_data_source_with_override(
+                &source_paths,
+                format_override.as_deref(),
+            )?)
+            .map_err(|err| err.to_string())
         }
         "import_files" => {
             let project_id = string_arg(&args, "projectId")?;

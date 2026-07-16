@@ -194,8 +194,14 @@ export async function pickDataSource(selectionType: "folder" | "files"): Promise
   return invokeRequired("pick_data_source", { selectionType });
 }
 
-export async function analyzeDataSource(sourcePaths: string[]): Promise<DataSourceAnalysis> {
-  return invokeRequired("analyze_data_source", { sourcePaths });
+export async function analyzeDataSource(
+  sourcePaths: string[],
+  formatOverride?: DataSourceAnalysis["detectedFormat"],
+): Promise<DataSourceAnalysis> {
+  return invokeRequired("analyze_data_source", {
+    sourcePaths,
+    ...(formatOverride ? { formatOverride } : {}),
+  });
 }
 
 export async function importFiles(

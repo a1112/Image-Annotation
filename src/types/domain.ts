@@ -1,4 +1,10 @@
-export type DatasetFormat = "yolo-detect" | "yolo-seg" | "voc-detect" | "image-classification";
+export type DatasetFormat =
+  | "yolo-detect"
+  | "yolo-seg"
+  | "voc-detect"
+  | "coco"
+  | "labelme"
+  | "image-classification";
 
 export type BuiltinDataset = {
   key: string;
