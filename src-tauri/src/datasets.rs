@@ -44,6 +44,16 @@ pub struct DataSourceTreeNode {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct InspectionProblem {
+    pub severity: String,
+    pub code: String,
+    pub path: Option<String>,
+    pub record: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DataSourceAnalysis {
     pub source_paths: Vec<String>,
     pub root_path: String,
@@ -56,6 +66,10 @@ pub struct DataSourceAnalysis {
     pub classes: Vec<String>,
     pub split_count: u32,
     pub warnings: Vec<String>,
+    pub problems: Vec<InspectionProblem>,
+    pub unsupported_object_count: u32,
+    pub detection_confidence: u8,
+    pub annotation_path: Option<String>,
     pub tree: Vec<DataSourceTreeNode>,
 }
 
@@ -524,6 +538,29 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
     if detected_format == "image-directory" {
         warnings.push("未发现标注文件，将按未标注图片导入".to_string());
     }
+    let problems = warnings
+        .iter()
+        .map(|message| InspectionProblem {
+            severity: if image_count == 0 {
+                "error".to_string()
+            } else if detected_format == "image-directory" {
+                "info".to_string()
+            } else {
+                "warning".to_string()
+            },
+            code: if image_count == 0 {
+                "no-images".to_string()
+            } else if detected_format == "image-directory" {
+                "no-annotations".to_string()
+            } else {
+                "incomplete-annotations".to_string()
+            },
+            path: None,
+            record: None,
+            message: message.clone(),
+        })
+        .collect();
+    let detection_confidence = if detected_format == "unknown" { 0 } else { 80 };
 
     Ok(DataSourceAnalysis {
         source_paths: source_paths.to_vec(),
@@ -537,6 +574,10 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
         classes,
         split_count,
         warnings,
+        problems,
+        unsupported_object_count: 0,
+        detection_confidence,
+        annotation_path: None,
         tree: build_source_tree(&paths, &root),
     })
 }
@@ -1265,7 +1306,30 @@ fn path_contains_segment(path: &Path, segment: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::io::Write;
+
+    #[test]
+    fn inspection_problem_serializes_for_frontend_contract() {
+        let problem = InspectionProblem {
+            severity: "error".to_string(),
+            code: "missing-image".to_string(),
+            path: Some("images/a.jpg".to_string()),
+            record: Some("42".to_string()),
+            message: "COCO image file does not exist".to_string(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(problem).unwrap(),
+            json!({
+                "severity": "error",
+                "code": "missing-image",
+                "path": "images/a.jpg",
+                "record": "42",
+                "message": "COCO image file does not exist"
+            })
+        );
+    }
 
     #[test]
     fn imports_dataset_archive_into_manifest_and_sqlite_index() {

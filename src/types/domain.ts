@@ -27,6 +27,14 @@ export type DataSourceTreeNode = {
   truncated: boolean;
 };
 
+export type InspectionProblem = {
+  severity: "error" | "warning" | "info";
+  code: string;
+  path: string | null;
+  record: string | null;
+  message: string;
+};
+
 export type DataSourceAnalysis = {
   sourcePaths: string[];
   rootPath: string;
@@ -39,6 +47,10 @@ export type DataSourceAnalysis = {
   classes: string[];
   splitCount: number;
   warnings: string[];
+  problems?: InspectionProblem[];
+  unsupportedObjectCount?: number;
+  detectionConfidence?: number;
+  annotationPath?: string | null;
   tree: DataSourceTreeNode[];
 };
 

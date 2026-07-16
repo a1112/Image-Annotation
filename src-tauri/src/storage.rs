@@ -23,6 +23,24 @@ pub struct StoredClass {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct StoredDatasetSource {
+    pub format: String,
+    pub mode: String,
+    pub root_path: String,
+    pub annotation_path: Option<String>,
+    pub options_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredImageSource {
+    pub image_id: String,
+    pub relative_path: String,
+    pub external_id: Option<String>,
+    pub annotation_path: Option<String>,
+    pub source_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct AnnotationPayload {
     pub image_id: String,
     pub revision: String,
@@ -133,6 +151,21 @@ pub fn initialize_project_database(path: &Path) -> Result<(), String> {
                 name TEXT NOT NULL,
                 class_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS dataset_sources (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                format TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                root_path TEXT NOT NULL,
+                annotation_path TEXT,
+                options_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS image_sources (
+                image_id TEXT PRIMARY KEY,
+                relative_path TEXT NOT NULL,
+                external_id TEXT,
+                annotation_path TEXT,
+                source_version TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS annotations (
                 id TEXT PRIMARY KEY,
@@ -310,6 +343,105 @@ pub fn read_project_manifest(path: &Path) -> Result<Option<ProjectManifest>, Str
                     class_count: row.get::<_, u32>(5)?,
                     image_count: row.get::<_, u32>(6)?,
                     created_at: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|err| err.to_string())
+}
+
+pub fn write_dataset_source(path: &Path, source: &StoredDatasetSource) -> Result<(), String> {
+    initialize_project_database(path)?;
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO dataset_sources (id, format, mode, root_path, annotation_path, options_json)
+            VALUES (1, ?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+              format = excluded.format,
+              mode = excluded.mode,
+              root_path = excluded.root_path,
+              annotation_path = excluded.annotation_path,
+              options_json = excluded.options_json
+            "#,
+            params![
+                source.format,
+                source.mode,
+                source.root_path,
+                source.annotation_path,
+                source.options_json,
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+pub fn read_dataset_source(path: &Path) -> Result<Option<StoredDatasetSource>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    initialize_project_database(path)?;
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    connection
+        .query_row(
+            "SELECT format, mode, root_path, annotation_path, options_json FROM dataset_sources WHERE id = 1",
+            [],
+            |row| {
+                Ok(StoredDatasetSource {
+                    format: row.get(0)?,
+                    mode: row.get(1)?,
+                    root_path: row.get(2)?,
+                    annotation_path: row.get(3)?,
+                    options_json: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|err| err.to_string())
+}
+
+pub fn replace_image_sources(path: &Path, sources: &[StoredImageSource]) -> Result<(), String> {
+    initialize_project_database(path)?;
+    let mut connection = Connection::open(path).map_err(|err| err.to_string())?;
+    let transaction = connection.transaction().map_err(|err| err.to_string())?;
+    transaction
+        .execute("DELETE FROM image_sources", [])
+        .map_err(|err| err.to_string())?;
+    for source in sources {
+        transaction
+            .execute(
+                "INSERT INTO image_sources (image_id, relative_path, external_id, annotation_path, source_version) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    source.image_id,
+                    source.relative_path,
+                    source.external_id,
+                    source.annotation_path,
+                    source.source_version,
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+    }
+    transaction.commit().map_err(|err| err.to_string())
+}
+
+pub fn read_image_source(path: &Path, image_id: &str) -> Result<Option<StoredImageSource>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    initialize_project_database(path)?;
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    connection
+        .query_row(
+            "SELECT image_id, relative_path, external_id, annotation_path, source_version FROM image_sources WHERE image_id = ?1",
+            params![image_id],
+            |row| {
+                Ok(StoredImageSource {
+                    image_id: row.get(0)?,
+                    relative_path: row.get(1)?,
+                    external_id: row.get(2)?,
+                    annotation_path: row.get(3)?,
+                    source_version: row.get(4)?,
                 })
             },
         )
@@ -1146,6 +1278,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["img-3", "img-4"]
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn source_mapping_records_round_trip() {
+        let path = std::env::temp_dir().join("image_annotation_source_mapping_test.sqlite");
+        let _ = std::fs::remove_file(&path);
+        initialize_project_database(&path).unwrap();
+        let source = StoredDatasetSource {
+            format: "coco".to_string(),
+            mode: "linked".to_string(),
+            root_path: "L:/dataset".to_string(),
+            annotation_path: Some("L:/dataset/annotations.json".to_string()),
+            options_json: "{}".to_string(),
+        };
+        let mapping = StoredImageSource {
+            image_id: "img-1".to_string(),
+            relative_path: "images/a.jpg".to_string(),
+            external_id: Some("42".to_string()),
+            annotation_path: Some("annotations.json".to_string()),
+            source_version: "100:1234".to_string(),
+        };
+
+        write_dataset_source(&path, &source).unwrap();
+        replace_image_sources(&path, std::slice::from_ref(&mapping)).unwrap();
+
+        assert_eq!(read_dataset_source(&path).unwrap(), Some(source));
+        assert_eq!(read_image_source(&path, "img-1").unwrap(), Some(mapping));
         let _ = std::fs::remove_file(path);
     }
 }
