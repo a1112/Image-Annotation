@@ -10,6 +10,7 @@ import type {
   DatasetImage,
   DatasetProject,
   DatasetSnapshot,
+  DataSourceAnalysis,
   DownloadJob,
   ProjectDetail,
 } from "../types/domain";
@@ -182,6 +183,21 @@ export async function importYoloDataset(
   sourcePath: string,
 ): Promise<DatasetProject> {
   return invokeRequired("import_yolo_dataset", { projectId, sourcePath });
+}
+
+export async function pickDataSource(selectionType: "folder" | "files"): Promise<string[] | null> {
+  return invokeRequired("pick_data_source", { selectionType });
+}
+
+export async function analyzeDataSource(sourcePaths: string[]): Promise<DataSourceAnalysis> {
+  return invokeRequired("analyze_data_source", { sourcePaths });
+}
+
+export async function importFiles(
+  projectId: string,
+  sourcePaths: string[],
+): Promise<DatasetProject> {
+  return invokeRequired("import_files", { projectId, sourcePaths });
 }
 
 export async function openLocalDataset(

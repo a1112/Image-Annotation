@@ -221,8 +221,8 @@ mod tests {
             },
         )];
 
-        let xml = annotations_to_voc_xml(Path::new("L:/data/out/a.jpg"), 1024, 1024, &objects)
-            .unwrap();
+        let xml =
+            annotations_to_voc_xml(Path::new("L:/data/out/a.jpg"), 1024, 1024, &objects).unwrap();
 
         assert!(xml.contains("<filename>a.jpg</filename>"));
         assert!(xml.contains("<name>毛刺</name>"));

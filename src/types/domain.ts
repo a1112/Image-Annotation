@@ -1,4 +1,4 @@
-export type DatasetFormat = "yolo-detect" | "yolo-seg" | "voc-detect";
+export type DatasetFormat = "yolo-detect" | "yolo-seg" | "voc-detect" | "image-classification";
 
 export type BuiltinDataset = {
   key: string;
@@ -17,6 +17,29 @@ export type DownloadJob = {
   progress: number;
   message: string;
   projectId: string | null;
+};
+
+export type DataSourceTreeNode = {
+  name: string;
+  path: string;
+  kind: "folder" | "file";
+  children: DataSourceTreeNode[];
+  truncated: boolean;
+};
+
+export type DataSourceAnalysis = {
+  sourcePaths: string[];
+  rootPath: string;
+  sourceKind: "folder" | "files";
+  detectedFormat: DatasetFormat | "image-directory" | "unknown";
+  recommendedAction: "open-local" | "copy-images";
+  imageCount: number;
+  annotationCount: number;
+  classCount: number;
+  classes: string[];
+  splitCount: number;
+  warnings: string[];
+  tree: DataSourceTreeNode[];
 };
 
 export type BackendTask = {

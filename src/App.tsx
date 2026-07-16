@@ -1,26 +1,27 @@
 import {
   Archive,
+  ArrowLeft,
   BoxSelect,
   CheckCircle2,
-  ChevronDown,
   CircleAlert,
   ClipboardCheck,
   Database,
   Download,
   Eye,
   FileJson,
+  Files,
   FolderKanban,
+  FolderOpen,
   Home,
   ImageIcon,
   Layers3,
   Maximize2,
-  Minimize2,
+  Minus,
   Move,
   MousePointer2,
   Play,
   Plus,
   Save,
-  Search,
   Settings,
   ShieldCheck,
   Square,
@@ -31,9 +32,10 @@ import {
   ZoomOut,
   Zap,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { KeyboardEvent, MouseEvent, WheelEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { DragEvent, KeyboardEvent, MouseEvent, WheelEvent } from "react";
 import {
+  analyzeDataSource,
   clearCompletedBackendTasks,
   createDatasetProject,
   createDatasetSnapshot,
@@ -43,6 +45,7 @@ import {
   getFileAssetUrl,
   getImageAnnotations,
   getImageAnnotationState,
+  importFiles,
   importImages,
   importYoloDataset,
   getProjectDetail,
@@ -57,6 +60,7 @@ import {
   openAnnotationWindow,
   openBackendTaskTray,
   openLocalDataset,
+  pickDataSource,
   saveImageAnnotations,
   submitImageAnnotations,
 } from "./api/tauri";
@@ -71,9 +75,12 @@ import type {
   DatasetImage,
   DatasetProject,
   DatasetSnapshot,
+  DataSourceAnalysis,
+  DataSourceTreeNode,
   ProjectDetail,
 } from "./types/domain";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 type ProjectTab = "概览" | "数据分组" | "图片" | "类别" | "任务" | "质检" | "快照" | "导出";
 type ToolMode = "select" | "bbox" | "polygon" | "pan";
@@ -89,8 +96,12 @@ type CanvasSize = {
 };
 type DatasetCreationForm = {
   name: string;
-  datasetType: "yolo-detect" | "yolo-seg";
-  demoTemplate: "demo-bbox" | "demo-polygon" | "empty";
+  datasetType: "yolo-detect" | "yolo-seg" | "image-classification";
+  demoTemplate: "demo-bbox" | "demo-polygon" | "demo-classification" | "empty";
+};
+type ProjectTopbarContext = {
+  project: DatasetProject;
+  firstImageId?: string;
 };
 type Route =
   | { name: "datasets" }
@@ -126,6 +137,15 @@ async function runDesktopCommand(command: string) {
   }
 }
 
+function beginDesktopWindowDrag(event: MouseEvent<HTMLElement>) {
+  if (event.button !== 0) return;
+  const target = event.target instanceof HTMLElement ? event.target : null;
+  if (target?.closest("[data-no-drag], button, input, textarea, select, a, label")) {
+    return;
+  }
+  void runDesktopCommand("start_drag_window");
+}
+
 function parseRoute(): Route {
   const hash = window.location.hash.replace(/^#\/?/, "");
   const parts = hash.split("/").filter(Boolean);
@@ -136,7 +156,12 @@ function parseRoute(): Route {
     return { name: "backendTasks" };
   }
   if (parts[0] === "datasets" && parts[1]) {
-    return { name: "project", projectId: parts[1] };
+    const tab = parts[2] ? decodeURIComponent(parts[2]) : undefined;
+    return {
+      name: "project",
+      projectId: parts[1],
+      tab: projectTabs.includes(tab as ProjectTab) ? tab as ProjectTab : undefined,
+    };
   }
   return { name: "datasets" };
 }
@@ -671,57 +696,114 @@ function BuiltinDatasetPanel({
 }
 
 function TopBar({
+  activeProjectId,
+  activeProjectContext,
   backendConnection,
   onBackendTasks,
   onCreateDataset,
   onDataSubmit,
   onDatasets,
+  onProjectAnnotate,
+  onProjectOpenWindow,
+  onProjectTab,
 }: {
+  activeProjectId?: string;
+  activeProjectContext: ProjectTopbarContext | null;
   backendConnection: BackendConnection;
   onBackendTasks: () => void;
   onCreateDataset: () => void;
   onDataSubmit: () => void;
   onDatasets: () => void;
+  onProjectAnnotate: (projectId: string, imageId?: string) => void;
+  onProjectOpenWindow: (project: DatasetProject) => void;
+  onProjectTab: (projectId: string, tab: ProjectTab) => void;
 }) {
+  const showWindowControls = backendConnection.mode === "tauri";
+  const isProjectScope = Boolean(activeProjectId);
+  const activeProject = activeProjectContext?.project ?? null;
+
   return (
-    <header className="topbar" data-tauri-drag-region>
-      <div className="brand" onClick={onDatasets} role="button" tabIndex={0}>
-        <ImageIcon size={19} />
-        <span>Image Annotation</span>
-      </div>
-      <button className="workspace" type="button" data-no-drag>
-        数据生产工作区 <ChevronDown size={15} />
+    <header className="topbar" data-tauri-drag-region onMouseDown={beginDesktopWindowDrag}>
+      <button
+        aria-label={isProjectScope ? "返回数据集列表" : "数据集首页"}
+        className="brand"
+        data-no-drag
+        onClick={onDatasets}
+        type="button"
+      >
+        {isProjectScope ? <ArrowLeft size={19} /> : <ImageIcon size={19} />}
       </button>
-      <label className="search" data-no-drag>
-        <Search size={16} />
-        <input placeholder="搜索数据集、标签、文件" />
-      </label>
+      <div className="topbar-context">
+        {activeProject ? (
+          <>
+            <strong>{activeProject.name}</strong>
+            <span>{activeProject.description}</span>
+          </>
+        ) : isProjectScope ? (
+          <span>加载数据集...</span>
+        ) : null}
+      </div>
       <div className="topbar-actions" data-no-drag>
-        <button type="button" onClick={onBackendTasks}>
-          <ClipboardCheck size={16} />
-          后端任务
-        </button>
-        <button type="button" onClick={onDataSubmit}>
-          <Upload size={16} />
-          数据提交
-        </button>
-        <button type="button" className="primary" onClick={onCreateDataset}>
-          <Plus size={16} />
-          新建数据集
-        </button>
+        {isProjectScope && activeProjectId ? (
+          <>
+            {activeProject ? (
+              <>
+                <button type="button" onClick={() => onProjectAnnotate(activeProject.id, activeProjectContext?.firstImageId)}>
+                  <Play size={16} />
+                  开始标注
+                </button>
+                <button type="button" onClick={() => onProjectOpenWindow(activeProject)}>
+                  <Layers3 size={16} />
+                  独立窗口标注
+                </button>
+              </>
+            ) : null}
+            <button type="button" onClick={onDataSubmit}>
+              <Plus size={16} />
+              添加数据
+            </button>
+            <button type="button" onClick={() => onProjectTab(activeProjectId, "快照")}>
+              <Save size={16} />
+              快照管理
+            </button>
+            <button className="primary" type="button" onClick={() => onProjectTab(activeProjectId, "导出")}>
+              <Download size={16} />
+              导出数据集
+            </button>
+          </>
+        ) : (
+          <>
+            <button type="button" onClick={onBackendTasks}>
+              <ClipboardCheck size={16} />
+              后端任务
+            </button>
+            <button type="button" onClick={onDataSubmit}>
+              <Upload size={16} />
+              数据提交
+            </button>
+            <button type="button" className="primary" onClick={onCreateDataset}>
+              <Plus size={16} />
+              新建数据集
+            </button>
+          </>
+        )}
         <span className={`sync-state ${backendConnection.mode}`}>
           {backendConnection.mode === "unavailable" ? <CircleAlert size={15} /> : <CheckCircle2 size={15} />}
           {backendConnection.label}
         </span>
-        <button aria-label="最小化" type="button" onClick={() => runDesktopCommand("minimize_window")}>
-          <Minimize2 size={16} />
-        </button>
-        <button aria-label="最大化" type="button" onClick={() => runDesktopCommand("toggle_maximize_window")}>
-          <Maximize2 size={16} />
-        </button>
-        <button aria-label="关闭到托盘" type="button" onClick={() => runDesktopCommand("close_window")}>
-          <X size={16} />
-        </button>
+        {showWindowControls ? (
+          <>
+            <button aria-label="最小化" type="button" onClick={() => runDesktopCommand("minimize_window")}>
+              <Minus size={16} />
+            </button>
+            <button aria-label="最大化" type="button" onClick={() => runDesktopCommand("toggle_maximize_window")}>
+              <Maximize2 size={16} />
+            </button>
+            <button aria-label="关闭到托盘" type="button" onClick={() => runDesktopCommand("close_window")}>
+              <X size={16} />
+            </button>
+          </>
+        ) : null}
       </div>
     </header>
   );
@@ -920,26 +1002,155 @@ function ProjectInfoDialog({ onClose }: { onClose: () => void }) {
   );
 }
 
+type DataImportAction = "open-local" | "copy-images" | "copy-yolo";
+
 function DataSubmitDialog({
   datasets,
   projects,
   onCancel,
+  onAnalyzeSource,
   onDownload,
+  onImportFiles,
   onImportImages,
   onImportYolo,
   onOpenLocal,
+  onPickSource,
 }: {
   datasets: BuiltinDataset[];
   projects: DatasetProject[];
   onCancel: () => void;
+  onAnalyzeSource: (sourcePaths: string[]) => Promise<DataSourceAnalysis>;
   onDownload: (datasetKey: string) => void;
+  onImportFiles: (projectId: string, sourcePaths: string[]) => void;
   onImportImages: (projectId: string, sourcePath: string) => void;
   onImportYolo: (projectId: string, sourcePath: string) => void;
   onOpenLocal: (sourcePath: string, datasetType: string) => void;
+  onPickSource: (selectionType: "folder" | "files") => Promise<string[] | null>;
 }) {
   const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
-  const [sourcePath, setSourcePath] = useState("");
-  const [localDatasetType, setLocalDatasetType] = useState<"voc-detect" | "yolo-detect">("voc-detect");
+  const [analysis, setAnalysis] = useState<DataSourceAnalysis | null>(null);
+  const [datasetType, setDatasetType] = useState<"voc-detect" | "yolo-detect" | "image-directory">("voc-detect");
+  const [importAction, setImportAction] = useState<DataImportAction>("open-local");
+  const [analyzeState, setAnalyzeState] = useState<"idle" | "loading" | "error">("idle");
+  const [message, setMessage] = useState<string | null>(null);
+  const [dropActive, setDropActive] = useState(false);
+
+  const analyzeSourcePaths = useCallback(async (sourcePaths: string[]) => {
+    if (!sourcePaths.length) return;
+    setAnalyzeState("loading");
+    setMessage(null);
+    try {
+      const nextAnalysis = await onAnalyzeSource(sourcePaths);
+      setAnalysis(nextAnalysis);
+      setDatasetType(normalizeDetectedDatasetType(nextAnalysis.detectedFormat));
+      setImportAction(defaultImportAction(nextAnalysis));
+      setAnalyzeState("idle");
+    } catch (error) {
+      setAnalyzeState("error");
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  }, [onAnalyzeSource]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === "enter" || event.payload.type === "over") {
+          setDropActive(true);
+          return;
+        }
+        if (event.payload.type === "leave") {
+          setDropActive(false);
+          return;
+        }
+        setDropActive(false);
+        void analyzeSourcePaths(event.payload.paths);
+      })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {
+        // In a normal browser there is no Tauri webview event source.
+      });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [analyzeSourcePaths]);
+
+  async function chooseSource(selectionType: "folder" | "files") {
+    setAnalyzeState("loading");
+    setMessage(null);
+    try {
+      const sourcePaths = await onPickSource(selectionType);
+      if (!sourcePaths?.length) {
+        setAnalyzeState("idle");
+        return;
+      }
+      await analyzeSourcePaths(sourcePaths);
+    } catch (error) {
+      setAnalyzeState("error");
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function handleDragEnter(event: DragEvent<HTMLElement>) {
+    event.preventDefault();
+    setDropActive(true);
+  }
+
+  function handleDragOver(event: DragEvent<HTMLElement>) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    setDropActive(true);
+  }
+
+  function handleDragLeave(event: DragEvent<HTMLElement>) {
+    const nextTarget = event.relatedTarget instanceof Node ? event.relatedTarget : null;
+    if (nextTarget && event.currentTarget.contains(nextTarget)) return;
+    setDropActive(false);
+  }
+
+  function handleDrop(event: DragEvent<HTMLElement>) {
+    event.preventDefault();
+    setDropActive(false);
+    const sourcePaths = pathsFromDrop(event.dataTransfer);
+    if (!sourcePaths.length) {
+      setAnalyzeState("error");
+      setMessage("当前环境无法读取拖拽文件路径，请使用选择文件夹或选择多个文件。");
+      return;
+    }
+    void analyzeSourcePaths(sourcePaths);
+  }
+
+  function confirmImport() {
+    if (!analysis) return;
+    if (importAction === "open-local") {
+      onOpenLocal(analysis.rootPath, datasetType === "image-directory" ? "voc-detect" : datasetType);
+      return;
+    }
+    if (importAction === "copy-yolo") {
+      onImportYolo(projectId, analysis.rootPath);
+      return;
+    }
+    if (analysis.sourceKind === "files") {
+      onImportFiles(projectId, analysis.sourcePaths);
+      return;
+    }
+    onImportImages(projectId, analysis.rootPath);
+  }
+
+  const canConfirm = Boolean(
+    analysis
+      && analysis.imageCount > 0
+      && (importAction === "open-local" || projectId),
+  );
 
   return (
     <div className="modal-backdrop">
@@ -953,68 +1164,172 @@ function DataSubmitDialog({
             <X size={16} />
           </button>
         </div>
-        <div className="submit-options">
-          <article className="submit-option">
-            <FolderKanban size={18} />
+        <section className="source-picker">
+          <button type="button" onClick={() => chooseSource("folder")} disabled={analyzeState === "loading"}>
+            <FolderOpen size={18} />
             <div>
-              <h3>打开本机标注目录</h3>
-              <p>不复制图片，直接索引本机 VOC / YOLO BBox 目录，保存时原地写回 XML 或 TXT。</p>
+              <strong>选择文件夹</strong>
+              <span>自动识别 VOC / YOLO / 图片目录</span>
             </div>
-            <button type="button" onClick={() => onOpenLocal(sourcePath, localDatasetType)} disabled={!sourcePath.trim()}>
-              打开本机数据集
-            </button>
-          </article>
-          <article className="submit-option">
-            <Upload size={18} />
+          </button>
+          <button type="button" onClick={() => chooseSource("files")} disabled={analyzeState === "loading"}>
+            <Files size={18} />
             <div>
-              <h3>本地图片或目录</h3>
-              <p>输入本机图片目录路径，后端会复制、索引并生成可标注图片列表。</p>
+              <strong>选择多个文件</strong>
+              <span>适合临时补充图片到当前项目</span>
             </div>
-            <button type="button" onClick={() => onImportImages(projectId, sourcePath)} disabled={!projectId || !sourcePath.trim()}>
-              导入图片目录
-            </button>
-          </article>
-          <article className="submit-option">
-            <Database size={18} />
+          </button>
+        </section>
+        <section
+          aria-label="拖拽添加数据"
+          className={`drop-source ${dropActive ? "active" : ""}`}
+          onDragEnter={handleDragEnter}
+          onDragLeave={handleDragLeave}
+          onDragOver={handleDragOver}
+          onDrop={handleDrop}
+        >
+          <Upload size={20} />
+          <div>
+            <strong>{dropActive ? "松开后分析数据" : "拖拽文件夹或多个文件到这里"}</strong>
+            <span>不会立即导入，系统会先展开导入确认界面。</span>
+          </div>
+        </section>
+        {message ? <div className="inline-error">{message}</div> : null}
+        {analysis ? (
+          <section className="import-review">
+            <div className="import-review-main">
+              <div className="analysis-summary">
+                <span>{analysis.sourceKind === "folder" ? "文件夹分析" : "多文件分析"}</span>
+                <h3>{formatDatasetFormat(analysis.detectedFormat)}</h3>
+                <p>{analysis.rootPath}</p>
+                <div className="analysis-metrics">
+                  <div><strong>{analysis.imageCount}</strong><span>图片</span></div>
+                  <div><strong>{analysis.annotationCount}</strong><span>标注文件</span></div>
+                  <div><strong>{analysis.classCount}</strong><span>类别</span></div>
+                  <div><strong>{analysis.splitCount || 1}</strong><span>分组</span></div>
+                </div>
+              </div>
+              <div className="import-settings">
+                <label>
+                  <span>导入方式</span>
+                  <select value={importAction} onChange={(event) => setImportAction(event.target.value as DataImportAction)}>
+                    <option value="open-local">链接本机目录（原地写回标注）</option>
+                    <option value="copy-images">复制图片到目标项目</option>
+                    {analysis.detectedFormat === "yolo-detect" ? <option value="copy-yolo">复制 YOLO 数据集到目标项目</option> : null}
+                  </select>
+                </label>
+                <label>
+                  <span>数据类型</span>
+                  <select value={datasetType} onChange={(event) => setDatasetType(event.target.value as typeof datasetType)}>
+                    <option value="voc-detect">Pascal VOC BBox XML</option>
+                    <option value="yolo-detect">YOLO BBox TXT</option>
+                    <option value="image-directory">仅图片目录</option>
+                  </select>
+                </label>
+                {importAction !== "open-local" ? (
+                  <label>
+                    <span>目标项目</span>
+                    <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
+                      <option value="">请选择项目</option>
+                      {projects.map((project) => (
+                        <option key={project.id} value={project.id}>{project.name}</option>
+                      ))}
+                    </select>
+                  </label>
+                ) : null}
+              </div>
+              {analysis.classes.length ? (
+                <div className="class-preview">
+                  {analysis.classes.slice(0, 12).map((label) => <span key={label}>{label}</span>)}
+                  {analysis.classes.length > 12 ? <span>+{analysis.classes.length - 12}</span> : null}
+                </div>
+              ) : null}
+              {analysis.warnings.length ? (
+                <div className="import-warnings">
+                  {analysis.warnings.map((warning) => <span key={warning}>{warning}</span>)}
+                </div>
+              ) : null}
+              <div className="dialog-actions">
+                <button type="button" onClick={() => setAnalysis(null)}>重新选择</button>
+                <button className="primary" type="button" onClick={confirmImport} disabled={!canConfirm}>
+                  确认导入
+                </button>
+              </div>
+            </div>
+            <aside className="source-tree" aria-label="文件夹结构">
+              <h3>文件夹结构</h3>
+              {analysis.tree.map((node) => <SourceTreeNode node={node} key={`${node.kind}-${node.path}`} />)}
+            </aside>
+          </section>
+        ) : (
+          <section className="empty-analysis">
+            <Database size={20} />
             <div>
-              <h3>YOLO 数据集目录</h3>
-              <p>导入包含 images/labels 的 YOLO 检测或分割数据集。</p>
+              <h3>{analyzeState === "loading" ? "正在分析数据结构" : "选择数据来源后确认导入"}</h3>
+              <p>选择文件夹或多个文件后，系统会自动识别标注格式并展开导入确认界面。</p>
             </div>
-            <button type="button" onClick={() => onImportYolo(projectId, sourcePath)} disabled={!projectId || !sourcePath.trim()}>
-              导入 YOLO 数据集
-            </button>
-          </article>
-        </div>
-        <div className="submit-path-form">
-          <label>
-            <span>目录类型</span>
-            <select value={localDatasetType} onChange={(event) => setLocalDatasetType(event.target.value as "voc-detect" | "yolo-detect")}>
-              <option value="voc-detect">Pascal VOC BBox XML</option>
-              <option value="yolo-detect">YOLO BBox TXT</option>
-            </select>
-          </label>
-          <label>
-            <span>目标项目</span>
-            <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
-              <option value="">请选择项目</option>
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>{project.name}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            <span>本地路径</span>
-            <input
-              placeholder="例如 F:\\datasets\\my-yolo-dataset"
-              value={sourcePath}
-              onChange={(event) => setSourcePath(event.target.value)}
-            />
-          </label>
-        </div>
-        <BuiltinDatasetPanel datasets={datasets} onDownload={onDownload} />
+          </section>
+        )}
+        <details className="builtin-downloads">
+          <summary>内置下载</summary>
+          <BuiltinDatasetPanel datasets={datasets} onDownload={onDownload} />
+        </details>
       </section>
     </div>
   );
+}
+
+function SourceTreeNode({ node }: { node: DataSourceTreeNode }) {
+  return (
+    <div className={`tree-node ${node.kind}`}>
+      <div>
+        <span>{node.kind === "folder" ? "▸" : ""}</span>
+        <strong>{node.name}</strong>
+      </div>
+      {node.children.length ? (
+        <div className="tree-children">
+          {node.children.map((child) => <SourceTreeNode node={child} key={`${child.kind}-${child.path}`} />)}
+          {node.truncated ? <span className="tree-more">已截断显示</span> : null}
+        </div>
+      ) : node.truncated ? (
+        <span className="tree-more">已截断显示</span>
+      ) : null}
+    </div>
+  );
+}
+
+function pathsFromDrop(dataTransfer: DataTransfer) {
+  const droppedText = typeof dataTransfer.getData === "function" ? dataTransfer.getData("text/plain") : "";
+  const explicitPaths = droppedText
+    .split(/\r?\n/)
+    .map((path) => path.trim())
+    .filter(Boolean);
+  if (explicitPaths.length) return explicitPaths;
+
+  return Array.from(dataTransfer.files)
+    .map((file) => {
+      const pathFile = file as File & { path?: string; webkitRelativePath?: string };
+      return pathFile.path || pathFile.webkitRelativePath || "";
+    })
+    .filter(Boolean);
+}
+
+function normalizeDetectedDatasetType(format: DataSourceAnalysis["detectedFormat"]): "voc-detect" | "yolo-detect" | "image-directory" {
+  if (format === "yolo-detect") return "yolo-detect";
+  if (format === "voc-detect") return "voc-detect";
+  return "image-directory";
+}
+
+function defaultImportAction(analysis: DataSourceAnalysis): DataImportAction {
+  if (analysis.recommendedAction === "open-local") return "open-local";
+  return "copy-images";
+}
+
+function formatDatasetFormat(format: DataSourceAnalysis["detectedFormat"]) {
+  if (format === "voc-detect") return "Pascal VOC BBox";
+  if (format === "yolo-detect") return "YOLO BBox";
+  if (format === "image-directory") return "图片目录";
+  return "未识别";
 }
 
 function RuntimeStatePanel({
@@ -1078,16 +1393,23 @@ function CreateDatasetDialog({
             aria-label="数据集类型"
             onChange={(event) => {
               const datasetType = event.target.value as DatasetCreationForm["datasetType"];
+              const demoTemplate =
+                datasetType === "yolo-seg"
+                  ? "demo-polygon"
+                  : datasetType === "image-classification"
+                    ? "demo-classification"
+                    : "demo-bbox";
               onChange({
                 ...form,
                 datasetType,
-                demoTemplate: datasetType === "yolo-seg" ? "demo-polygon" : "demo-bbox",
+                demoTemplate,
               });
             }}
             value={form.datasetType}
           >
             <option value="yolo-detect">目标检测 / YOLO BBox</option>
             <option value="yolo-seg">实例分割 / YOLO Polygon</option>
+            <option value="image-classification">图像分类 / Classification</option>
           </select>
         </label>
         <label>
@@ -1099,6 +1421,7 @@ function CreateDatasetDialog({
           >
             <option value="demo-bbox">Demo BBox：生成 3 张样例图和检测标签</option>
             <option value="demo-polygon">Demo Polygon：生成 3 张样例图和分割标签</option>
+            <option value="demo-classification">Demo Classification：生成 3 张样例图和分类目录</option>
             <option value="empty">空数据集：仅创建工程结构</option>
           </select>
         </label>
@@ -1260,17 +1583,19 @@ function ImagePreviewDialog({
 
 function ProjectWorkspace({
   projectId,
-  onOpenWindow,
+  routeTab,
+  onProjectContextChange,
 }: {
   projectId: string;
-  onOpenWindow: (project: DatasetProject) => void;
+  routeTab?: ProjectTab;
+  onProjectContextChange: (context: ProjectTopbarContext | null) => void;
 }) {
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [images, setImages] = useState<DatasetImage[]>([]);
   const [snapshots, setSnapshots] = useState<DatasetSnapshot[]>([]);
   const [exports, setExports] = useState<DatasetExport[]>([]);
   const [workflowMessage, setWorkflowMessage] = useState<string | null>(null);
-  const [tab, setTab] = useState<ProjectTab>("概览");
+  const [tab, setTab] = useState<ProjectTab>(routeTab ?? "概览");
   const [imagePage, setImagePage] = useState(0);
   const [previewImageId, setPreviewImageId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<{ title: string; message: string } | null>(null);
@@ -1295,6 +1620,12 @@ function ProjectWorkspace({
     setClassSamples([]);
     setClassSamplePage(0);
   }, [projectId]);
+
+  useEffect(() => {
+    if (routeTab) {
+      setTab(routeTab);
+    }
+  }, [routeTab]);
 
   useEffect(() => {
     if (!selectedClass) {
@@ -1334,6 +1665,7 @@ function ProjectWorkspace({
 
   useEffect(() => {
     setLoadError(null);
+    onProjectContextChange(null);
     Promise.all([
       getProjectDetail(projectId),
       listProjectImages(projectId, undefined, {
@@ -1348,19 +1680,24 @@ function ProjectWorkspace({
         setImages(nextImages);
         setSnapshots(nextSnapshots);
         setExports(nextExports);
+        onProjectContextChange({
+          project: nextDetail.project,
+          firstImageId: nextImages[0]?.id,
+        });
       })
       .catch((error) => {
         setDetail(null);
         setImages([]);
         setSnapshots([]);
         setExports([]);
+        onProjectContextChange(null);
         setLoadError(
           isBackendUnavailableError(error)
             ? { title: "后端未连接", message: "请在 Tauri 桌面环境启动应用。" }
             : { title: "数据集未初始化", message: error instanceof Error ? error.message : String(error) },
         );
       });
-  }, [projectId, imagePage]);
+  }, [projectId, imagePage, onProjectContextChange]);
 
   async function handleCreateSnapshot() {
     if (!detail) return;
@@ -1413,29 +1750,6 @@ function ProjectWorkspace({
     <main className="project-page">
       <section className="project-main">
         <div className="project-sticky-header">
-          <div className="project-header">
-            <div>
-              <button className="text-button" type="button" onClick={() => navigate("#/datasets")}>
-                数据集
-              </button>
-              <h1>{detail.project.name}</h1>
-              <p>{detail.project.description}</p>
-            </div>
-            <div className="project-actions">
-              <button type="button" onClick={() => navigate(`#/annotate/${detail.project.id}/${images[0]?.id ?? ""}`)}>
-                <Play size={16} />
-                开始标注
-              </button>
-              <button type="button" onClick={() => onOpenWindow(detail.project)}>
-                <Layers3 size={16} />
-                独立窗口标注
-              </button>
-              <button className="primary" type="button">
-                <Download size={16} />
-                导出数据集
-              </button>
-            </div>
-          </div>
           <div className="project-tabs" aria-label="项目页面">
             {projectTabs.map((item) => (
               <button aria-pressed={item === tab} className={item === tab ? "active" : ""} key={item} onClick={() => setTab(item)} type="button">
@@ -1780,7 +2094,15 @@ function renderProjectTab(
   }
 }
 
-function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageId?: string }) {
+function AnnotationWorkspace({
+  projectId,
+  imageId,
+  showWindowControls,
+}: {
+  projectId: string;
+  imageId?: string;
+  showWindowControls: boolean;
+}) {
   const [images, setImages] = useState<DatasetImage[]>([]);
   const [imagesLoaded, setImagesLoaded] = useState(false);
   const [loadError, setLoadError] = useState<{ title: string; message: string } | null>(null);
@@ -2387,15 +2709,6 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
     setDirty(true);
   }
 
-  function beginWindowDrag(event: MouseEvent<HTMLElement>) {
-    if (event.button !== 0) return;
-    const target = event.target instanceof HTMLElement ? event.target : null;
-    if (target?.closest("[data-no-drag], button, input, textarea, select, a, label")) {
-      return;
-    }
-    void runDesktopCommand("start_drag_window");
-  }
-
   return (
     <main className="annotation-page">
       <aside className="tool-rail" aria-label="Annotation tools">
@@ -2424,7 +2737,7 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
         })}
       </aside>
       <section className="workspace-area">
-        <div className="annotation-toolbar" data-tauri-drag-region onMouseDown={beginWindowDrag}>
+        <div className="annotation-toolbar" data-tauri-drag-region onMouseDown={beginDesktopWindowDrag}>
           <div>
             <h1>标注工作台</h1>
             <span>{projectId} / {activeImage?.fileName ?? "加载图片"} / {annotationStatus}</span>
@@ -2453,17 +2766,19 @@ function AnnotationWorkspace({ projectId, imageId }: { projectId: string; imageI
             <button type="button" onClick={() => save({ next: true })}>
               保存并下一张
             </button>
-            <span className="annotation-window-controls">
-              <button aria-label="最小化标注工作台" type="button" onClick={() => runDesktopCommand("minimize_window")}>
-                <Minimize2 size={16} />
-              </button>
-              <button aria-label="最大化标注工作台" type="button" onClick={() => runDesktopCommand("toggle_maximize_window")}>
-                <Maximize2 size={16} />
-              </button>
-              <button aria-label="关闭标注工作台" type="button" onClick={() => runDesktopCommand("close_window")}>
-                <X size={16} />
-              </button>
-            </span>
+            {showWindowControls ? (
+              <span className="annotation-window-controls">
+                <button aria-label="最小化标注工作台" type="button" onClick={() => runDesktopCommand("minimize_window")}>
+                  <Minus size={16} />
+                </button>
+                <button aria-label="最大化标注工作台" type="button" onClick={() => runDesktopCommand("toggle_maximize_window")}>
+                  <Maximize2 size={16} />
+                </button>
+                <button aria-label="关闭标注工作台" type="button" onClick={() => runDesktopCommand("close_window")}>
+                  <X size={16} />
+                </button>
+              </span>
+            ) : null}
           </div>
         </div>
         <div className="image-stage">
@@ -2598,6 +2913,7 @@ export default function App() {
   const [backendTasks, setBackendTasks] = useState<BackendTask[]>([]);
   const [taskTrayState, setTaskTrayState] = useState<"idle" | "loading" | "error">("idle");
   const [taskTrayMessage, setTaskTrayMessage] = useState<string | null>(null);
+  const [projectTopbarContext, setProjectTopbarContext] = useState<ProjectTopbarContext | null>(null);
   const [backendConnection, setBackendConnection] = useState<BackendConnection>({
     mode: "checking",
     label: "连接中",
@@ -2608,6 +2924,14 @@ export default function App() {
     const onHashChange = () => setRoute(parseRoute());
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  useEffect(() => {
+    setProjectTopbarContext(null);
+  }, [route.name === "project" ? route.projectId : route.name]);
+
+  const updateProjectTopbarContext = useCallback((context: ProjectTopbarContext | null) => {
+    setProjectTopbarContext(context);
   }, []);
 
   useEffect(() => {
@@ -2709,10 +3033,25 @@ export default function App() {
     await refreshDatasets({ autoDownload: false });
   }
 
-  async function handleOpenLocalDataset(sourcePath: string, datasetType: string) {
-    await openLocalDataset(sourcePath, datasetType);
+  async function handleImportFiles(projectId: string, sourcePaths: string[]) {
+    await importFiles(projectId, sourcePaths);
     setDataSubmitOpen(false);
     await refreshDatasets({ autoDownload: false });
+  }
+
+  async function handleOpenLocalDataset(sourcePath: string, datasetType: string) {
+    const project = await openLocalDataset(sourcePath, datasetType);
+    setDataSubmitOpen(false);
+    await refreshDatasets({ autoDownload: false });
+    navigate(`#/datasets/${project.id}`);
+  }
+
+  async function handlePickDataSource(selectionType: "folder" | "files") {
+    return pickDataSource(selectionType);
+  }
+
+  async function handleAnalyzeDataSource(sourcePaths: string[]) {
+    return analyzeDataSource(sourcePaths);
   }
 
   async function annotateProject(project: DatasetProject) {
@@ -2768,6 +3107,14 @@ export default function App() {
     }
   }
 
+  function openProjectTab(projectId: string, tab: ProjectTab) {
+    navigate(`#/datasets/${projectId}/${encodeURIComponent(tab)}`);
+  }
+
+  function openProjectAnnotationRoute(projectId: string, imageId?: string) {
+    navigate(`#/annotate/${projectId}/${imageId ?? ""}`);
+  }
+
   async function clearCompletedTasks() {
     try {
       await clearCompletedBackendTasks();
@@ -2799,17 +3146,22 @@ export default function App() {
   }
 
   if (route.name === "annotate") {
-    return <AnnotationWorkspace imageId={route.imageId} projectId={route.projectId} />;
+    return <AnnotationWorkspace imageId={route.imageId} projectId={route.projectId} showWindowControls={backendConnection.mode === "tauri"} />;
   }
 
   return (
     <div className="app-shell">
       <TopBar
+        activeProjectId={route.name === "project" ? route.projectId : undefined}
+        activeProjectContext={route.name === "project" ? projectTopbarContext : null}
         backendConnection={backendConnection}
         onBackendTasks={openBackendTasks}
         onCreateDataset={() => setCreateDialogOpen(true)}
         onDataSubmit={() => setDataSubmitOpen(true)}
         onDatasets={() => navigate("#/datasets")}
+        onProjectAnnotate={openProjectAnnotationRoute}
+        onProjectOpenWindow={openProjectWindow}
+        onProjectTab={openProjectTab}
       />
       <div className="app-body">
         <IconRail />
@@ -2825,7 +3177,13 @@ export default function App() {
             runtimeState={runtimeState}
           />
         )}
-        {route.name === "project" && <ProjectWorkspace onOpenWindow={openProjectWindow} projectId={route.projectId} />}
+        {route.name === "project" && (
+          <ProjectWorkspace
+            onProjectContextChange={updateProjectTopbarContext}
+            projectId={route.projectId}
+            routeTab={route.tab}
+          />
+        )}
       </div>
       {createDialogOpen ? (
         <CreateDatasetDialog
@@ -2839,11 +3197,14 @@ export default function App() {
         <DataSubmitDialog
           datasets={builtinDatasets}
           projects={projects}
+          onAnalyzeSource={handleAnalyzeDataSource}
           onCancel={() => setDataSubmitOpen(false)}
           onDownload={handleSubmitDownload}
+          onImportFiles={handleImportFiles}
           onImportImages={handleImportImages}
           onImportYolo={handleImportYolo}
           onOpenLocal={handleOpenLocalDataset}
+          onPickSource={handlePickDataSource}
         />
       ) : null}
       {projectInfoOpen ? <ProjectInfoDialog onClose={() => setProjectInfoOpen(false)} /> : null}

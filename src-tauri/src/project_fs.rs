@@ -180,7 +180,10 @@ pub fn list_project_manifests() -> Vec<ProjectManifest> {
     let mut manifests = Vec::new();
     manifests.extend(list_project_manifests_from(workspace_projects_dir()));
     for manifest in list_project_manifests_from(projects_dir()) {
-        if !manifests.iter().any(|item: &ProjectManifest| item.id == manifest.id) {
+        if !manifests
+            .iter()
+            .any(|item: &ProjectManifest| item.id == manifest.id)
+        {
             manifests.push(manifest);
         }
     }
