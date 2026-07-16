@@ -1,5 +1,5 @@
 use crate::{
-    importers::{voc, yolo},
+    importers::{voc_adapter, yolo_adapter},
     project_fs, storage,
 };
 use serde::{Deserialize, Serialize};
@@ -689,52 +689,6 @@ impl SampleRepository {
                 updated_at: None,
             };
         };
-        if is_voc_project(project_id) {
-            let label_path = image_path.with_extension("xml");
-            if let Ok(xml) = fs::read_to_string(label_path) {
-                let labels = storage::read_classes(&paths.sqlite)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|class| class.label)
-                    .collect::<Vec<_>>();
-                let objects = voc::parse_voc_annotations(&xml, &labels).unwrap_or_default();
-                return AnnotationState {
-                    image_id: image_id.to_string(),
-                    revision: None,
-                    objects,
-                    status: image_status(project_id, image_id)
-                        .unwrap_or_else(|| "已标注".to_string()),
-                    updated_at: None,
-                };
-            }
-            return AnnotationState {
-                image_id: image_id.to_string(),
-                revision: None,
-                objects: Vec::new(),
-                status: image_status(project_id, image_id).unwrap_or_else(|| "未标注".to_string()),
-                updated_at: None,
-            };
-        }
-        let Some(label_path) = yolo_label_path_for_image(project_id, &image_path) else {
-            return AnnotationState {
-                image_id: image_id.to_string(),
-                revision: None,
-                objects: Vec::new(),
-                status: image_status(project_id, image_id).unwrap_or_else(|| "未标注".to_string()),
-                updated_at: None,
-            };
-        };
-        let Ok(label_data) = fs::read_to_string(label_path) else {
-            return AnnotationState {
-                image_id: image_id.to_string(),
-                revision: None,
-                objects: Vec::new(),
-                status: image_status(project_id, image_id).unwrap_or_else(|| "未标注".to_string()),
-                updated_at: None,
-            };
-        };
-
-        let (width, height) = image::image_dimensions(&image_path).unwrap_or((0, 0));
         let labels = storage::read_classes(&paths.sqlite)
             .unwrap_or_default()
             .into_iter()
@@ -745,22 +699,33 @@ impl SampleRepository {
         } else {
             labels
         };
-        let prefer_polygon = project_fs::read_manifest(project_id)
-            .map(|manifest| manifest.format == "yolo-seg")
-            .unwrap_or(false);
-
-        let objects = label_data
-            .lines()
-            .enumerate()
-            .filter_map(|(index, line)| {
-                yolo::line_to_annotation(line, width, height, &labels, index, prefer_polygon).ok()
-            })
-            .collect();
+        let manifest = project_manifest(project_id);
+        let root = manifest
+            .as_ref()
+            .map(|manifest| PathBuf::from(&manifest.root_path))
+            .unwrap_or_else(|| paths.raw.clone());
+        let format = manifest
+            .as_ref()
+            .map(|manifest| manifest.format.as_str())
+            .unwrap_or("yolo-detect");
+        let objects = match format {
+            "voc-detect" => voc_adapter::load_annotations(&root, &image_path, &labels),
+            "yolo-detect" | "yolo-seg" => {
+                yolo_adapter::load_annotations(&root, &image_path, format, &labels)
+            }
+            _ => Ok(Vec::new()),
+        }
+        .unwrap_or_default();
+        let default_status = if objects.is_empty() {
+            "未标注".to_string()
+        } else {
+            "已标注".to_string()
+        };
         AnnotationState {
             image_id: image_id.to_string(),
             revision: None,
             objects,
-            status: image_status(project_id, image_id).unwrap_or_else(|| "已标注".to_string()),
+            status: image_status(project_id, image_id).unwrap_or(default_status),
             updated_at: None,
         }
     }
@@ -799,22 +764,54 @@ impl SampleRepository {
         let data = serde_json::to_string_pretty(&state).map_err(|err| err.to_string())?;
         fs::write(paths.annotations.join(format!("{image_id}.json")), data)
             .map_err(|err| err.to_string())?;
-        if is_voc_project(project_id) {
-            if let Some(image_path) = self.image_path(project_id, image_id) {
-                let (width, height) = image::image_dimensions(&image_path).unwrap_or((0, 0));
-                let xml = voc::annotations_to_voc_xml(&image_path, width, height, &state.objects)?;
-                fs::write(image_path.with_extension("xml"), xml).map_err(|err| err.to_string())?;
-            }
-        }
-        if is_yolo_detect_project(project_id) {
-            if let Some(image_path) = self.image_path(project_id, image_id) {
-                let (width, height) = image::image_dimensions(&image_path).unwrap_or((0, 0));
-                let label_path = yolo_label_write_path_for_image(project_id, &image_path);
-                if let Some(parent) = label_path.parent() {
-                    fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-                }
-                let label_data = yolo::annotations_to_yolo_lines(&state.objects, width, height)?;
-                fs::write(label_path, label_data).map_err(|err| err.to_string())?;
+        if let (Some(image_path), Some(manifest)) = (
+            self.image_path(project_id, image_id),
+            project_manifest(project_id),
+        ) {
+            let root = PathBuf::from(&manifest.root_path);
+            let source = storage::read_image_source(&paths.sqlite, image_id).unwrap_or_default();
+            let expected_version = source
+                .as_ref()
+                .map(|mapping| mapping.source_version.as_str())
+                .filter(|value| !value.is_empty());
+            let synced = match manifest.format.as_str() {
+                "voc-detect" => Some(voc_adapter::sync_annotations(
+                    &root,
+                    &image_path,
+                    &state.objects,
+                    expected_version,
+                )?),
+                "yolo-detect" => Some(yolo_adapter::sync_annotations(
+                    &root,
+                    &image_path,
+                    "yolo-detect",
+                    &state.objects,
+                    expected_version,
+                )?),
+                _ => None,
+            };
+            if let Some(synced) = synced {
+                let relative_path = image_path
+                    .strip_prefix(&root)
+                    .unwrap_or(&image_path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let annotation_path = synced
+                    .path
+                    .strip_prefix(&root)
+                    .unwrap_or(&synced.path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                storage::write_image_source(
+                    &paths.sqlite,
+                    &storage::StoredImageSource {
+                        image_id: image_id.to_string(),
+                        relative_path,
+                        external_id: source.and_then(|mapping| mapping.external_id),
+                        annotation_path: Some(annotation_path),
+                        source_version: synced.source_version,
+                    },
+                )?;
             }
         }
         Ok(AnnotationSaveResult {
@@ -1093,24 +1090,6 @@ fn split_for_path(path: &PathBuf) -> String {
     }
 }
 
-fn label_path_for_image(
-    raw_root: &std::path::Path,
-    image_path: &std::path::Path,
-) -> Option<PathBuf> {
-    let relative = image_path.strip_prefix(raw_root).ok()?;
-    let mut parts: Vec<_> = relative.components().collect();
-    let image_index = parts
-        .iter()
-        .position(|component| component.as_os_str().to_string_lossy() == "images")?;
-    parts[image_index] = std::path::Component::Normal(std::ffi::OsStr::new("labels"));
-    let mut label = raw_root.to_path_buf();
-    for component in parts {
-        label.push(component.as_os_str());
-    }
-    label.set_extension("txt");
-    label.exists().then_some(label)
-}
-
 fn project_asset_root(project_id: &str, paths: &project_fs::ProjectPaths) -> PathBuf {
     project_manifest(project_id)
         .filter(|manifest| manifest.source_dataset_key == "local-linked")
@@ -1125,55 +1104,6 @@ fn project_manifest(project_id: &str) -> Option<project_fs::ProjectManifest> {
         .ok()
         .flatten()
         .or_else(|| project_fs::read_manifest(project_id))
-}
-
-fn is_voc_project(project_id: &str) -> bool {
-    project_manifest(project_id)
-        .map(|manifest| manifest.format == "voc-detect")
-        .unwrap_or(false)
-}
-
-fn is_yolo_detect_project(project_id: &str) -> bool {
-    project_manifest(project_id)
-        .map(|manifest| manifest.format == "yolo-detect")
-        .unwrap_or(false)
-}
-
-fn yolo_label_path_for_image(project_id: &str, image_path: &Path) -> Option<PathBuf> {
-    let manifest_root = project_manifest(project_id)
-        .map(|manifest| PathBuf::from(manifest.root_path))
-        .unwrap_or_else(|| project_fs::project_paths(project_id).raw);
-
-    label_path_for_image(&manifest_root, image_path).or_else(|| {
-        image_path
-            .with_extension("txt")
-            .exists()
-            .then(|| image_path.with_extension("txt"))
-    })
-}
-
-fn yolo_label_write_path_for_image(project_id: &str, image_path: &Path) -> PathBuf {
-    let manifest_root = project_manifest(project_id)
-        .map(|manifest| PathBuf::from(manifest.root_path))
-        .unwrap_or_else(|| project_fs::project_paths(project_id).raw);
-
-    yolo_label_path_candidate(&manifest_root, image_path)
-        .unwrap_or_else(|| image_path.with_extension("txt"))
-}
-
-fn yolo_label_path_candidate(root: &Path, image_path: &Path) -> Option<PathBuf> {
-    let relative = image_path.strip_prefix(root).ok()?;
-    let mut parts: Vec<_> = relative.components().collect();
-    let image_index = parts
-        .iter()
-        .position(|component| component.as_os_str().to_string_lossy() == "images")?;
-    parts[image_index] = std::path::Component::Normal(std::ffi::OsStr::new("labels"));
-    let mut label = root.to_path_buf();
-    for component in parts {
-        label.push(component.as_os_str());
-    }
-    label.set_extension("txt");
-    Some(label)
 }
 
 fn image_id_matches(root: &Path, image_path: &Path, image_id: &str) -> bool {

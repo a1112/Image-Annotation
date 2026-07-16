@@ -2,6 +2,7 @@ use crate::domain;
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 use walkdir::WalkDir;
 
@@ -58,6 +59,12 @@ pub trait AnnotationFormatAdapter {
     fn detect(&self, selection: &SourceSelection) -> DetectionResult;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSyncResult {
+    pub path: PathBuf,
+    pub source_version: String,
+}
+
 pub fn collect_source_files(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for path in paths {
@@ -97,4 +104,54 @@ pub fn has_extension(path: &Path, extension: &str) -> bool {
     path.extension()
         .map(|value| value.to_string_lossy().eq_ignore_ascii_case(extension))
         .unwrap_or(false)
+}
+
+pub fn source_version(path: &Path) -> String {
+    let Ok(metadata) = fs::metadata(path) else {
+        return String::new();
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{}:{modified}", metadata.len())
+}
+
+pub fn verify_source_version(path: &Path, expected: Option<&str>) -> Result<(), String> {
+    let Some(expected) = expected.filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let current = source_version(path);
+    if current != expected {
+        return Err(format!(
+            "source annotation changed outside the application: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+pub fn write_replacing(path: &Path, data: &[u8]) -> Result<SourceSyncResult, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let extension = path
+        .extension()
+        .map(|value| format!("{}.tmp", value.to_string_lossy()))
+        .unwrap_or_else(|| "tmp".to_string());
+    let temporary = path.with_extension(extension);
+    fs::write(&temporary, data).map_err(|err| err.to_string())?;
+    if path.exists() {
+        fs::remove_file(path).map_err(|err| err.to_string())?;
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    Ok(SourceSyncResult {
+        path: path.to_path_buf(),
+        source_version: source_version(path),
+    })
 }

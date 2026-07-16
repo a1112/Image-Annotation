@@ -1,4 +1,6 @@
 pub mod adapter;
 pub mod detect;
 pub mod voc;
+pub mod voc_adapter;
 pub mod yolo;
+pub mod yolo_adapter;

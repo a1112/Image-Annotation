@@ -1,6 +1,6 @@
 use crate::{
     domain,
-    importers::{detect, voc},
+    importers::{detect, voc, voc_adapter, yolo_adapter},
     project_fs, storage,
 };
 use serde::Serialize;
@@ -615,6 +615,7 @@ pub fn rescan_project_assets(project_id: &str) -> Result<domain::DatasetProject,
     project_fs::write_manifest_to_path(&manifest, &paths.manifest)?;
     storage::initialize_project_database(&paths.sqlite)?;
     storage::upsert_project_index(&paths.sqlite, &manifest, &images, &classes)?;
+    persist_local_source_mappings(&paths.sqlite, &manifest, &images)?;
     domain::SampleRepository::new()
         .dataset_projects()
         .into_iter()
@@ -680,10 +681,10 @@ pub fn open_local_dataset(
     let canonical = fs::canonicalize(&source).unwrap_or(source);
     let project_id = linked_project_id(&canonical);
     let paths = project_fs::ensure_workspace_project_dirs(&project_id)?;
-    let format = if dataset_type == "voc-detect" {
-        "voc-detect"
-    } else {
-        "yolo-detect"
+    let format = match dataset_type {
+        "voc-detect" => "voc-detect",
+        "yolo-seg" => "yolo-seg",
+        _ => "yolo-detect",
     };
     let images = indexed_local_images(&canonical, format);
     let labels = local_labels_for_format(&canonical, format);
@@ -711,6 +712,7 @@ pub fn open_local_dataset(
     project_fs::write_manifest_to_path(&manifest, &paths.manifest)?;
     storage::initialize_project_database(&paths.sqlite)?;
     storage::upsert_project_index(&paths.sqlite, &manifest, &images, &classes)?;
+    persist_local_source_mappings(&paths.sqlite, &manifest, &images)?;
     storage::record_import(
         &paths.sqlite,
         &canonical.to_string_lossy(),
@@ -973,36 +975,71 @@ fn indexed_local_images(root: &Path, format: &str) -> Vec<storage::StoredImage> 
 
 fn local_image_has_annotation(root: &Path, image_path: &Path, format: &str) -> bool {
     match format {
-        "voc-detect" => image_path.with_extension("xml").exists(),
-        "yolo-detect" => {
-            yolo_label_path_for_local_image(root, image_path).is_some()
-                || image_path.with_extension("txt").exists()
-        }
+        "voc-detect" => voc_adapter::annotation_path(root, image_path).exists(),
+        "yolo-detect" | "yolo-seg" => yolo_adapter::annotation_path(root, image_path).exists(),
         _ => false,
     }
-}
-
-fn yolo_label_path_for_local_image(root: &Path, image_path: &Path) -> Option<PathBuf> {
-    let relative = image_path.strip_prefix(root).ok()?;
-    let mut parts: Vec<_> = relative.components().collect();
-    let image_index = parts
-        .iter()
-        .position(|component| component.as_os_str().to_string_lossy() == "images")?;
-    parts[image_index] = std::path::Component::Normal(std::ffi::OsStr::new("labels"));
-    let mut label = root.to_path_buf();
-    for component in parts {
-        label.push(component.as_os_str());
-    }
-    label.set_extension("txt");
-    label.exists().then_some(label)
 }
 
 fn local_labels_for_format(root: &Path, format: &str) -> Vec<String> {
     match format {
         "voc-detect" => indexed_voc_labels(root),
-        "yolo-detect" => indexed_yolo_labels(root),
+        "yolo-detect" | "yolo-seg" => indexed_yolo_labels(root),
         _ => Vec::new(),
     }
+}
+
+fn persist_local_source_mappings(
+    sqlite: &Path,
+    manifest: &project_fs::ProjectManifest,
+    images: &[storage::StoredImage],
+) -> Result<(), String> {
+    if manifest.source_dataset_key != "local-linked" {
+        return Ok(());
+    }
+    let root = PathBuf::from(&manifest.root_path);
+    storage::write_dataset_source(
+        sqlite,
+        &storage::StoredDatasetSource {
+            format: manifest.format.clone(),
+            mode: "linked".to_string(),
+            root_path: manifest.root_path.clone(),
+            annotation_path: None,
+            options_json: "{}".to_string(),
+        },
+    )?;
+    let mappings = images
+        .iter()
+        .map(|image| {
+            let image_path = root.join(&image.file_name);
+            let annotation_path = match manifest.format.as_str() {
+                "voc-detect" => voc_adapter::annotation_path(&root, &image_path),
+                "yolo-detect" | "yolo-seg" => yolo_adapter::annotation_path(&root, &image_path),
+                _ => image_path.with_extension("json"),
+            };
+            let source_version = match manifest.format.as_str() {
+                "voc-detect" => voc_adapter::current_source_version(&root, &image_path),
+                "yolo-detect" | "yolo-seg" => {
+                    yolo_adapter::current_source_version(&root, &image_path)
+                }
+                _ => String::new(),
+            };
+            storage::StoredImageSource {
+                image_id: image.id.clone(),
+                relative_path: image.file_name.clone(),
+                external_id: None,
+                annotation_path: Some(
+                    annotation_path
+                        .strip_prefix(&root)
+                        .unwrap_or(&annotation_path)
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                ),
+                source_version,
+            }
+        })
+        .collect::<Vec<_>>();
+    storage::replace_image_sources(sqlite, &mappings)
 }
 
 fn classes_from_labels(labels: Vec<String>) -> Vec<storage::StoredClass> {
@@ -1467,6 +1504,16 @@ mod tests {
             project_fs::read_manifest(&project.id).unwrap().root_path,
             fs::canonicalize(&source_root).unwrap().to_string_lossy()
         );
+        let source = storage::read_dataset_source(&paths.sqlite)
+            .unwrap()
+            .unwrap();
+        let mapping = storage::read_image_source(&paths.sqlite, "sample")
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.format, "voc-detect");
+        assert_eq!(source.mode, "linked");
+        assert_eq!(mapping.annotation_path.as_deref(), Some("sample.xml"));
+        assert!(!mapping.source_version.is_empty());
         assert!(paths.raw.read_dir().unwrap().next().is_none());
 
         let repository = domain::SampleRepository::new();
@@ -1505,10 +1552,22 @@ mod tests {
         let paths = project_fs::project_paths(&project.id);
         let repository = domain::SampleRepository::new();
         let state = repository.image_annotation_state(&project.id, "images_train_sample");
+        let source = storage::read_dataset_source(&paths.sqlite)
+            .unwrap()
+            .unwrap();
+        let mapping = storage::read_image_source(&paths.sqlite, "images_train_sample")
+            .unwrap()
+            .unwrap();
 
         assert_eq!(project.class_count, 2);
         assert_eq!(state.objects[0].label, "scratch");
         assert_eq!(state.objects[0].class_id, 1);
+        assert_eq!(source.format, "yolo-detect");
+        assert_eq!(
+            mapping.annotation_path.as_deref(),
+            Some("labels/train/sample.txt")
+        );
+        assert!(!mapping.source_version.is_empty());
 
         let _ = fs::remove_dir_all(paths.root);
         let _ = fs::remove_dir_all(source_root);

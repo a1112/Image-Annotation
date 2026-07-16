@@ -86,6 +86,9 @@ pub fn parse_voc_annotations(
             if let Some(confidence) = object.confidence {
                 attributes.insert("confidence".to_string(), json!(confidence));
             }
+            if let Some(pose) = object.pose {
+                attributes.insert("pose".to_string(), json!(pose));
+            }
             AnnotationObject {
                 id: format!("voc-{index}"),
                 class_id,
@@ -147,7 +150,14 @@ pub fn annotations_to_voc_xml(
                 let bbox = object.bbox.as_ref()?;
                 Some(VocObject {
                     name: object.label.clone(),
-                    pose: Some("Unspecified".to_string()),
+                    pose: Some(
+                        object
+                            .attributes
+                            .get("pose")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("Unspecified")
+                            .to_string(),
+                    ),
                     truncated: Some(attribute_bool(object, "truncated") as u8),
                     difficult: Some(attribute_bool(object, "difficult") as u8),
                     confidence: object

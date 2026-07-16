@@ -425,6 +425,32 @@ pub fn replace_image_sources(path: &Path, sources: &[StoredImageSource]) -> Resu
     transaction.commit().map_err(|err| err.to_string())
 }
 
+pub fn write_image_source(path: &Path, source: &StoredImageSource) -> Result<(), String> {
+    initialize_project_database(path)?;
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO image_sources (image_id, relative_path, external_id, annotation_path, source_version)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(image_id) DO UPDATE SET
+              relative_path = excluded.relative_path,
+              external_id = excluded.external_id,
+              annotation_path = excluded.annotation_path,
+              source_version = excluded.source_version
+            "#,
+            params![
+                source.image_id,
+                source.relative_path,
+                source.external_id,
+                source.annotation_path,
+                source.source_version,
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 pub fn read_image_source(path: &Path, image_id: &str) -> Result<Option<StoredImageSource>, String> {
     if !path.exists() {
         return Ok(None);
