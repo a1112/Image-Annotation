@@ -1,10 +1,14 @@
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock, Weak,
+    },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use fs2::FileExt;
@@ -27,8 +31,10 @@ use super::{
 
 const MAX_PROJECT_NAME_CHARS: usize = 128;
 const MAX_DESCRIPTION_CHARS: usize = 2_000;
+const CREATE_OWNERSHIP_FILE: &str = ".remote-create-owner";
 static PROJECT_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static DATA_ROOT_LEASES: OnceLock<Mutex<HashMap<PathBuf, Weak<DataRootLease>>>> = OnceLock::new();
+static CREATE_OWNERSHIP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 struct DataRootLease {
@@ -42,6 +48,7 @@ struct CreateOperationPayload {
     name: String,
     dataset_type: String,
     demo_template: String,
+    ownership_marker: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -218,11 +225,13 @@ impl RemoteSampleService {
         let project_id = datasets::project_id_from_name(name, demo_template);
         validate_project_id(&project_id)?;
         let _mutation_guard = mutation_guard();
+        let ownership_marker = next_create_ownership_marker();
         let operation_payload = serde_json::to_string(&CreateOperationPayload {
             project_id: project_id.clone(),
             name: name.to_string(),
             dataset_type: dataset_type.to_string(),
             demo_template: demo_template.to_string(),
+            ownership_marker: ownership_marker.clone(),
         })
         .map_err(storage_failure)?;
         let operation = self
@@ -253,6 +262,14 @@ impl RemoteSampleService {
             return Err(ServiceError::Conflict);
         }
 
+        if let Err(error) = self.prepare_owned_project_directory(&project_id, &ownership_marker) {
+            if error == ServiceError::Conflict
+                || self.cleanup_partial_created_project(&project_id).is_ok()
+            {
+                self.fail_audit_best_effort(&operation, failure_message(error));
+            }
+            return Err(error);
+        }
         let result = datasets::create_dataset_project(name, dataset_type, demo_template)
             .map_err(storage_failure)
             .and_then(|project| {
@@ -763,22 +780,36 @@ impl RemoteSampleService {
             operation_id: record.operation_id.clone(),
         };
         match (active_dir, trash_dir) {
-            (Some(active_dir), None) => match self.ensure_project_manifest(&active_dir, true) {
-                Ok(manifest)
-                    if manifest.name == payload.name && manifest.format == payload.dataset_type =>
+            (Some(active_dir), None) => {
+                if self.read_create_ownership_marker(&active_dir)?.as_deref()
+                    != Some(payload.ownership_marker.as_str())
                 {
-                    self.storage
-                        .complete_audit(&operation, "project creation reconciled")
-                        .map_err(storage_failure)
+                    return self
+                        .storage
+                        .fail_audit(
+                            &operation,
+                            "create operation did not own the existing project",
+                        )
+                        .map_err(storage_failure);
                 }
-                Ok(_) => Err(ServiceError::Storage),
-                Err(_) => {
-                    fs::remove_dir_all(&active_dir).map_err(storage_failure)?;
-                    self.storage
-                        .fail_audit(&operation, "partial project creation removed")
-                        .map_err(storage_failure)
+                match self.ensure_project_manifest(&active_dir, true) {
+                    Ok(manifest)
+                        if manifest.name == payload.name
+                            && manifest.format == payload.dataset_type =>
+                    {
+                        self.storage
+                            .complete_audit(&operation, "project creation reconciled")
+                            .map_err(storage_failure)
+                    }
+                    Ok(_) => Err(ServiceError::Storage),
+                    Err(_) => {
+                        fs::remove_dir_all(&active_dir).map_err(storage_failure)?;
+                        self.storage
+                            .fail_audit(&operation, "partial project creation removed")
+                            .map_err(storage_failure)
+                    }
                 }
-            },
+            }
             (None, None) => self
                 .storage
                 .fail_audit(&operation, "project creation did not persist")
@@ -908,7 +939,7 @@ impl RemoteSampleService {
         project_fs::recover_manifest_backup(&manifest_path).map_err(storage_failure)?;
         self.validate_required_project_file(project_dir, &manifest_path)?;
         let sqlite_path = project_dir.join("project.sqlite");
-        self.validate_required_project_file(project_dir, &sqlite_path)?;
+        self.validate_project_database(project_dir, &sqlite_path)?;
         let manifest = fs::read(&manifest_path)
             .ok()
             .and_then(|data| serde_json::from_slice::<project_fs::ProjectManifest>(&data).ok());
@@ -959,7 +990,7 @@ impl RemoteSampleService {
         project_fs::recover_manifest_backup(&manifest_path).map_err(storage_failure)?;
         self.validate_required_project_file(project_dir, &manifest_path)?;
         let sqlite_path = project_dir.join("project.sqlite");
-        self.validate_required_project_file(project_dir, &sqlite_path)?;
+        self.validate_project_database(project_dir, &sqlite_path)?;
         let manifest: project_fs::ProjectManifest =
             serde_json::from_slice(&fs::read(&manifest_path).map_err(storage_failure)?)
                 .map_err(storage_failure)?;
@@ -1080,6 +1111,20 @@ impl RemoteSampleService {
             .ok_or(ServiceError::Storage)
     }
 
+    fn validate_project_database(
+        &self,
+        project_dir: &Path,
+        path: &Path,
+    ) -> Result<(), ServiceError> {
+        self.validate_required_project_file(project_dir, path)?;
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            self.validate_optional_project_file(project_dir, Path::new(&sidecar))?;
+        }
+        crate::storage::validate_project_database_artifacts(path).map_err(storage_failure)
+    }
+
     fn validate_managed_manifest(
         &self,
         manifest: &project_fs::ProjectManifest,
@@ -1152,6 +1197,52 @@ impl RemoteSampleService {
         self.ensure_project_manifest(&actual_dir, true).map(|_| ())
     }
 
+    fn prepare_owned_project_directory(
+        &self,
+        project_id: &str,
+        ownership_marker: &str,
+    ) -> Result<(), ServiceError> {
+        let project_dir = self.projects_dir.join(project_id);
+        match fs::create_dir(&project_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(ServiceError::Conflict);
+            }
+            Err(error) => return Err(storage_failure(error)),
+        }
+        let project_dir = self
+            .existing_project_dir(self.projects_dir.as_ref(), project_id)?
+            .ok_or(ServiceError::Storage)?;
+        let marker_path = project_dir.join(CREATE_OWNERSHIP_FILE);
+        let mut marker = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&marker_path)
+            .map_err(storage_failure)?;
+        marker
+            .write_all(ownership_marker.as_bytes())
+            .and_then(|()| marker.sync_all())
+            .map_err(storage_failure)?;
+        self.validate_required_project_file(&project_dir, &marker_path)?;
+        Ok(())
+    }
+
+    fn read_create_ownership_marker(
+        &self,
+        project_dir: &Path,
+    ) -> Result<Option<String>, ServiceError> {
+        let marker_path = project_dir.join(CREATE_OWNERSHIP_FILE);
+        let Some(marker_path) = self.validate_optional_project_file(project_dir, &marker_path)?
+        else {
+            return Ok(None);
+        };
+        let marker = fs::read_to_string(marker_path).map_err(storage_failure)?;
+        if marker.is_empty() || marker.len() > 256 || marker.chars().any(char::is_control) {
+            return Err(ServiceError::Storage);
+        }
+        Ok(Some(marker))
+    }
+
     fn cleanup_partial_created_project(&self, project_id: &str) -> Result<(), ServiceError> {
         let Some(project_dir) =
             self.existing_project_dir(self.projects_dir.as_ref(), project_id)?
@@ -1206,7 +1297,7 @@ impl RemoteSampleService {
         let manifest_path = active_dir.join("project.json");
         self.validate_required_project_file(active_dir, &manifest_path)?;
         let sqlite_path = active_dir.join("project.sqlite");
-        self.validate_required_project_file(active_dir, &sqlite_path)?;
+        self.validate_project_database(active_dir, &sqlite_path)?;
         let manifest_data = fs::read(&manifest_path).map_err(storage_failure)?;
         let old_manifest: project_fs::ProjectManifest =
             serde_json::from_slice(&manifest_data).map_err(storage_failure)?;
@@ -1540,6 +1631,18 @@ fn lifecycle_payload(project_id: &str) -> Result<String, ServiceError> {
         project_id: project_id.to_string(),
     })
     .map_err(storage_failure)
+}
+
+fn next_create_ownership_marker() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "create-owner-{timestamp}-{}-{}",
+        std::process::id(),
+        CREATE_OWNERSHIP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn lifecycle_operation_expectation(state: TrashState) -> (&'static str, &'static str) {

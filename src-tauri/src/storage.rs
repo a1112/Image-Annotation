@@ -1,6 +1,8 @@
 use crate::project_fs::ProjectManifest;
-use rusqlite::{params, Connection, OptionalExtension};
-use std::path::Path;
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,7 +115,9 @@ pub struct TaskItemRecord {
 }
 
 pub fn initialize_project_database(path: &Path) -> Result<(), String> {
-    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    validate_project_database_artifacts(path)?;
+    let connection = open_project_database_writable(path)?;
+    validate_project_database_artifacts(path)?;
     connection
         .execute_batch(
             r#"
@@ -249,7 +253,7 @@ pub fn initialize_project_database(path: &Path) -> Result<(), String> {
     ] {
         let _ = connection.execute(statement, []);
     }
-    Ok(())
+    validate_project_database_artifacts(path)
 }
 
 pub fn upsert_project_index(
@@ -258,9 +262,12 @@ pub fn upsert_project_index(
     images: &[StoredImage],
     classes: &[StoredClass],
 ) -> Result<(), String> {
-    let mut connection = Connection::open(path).map_err(|err| err.to_string())?;
     initialize_project_database(path)?;
+    validate_project_database_artifacts(path)?;
+    let mut connection = open_project_database_writable(path)?;
+    validate_project_database_artifacts(path)?;
     let transaction = connection.transaction().map_err(|err| err.to_string())?;
+    validate_project_database_artifacts(path)?;
     transaction
         .execute(
             r#"
@@ -321,15 +328,25 @@ pub fn upsert_project_index(
             .map_err(|err| err.to_string())?;
     }
 
-    transaction.commit().map_err(|err| err.to_string())
+    validate_project_database_artifacts(path)?;
+    transaction.commit().map_err(|err| err.to_string())?;
+    validate_project_database_artifacts(path)
 }
 
 pub fn read_project_manifest(path: &Path) -> Result<Option<ProjectManifest>, String> {
     if !path.exists() {
         return Ok(None);
     }
-    let connection = Connection::open(path).map_err(|err| err.to_string())?;
-    connection
+    validate_project_database_artifacts(path)?;
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|err| err.to_string())?;
+    validate_project_database_artifacts(path)?;
+    let manifest = connection
         .query_row(
             "SELECT id, name, source_dataset_key, format, root_path, class_count, image_count, created_at FROM projects LIMIT 1",
             [],
@@ -347,22 +364,96 @@ pub fn read_project_manifest(path: &Path) -> Result<Option<ProjectManifest>, Str
             },
         )
         .optional()
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+    validate_project_database_artifacts(path)?;
+    Ok(manifest)
 }
 
 pub fn update_project_name(path: &Path, project_id: &str, name: &str) -> Result<(), String> {
     initialize_project_database(path)?;
-    let connection = Connection::open(path).map_err(|err| err.to_string())?;
-    let updated = connection
+    validate_project_database_artifacts(path)?;
+    let mut connection = open_project_database_writable(path)?;
+    validate_project_database_artifacts(path)?;
+    let transaction = connection.transaction().map_err(|err| err.to_string())?;
+    validate_project_database_artifacts(path)?;
+    let updated = transaction
         .execute(
             "UPDATE projects SET name = ?1, updated_at = ?2 WHERE id = ?3",
             params![name, now_unix_string(), project_id],
         )
         .map_err(|err| err.to_string())?;
-    if updated == 1 {
+    if updated != 1 {
+        return Err("project index was not found".to_string());
+    }
+    validate_project_database_artifacts(path)?;
+    transaction.commit().map_err(|err| err.to_string())?;
+    validate_project_database_artifacts(path)
+}
+
+pub fn validate_project_database_artifacts(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "project database path has no parent".to_string())?;
+    let canonical_parent = fs::canonicalize(parent).map_err(|error| error.to_string())?;
+    for artifact in [
+        path.to_path_buf(),
+        sqlite_sidecar_path(path, "-journal"),
+        sqlite_sidecar_path(path, "-wal"),
+        sqlite_sidecar_path(path, "-shm"),
+    ] {
+        validate_optional_database_artifact(&canonical_parent, &artifact)?;
+    }
+    Ok(())
+}
+
+fn open_project_database_writable(path: &Path) -> Result<Connection, String> {
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = OsString::from(path.as_os_str());
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
+fn validate_optional_database_artifact(parent: &Path, path: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if is_symlink_or_reparse(&metadata) || !metadata.is_file() {
+        return Err("project database artifact is not a regular file".to_string());
+    }
+    let canonical = fs::canonicalize(path).map_err(|error| error.to_string())?;
+    if canonical.parent() == Some(parent) {
         Ok(())
     } else {
-        Err("project index was not found".to_string())
+        Err("project database artifact is outside its project directory".to_string())
+    }
+}
+
+fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 

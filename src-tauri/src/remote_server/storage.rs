@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 static SERVER_DATABASE_INITIALIZATION: Mutex<()> = Mutex::new(());
 static OPERATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -634,6 +634,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
             [],
         )
         .map_err(|error| error.to_string())?;
+    migrate_legacy_tombstone_operations(&transaction)?;
     transaction
         .execute(
             "UPDATE service_audit
@@ -651,6 +652,78 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())
+}
+
+fn migrate_legacy_tombstone_operations(transaction: &Transaction<'_>) -> Result<(), String> {
+    let legacy_tombstones = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT project_id, state, trashed_at
+                 FROM trashed_projects
+                 WHERE operation_id IS NULL OR operation_id = ''
+                 ORDER BY project_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?
+    };
+
+    for (project_id, trash_state, created_at) in legacy_tombstones {
+        let (action, operation_state) = match trash_state.as_str() {
+            "trashing" => ("delete_project", "pending"),
+            "trashed" => ("delete_project", "completed"),
+            "restoring" => ("restore_project", "pending"),
+            _ => return Err("legacy trash tombstone has an invalid state".to_string()),
+        };
+        let operation_id = next_operation_id();
+        let request_id = format!("legacy-migration-{operation_id}");
+        let payload = serde_json::json!({ "projectId": project_id }).to_string();
+        transaction
+            .execute(
+                r#"
+                INSERT INTO service_audit (
+                    operation_id, request_id, role, action, project_id, image_id,
+                    message, status, state, payload, created_at, updated_at
+                )
+                VALUES (
+                    ?1, ?2, 'system', ?3, ?4, NULL,
+                    'legacy trash tombstone migrated', ?5, ?5, ?6, ?7, ?7
+                )
+                "#,
+                params![
+                    operation_id,
+                    request_id,
+                    action,
+                    project_id,
+                    operation_state,
+                    payload,
+                    created_at
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let updated = transaction
+            .execute(
+                "UPDATE trashed_projects
+                 SET operation_id = ?1
+                 WHERE project_id = ?2
+                   AND (operation_id IS NULL OR operation_id = '')",
+                params![operation_id, project_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Err("legacy trash tombstone binding changed during migration".to_string());
+        }
+    }
+    Ok(())
 }
 
 fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool, String> {

@@ -1,9 +1,9 @@
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Barrier, Mutex, OnceLock,
@@ -20,6 +20,7 @@ use axum::{
     Router,
 };
 use clap::CommandFactory;
+use fs2::FileExt;
 use http_body_util::BodyExt;
 use image_annotation_lib::{
     project_fs::ProjectManifest,
@@ -42,9 +43,17 @@ const HELP_ADMIN_SECRET: &str = "help-admin-0123456789abcdef0123456789abcdef";
 const CONCURRENT_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_CONCURRENT_TEST_DATA_DIR";
 const ISOLATED_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_ISOLATED_TEST_DATA_DIR";
 const LEASE_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_LEASE_TEST_DATA_DIR";
+const CLEANUP_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_CLEANUP_TEST_DATA_DIR";
+const CLEANUP_LOCK_PATH_ENV: &str = "IMAGE_ANNOTATION_CLEANUP_TEST_LOCK_PATH";
+const PROCESS_ROOT_LOCK_FILE: &str = ".image-annotation-test-process.lock";
 static PROJECT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-static PROCESS_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
+static PROCESS_DATA_ROOT: OnceLock<ProcessDataRoot> = OnceLock::new();
 static TEST_SCHEMA_MIGRATION: Mutex<()> = Mutex::new(());
+
+struct ProcessDataRoot {
+    path: PathBuf,
+    _lease: File,
+}
 
 struct RemoveDirectoryOnDrop(PathBuf);
 
@@ -117,22 +126,50 @@ fn remove_directory_entry(path: &Path) {
 fn process_data_root() -> PathBuf {
     PROCESS_DATA_ROOT
         .get_or_init(|| {
-            if let Some(root) = std::env::var_os(ISOLATED_DATA_DIR_ENV) {
+            let root = if let Some(root) = std::env::var_os(ISOLATED_DATA_DIR_ENV) {
                 let root = PathBuf::from(root);
                 fs::create_dir_all(&root).unwrap();
-                return root;
+                root
+            } else {
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let root = std::env::temp_dir().join(format!(
+                    "image-annotation-remote-server-{}-{nonce}",
+                    std::process::id()
+                ));
+                fs::create_dir_all(&root).unwrap();
+                root
+            };
+            let lock_path = root.join(format!("{PROCESS_ROOT_LOCK_FILE}-{}", std::process::id()));
+            let lease = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            lease.lock_exclusive().unwrap();
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process_data_root_cleanup_watcher_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(CLEANUP_DATA_DIR_ENV, &root)
+                .env(CLEANUP_LOCK_PATH_ENV, lock_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            ProcessDataRoot {
+                path: root,
+                _lease: lease,
             }
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = std::env::temp_dir().join(format!(
-                "image-annotation-remote-server-{}-{nonce}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&root).unwrap();
-            root
         })
+        .path
         .clone()
 }
 
@@ -150,6 +187,75 @@ fn run_ignored_test_in_subprocess(test_name: &str) {
     );
     let _ = fs::remove_dir_all(data_dir);
     assert!(output.status.success(), "{rendered}");
+}
+
+#[test]
+fn process_data_root_is_removed_after_child_process_exits() {
+    let data_dir = unique_temp_root("image-annotation-process-root-cleanup");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "process_data_root_cleanup_producer_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(ISOLATED_DATA_DIR_ENV, &data_dir)
+        .output()
+        .unwrap();
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{rendered}");
+    let started = Instant::now();
+    while data_dir.exists() && started.elapsed() < Duration::from_secs(3) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let removed = !data_dir.exists();
+    let _ = fs::remove_dir_all(&data_dir);
+    assert!(removed, "child process left data root at {data_dir:?}");
+}
+
+#[test]
+#[ignore]
+fn process_data_root_cleanup_producer_child() {
+    let data_dir = process_data_root();
+    fs::write(data_dir.join("cleanup-sentinel"), b"cleanup").unwrap();
+}
+
+#[test]
+#[ignore]
+fn process_data_root_cleanup_watcher_child() {
+    let data_dir = PathBuf::from(std::env::var_os(CLEANUP_DATA_DIR_ENV).unwrap());
+    let lock_path = PathBuf::from(std::env::var_os(CLEANUP_LOCK_PATH_ENV).unwrap());
+    let lease = loop {
+        match OpenOptions::new().read(true).write(true).open(&lock_path) {
+            Ok(file) => break file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !data_dir.exists() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("failed to open process root cleanup lock: {error}"),
+        }
+    };
+    lease.lock_exclusive().unwrap();
+    drop(lease);
+
+    let started = Instant::now();
+    loop {
+        match fs::remove_dir_all(&data_dir) {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) if started.elapsed() < Duration::from_secs(3) => {
+                let _ = error;
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("failed to remove process test root: {error}"),
+        }
+    }
 }
 
 fn unique_project(prefix: &str) -> (String, String) {
@@ -309,6 +415,15 @@ fn operation_state(data_dir: &Path, operation_id: &str) -> Option<String> {
 }
 
 fn install_completion_failure_trigger(data_dir: &Path, trigger_name: &str, action: &str) {
+    install_audit_state_failure_trigger(data_dir, trigger_name, action, "completed");
+}
+
+fn install_audit_state_failure_trigger(
+    data_dir: &Path,
+    trigger_name: &str,
+    action: &str,
+    state: &str,
+) {
     let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
     ensure_lifecycle_test_columns(&connection);
     connection
@@ -316,9 +431,9 @@ fn install_completion_failure_trigger(data_dir: &Path, trigger_name: &str, actio
             r#"
             CREATE TRIGGER {trigger_name}
             BEFORE UPDATE ON service_audit
-            WHEN OLD.action = '{action}' AND NEW.status = 'completed'
+            WHEN OLD.action = '{action}' AND NEW.status = '{state}'
             BEGIN
-                SELECT RAISE(ABORT, 'injected audit completion failure');
+                SELECT RAISE(ABORT, 'injected audit state failure');
             END;
             "#
         ))
@@ -1442,6 +1557,116 @@ fn startup_reconciles_interrupted_project_lifecycle_states() {
     run_ignored_test_in_subprocess("startup_reconciles_interrupted_project_lifecycle_states_child");
 }
 
+#[test]
+fn legacy_tombstone_schema_migrates_to_a_bound_delete_operation() {
+    run_ignored_test_in_subprocess(
+        "legacy_tombstone_schema_migrates_to_a_bound_delete_operation_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn legacy_tombstone_schema_migrates_to_a_bound_delete_operation_child() {
+    let (name, project_id) = unique_project("Task3 legacy tombstone migration");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+    create_empty_project(&app, &name, &project_id).await;
+    let (delete_status, _, deleted) = router_request(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/projects/{project_id}"),
+        ADMIN_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(delete_status, StatusCode::OK, "{deleted}");
+    drop(app);
+
+    let mut connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute_batch(
+            r#"
+            PRAGMA foreign_keys = OFF;
+            DROP TABLE trashed_projects;
+            DROP TABLE service_audit;
+
+            CREATE TABLE service_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                project_id TEXT,
+                image_id TEXT,
+                message TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'completed',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_service_audit_request_id
+                ON service_audit(request_id);
+            CREATE INDEX idx_service_audit_project_id
+                ON service_audit(project_id);
+
+            CREATE TABLE trashed_projects (
+                project_id TEXT PRIMARY KEY,
+                trashed_at TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'trashed'
+            );
+            "#,
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "INSERT INTO trashed_projects (project_id, trashed_at, state)
+             VALUES (?1, 'legacy-trashed-at', 'trashed')",
+            [&project_id],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(connection);
+
+    let migrated = build_router(config.clone()).unwrap();
+    let binding: (String, String, String, String, String, String, String) =
+        rusqlite::Connection::open(data_dir.join("server.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT tp.operation_id, audit.action, audit.project_id,
+                        audit.state, audit.status, audit.payload, audit.role
+                 FROM trashed_projects AS tp
+                 JOIN service_audit AS audit
+                   ON audit.operation_id = tp.operation_id
+                 WHERE tp.project_id = ?1",
+                [&project_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+    assert!(!binding.0.is_empty());
+    assert_eq!(binding.1, "delete_project");
+    assert_eq!(binding.2, project_id);
+    assert_eq!(binding.3, "completed");
+    assert_eq!(binding.4, "completed");
+    assert_eq!(
+        serde_json::from_str::<Value>(&binding.5).unwrap()["projectId"],
+        project_id
+    );
+    assert_eq!(binding.6, "system");
+    let _idempotent_restart = build_router(config).unwrap();
+    drop(migrated);
+}
+
 #[tokio::test]
 #[ignore]
 async fn startup_reconciles_interrupted_project_lifecycle_states_child() {
@@ -1717,6 +1942,87 @@ fn pending_create_completion_is_reconciled_on_startup() {
 #[test]
 fn pending_create_rejects_a_different_valid_project() {
     run_ignored_test_in_subprocess("pending_create_rejects_a_different_valid_project_child");
+}
+
+#[test]
+fn duplicate_create_pending_operation_never_owns_the_existing_project() {
+    run_ignored_test_in_subprocess(
+        "duplicate_create_pending_operation_never_owns_the_existing_project_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn duplicate_create_pending_operation_never_owns_the_existing_project_child() {
+    let (name, project_id) = unique_project("Task3 duplicate create ownership");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+    let created = create_empty_project(&app, &name, &project_id).await;
+    let original_request_id = created["requestId"].as_str().unwrap();
+    install_audit_state_failure_trigger(
+        &data_dir,
+        "fail_duplicate_create_finalization",
+        "create_project",
+        "failed",
+    );
+
+    let (duplicate_status, _, duplicate) = router_request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        ADMIN_TOKEN,
+        Some(serde_json::json!({
+            "name": name,
+            "datasetType": "yolo-detect"
+        })),
+    )
+    .await;
+    assert_eq!(duplicate_status, StatusCode::CONFLICT, "{duplicate}");
+    let duplicate_request_id = duplicate["requestId"].as_str().unwrap();
+    let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    let pending_state: String = connection
+        .query_row(
+            "SELECT state FROM service_audit WHERE request_id = ?1",
+            [duplicate_request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending_state, "pending");
+    drop(connection);
+    drop_test_trigger(&data_dir, "fail_duplicate_create_finalization");
+
+    let _restarted = build_router(config).unwrap();
+    let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    let original_state: String = connection
+        .query_row(
+            "SELECT state FROM service_audit WHERE request_id = ?1",
+            [original_request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let duplicate_state: String = connection
+        .query_row(
+            "SELECT state FROM service_audit WHERE request_id = ?1",
+            [duplicate_request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(original_state, "completed");
+    assert_eq!(duplicate_state, "failed");
+    let manifest: ProjectManifest = serde_json::from_slice(
+        &fs::read(
+            data_dir
+                .join("projects")
+                .join(&project_id)
+                .join("project.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest.name, name);
 }
 
 #[tokio::test]
@@ -2376,6 +2682,62 @@ fn project_file_links_outside_project_directory_are_rejected() {
     run_ignored_test_in_subprocess(
         "project_file_links_outside_project_directory_are_rejected_child",
     );
+}
+
+#[test]
+fn project_sqlite_sidecar_links_are_rejected_before_patch() {
+    run_ignored_test_in_subprocess("project_sqlite_sidecar_links_are_rejected_before_patch_child");
+}
+
+#[tokio::test]
+#[ignore]
+async fn project_sqlite_sidecar_links_are_rejected_before_patch_child() {
+    let (name, project_id) = unique_project("Task3 linked sqlite sidecar");
+    let renamed = format!("{name} renamed");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+    create_empty_project(&app, &name, &project_id).await;
+
+    let external_dir = unique_temp_root("image-annotation-linked-sqlite-sidecar");
+    fs::create_dir_all(&external_dir).unwrap();
+    let _external_cleanup = RemoveDirectoryOnDrop(external_dir.clone());
+    let sentinel = external_dir.join("sentinel");
+    let sentinel_bytes = b"external sqlite sidecar sentinel".to_vec();
+    fs::write(&sentinel, &sentinel_bytes).unwrap();
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let sidecar = project_dir.join("project.sqlite-journal");
+    let _link_cleanup = RemoveLinksOnDrop(vec![sidecar.clone()]);
+    match create_file_link(&sentinel, &sidecar) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            return;
+        }
+        Err(error) => panic!("failed to create project SQLite sidecar link: {error}"),
+    }
+
+    let (status, _, response) = router_request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/projects/{project_id}"),
+        ADMIN_TOKEN,
+        Some(serde_json::json!({"name": renamed})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{response}");
+    assert_eq!(response["error"]["code"], "storage");
+    assert_eq!(fs::read(&sentinel).unwrap(), sentinel_bytes);
+    let manifest: ProjectManifest =
+        serde_json::from_slice(&fs::read(project_dir.join("project.json")).unwrap()).unwrap();
+    assert_eq!(manifest.name, name);
 }
 
 #[tokio::test]
