@@ -7,8 +7,8 @@ use image_annotation_lib::{
         parse_yolo_polygon_line,
     },
     project_fs::{
-        configure_workspace_data_root, safe_extract_path, test_data_root, workspace_data_root,
-        workspace_data_root_from,
+        configure_workspace_data_root, resolve_workspace_data_root, safe_extract_path,
+        test_data_root, workspace_data_root_from,
     },
     windows::{annotation_route, backend_tasks_route},
 };
@@ -24,9 +24,9 @@ fn test_data_root_is_project_local_data_test_data() {
 
 #[test]
 fn workspace_data_root_is_project_local_default_workspace() {
-    let root = workspace_data_root();
+    let root = resolve_workspace_data_root(None, None, Path::new("F:/source"));
 
-    assert!(root.ends_with(Path::new("data").join("workspaces").join("default")));
+    assert_eq!(root, Path::new("F:/source/data/workspaces/default"));
 }
 
 #[test]
@@ -43,6 +43,38 @@ fn configured_workspace_root_is_independent_of_source_checkout() {
 fn default_workspace_root_preserves_desktop_layout() {
     assert_eq!(
         workspace_data_root_from(None, Path::new("F:/source")),
+        Path::new("F:/source/data/workspaces/default")
+    );
+}
+
+#[test]
+fn environment_workspace_root_is_used_without_explicit_configuration() {
+    let environment = PathBuf::from("D:/environment-data");
+
+    assert_eq!(
+        resolve_workspace_data_root(None, Some(environment.clone()), Path::new("F:/source")),
+        environment
+    );
+}
+
+#[test]
+fn explicit_workspace_root_takes_priority_over_environment() {
+    let explicit = PathBuf::from("D:/explicit-data");
+
+    assert_eq!(
+        resolve_workspace_data_root(
+            Some(explicit.clone()),
+            Some(PathBuf::from("D:/environment-data")),
+            Path::new("F:/source")
+        ),
+        explicit
+    );
+}
+
+#[test]
+fn empty_environment_workspace_root_falls_back_to_desktop_layout() {
+    assert_eq!(
+        resolve_workspace_data_root(None, Some(PathBuf::new()), Path::new("F:/source")),
         Path::new("F:/source/data/workspaces/default")
     );
 }

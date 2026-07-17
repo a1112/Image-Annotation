@@ -44,13 +44,23 @@ pub fn test_data_root() -> PathBuf {
     workspace_root().join("data").join("test_data")
 }
 
+pub fn resolve_workspace_data_root(
+    explicit: Option<PathBuf>,
+    environment: Option<PathBuf>,
+    checkout_root: &Path,
+) -> PathBuf {
+    explicit
+        .or_else(|| environment.filter(|path| !path.as_os_str().is_empty()))
+        .unwrap_or_else(|| {
+            checkout_root
+                .join("data")
+                .join("workspaces")
+                .join("default")
+        })
+}
+
 pub fn workspace_data_root_from(configured: Option<PathBuf>, checkout_root: &Path) -> PathBuf {
-    configured.unwrap_or_else(|| {
-        checkout_root
-            .join("data")
-            .join("workspaces")
-            .join("default")
-    })
+    resolve_workspace_data_root(configured, None, checkout_root)
 }
 
 pub fn configure_workspace_data_root(path: PathBuf) -> Result<(), String> {
@@ -64,13 +74,11 @@ pub fn configure_workspace_data_root(path: PathBuf) -> Result<(), String> {
 }
 
 pub fn workspace_data_root() -> PathBuf {
-    let configured = WORKSPACE_DATA_ROOT.get().cloned().or_else(|| {
-        std::env::var_os("IMAGE_ANNOTATION_DATA_DIR")
-            .map(PathBuf::from)
-            .filter(|path| !path.as_os_str().is_empty())
-    });
-
-    workspace_data_root_from(configured, &workspace_root())
+    resolve_workspace_data_root(
+        WORKSPACE_DATA_ROOT.get().cloned(),
+        std::env::var_os("IMAGE_ANNOTATION_DATA_DIR").map(PathBuf::from),
+        &workspace_root(),
+    )
 }
 
 pub fn downloads_dir() -> PathBuf {
