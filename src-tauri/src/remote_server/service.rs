@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Cursor, Write},
     path::{Component, Path, PathBuf},
@@ -19,11 +19,15 @@ use walkdir::WalkDir;
 
 use crate::{
     datasets,
-    domain::{DatasetProject, SampleRepository},
+    domain::{
+        AnnotationObject, AnnotationState, AnnotationVersion, BBox, DatasetProject, Point,
+        SampleRepository,
+    },
     project_fs,
     storage::{
-        self as project_storage, SampleMutationEvidence, StoredImage, StoredSample,
-        StoredSampleClass, StoredSampleFilter,
+        self as project_storage, AnnotationRevisionExpectation, RemoteMutationError,
+        RemoteWorkflowState, SampleMutationEvidence, StoredImage, StoredSample, StoredSampleClass,
+        StoredSampleFilter,
     },
 };
 
@@ -40,11 +44,17 @@ const MAX_PROJECT_NAME_CHARS: usize = 128;
 const MAX_DESCRIPTION_CHARS: usize = 2_000;
 const MAX_SAMPLE_TEXT_CHARS: usize = 2_000;
 const MAX_SAMPLE_QUERY_CHARS: usize = 256;
+const MAX_ANNOTATION_OBJECTS: usize = 1_000;
+const MAX_ANNOTATION_ID_CHARS: usize = 128;
+const MAX_ANNOTATION_LABEL_CHARS: usize = 256;
+const MAX_ANNOTATION_ATTRIBUTES_BYTES: usize = 16 * 1024;
+const MAX_REVIEW_NOTE_CHARS: usize = 2_000;
 const THUMBNAIL_EDGE: u32 = 320;
 const CREATE_OWNERSHIP_FILE: &str = ".remote-create-owner";
 static PROJECT_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static DATA_ROOT_LEASES: OnceLock<Mutex<HashMap<PathBuf, Weak<DataRootLease>>>> = OnceLock::new();
 static CREATE_OWNERSHIP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static ANNOTATION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 struct DataRootLease {
@@ -111,8 +121,10 @@ enum DataRootLeaseError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ServiceError {
     Validation,
+    AnnotationValidation,
     NotFound,
     Conflict,
+    RevisionConflict,
     UnsupportedMedia,
     Storage,
 }
@@ -208,6 +220,45 @@ struct PendingSampleMutationPayload {
     after: Option<SampleMetadataSnapshot>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnnotationOperationPayload {
+    project_id: String,
+    image_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    object_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+struct AnnotationWorkflowRequest<'a> {
+    project_id: &'a str,
+    sample_id: &'a str,
+    request_id: &'a str,
+    role: Role,
+    action: &'static str,
+    payload: AnnotationOperationPayload,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AnnotationHistory {
+    items: Vec<AnnotationVersion>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AnnotationWorkflowView {
+    image_id: String,
+    status: String,
+    qa_status: String,
+    review_note: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SampleClassView {
@@ -263,6 +314,7 @@ struct SampleProjectContext {
     sqlite: PathBuf,
     original_dir: PathBuf,
     thumbnail_dir: PathBuf,
+    annotations_dir: PathBuf,
 }
 
 #[derive(Clone)]
@@ -466,6 +518,212 @@ impl RemoteSampleService {
             );
         }
         Ok(updated_sample)
+    }
+
+    pub(super) fn annotation_state(
+        &self,
+        project_id: &str,
+        sample_id: &str,
+    ) -> Result<AnnotationState, ServiceError> {
+        self.ensure_configured_root()?;
+        validate_project_id(project_id)?;
+        validate_sample_id(sample_id)?;
+        let _mutation_guard = mutation_guard();
+        let context = self.sample_project_context(project_id)?;
+        self.annotation_state_in_context(&context, sample_id)
+    }
+
+    pub(super) fn annotation_history(
+        &self,
+        project_id: &str,
+        sample_id: &str,
+    ) -> Result<AnnotationHistory, ServiceError> {
+        self.ensure_configured_root()?;
+        validate_project_id(project_id)?;
+        validate_sample_id(sample_id)?;
+        let _mutation_guard = mutation_guard();
+        let context = self.sample_project_context(project_id)?;
+        self.stored_sample(&context, sample_id)?;
+        let items = project_storage::read_annotation_versions(&context.sqlite, sample_id)
+            .map_err(storage_failure)?
+            .into_iter()
+            .map(|record| {
+                Ok(AnnotationVersion {
+                    id: record.id,
+                    image_id: record.image_id,
+                    revision: record.revision,
+                    objects: serde_json::from_str(&record.object_json)
+                        .map_err(|_| ServiceError::Storage)?,
+                    created_at: record.created_at,
+                })
+            })
+            .collect::<Result<Vec<_>, ServiceError>>()?;
+        Ok(AnnotationHistory { items })
+    }
+
+    pub(super) fn save_annotations(
+        &self,
+        project_id: &str,
+        sample_id: &str,
+        request_id: &str,
+        role: Role,
+        expectation: AnnotationRevisionExpectation,
+        raw_objects: Vec<serde_json::Value>,
+    ) -> Result<AnnotationState, ServiceError> {
+        self.ensure_configured_root()?;
+        validate_project_id(project_id)?;
+        validate_sample_id(sample_id)?;
+        let _mutation_guard = mutation_guard();
+        let context = self.sample_project_context(project_id)?;
+        let sample = self.stored_sample(&context, sample_id)?;
+        if context.manifest.format == "image-classification" {
+            return Err(ServiceError::AnnotationValidation);
+        }
+        let objects = self.validate_annotation_objects(&context, &sample.image, raw_objects)?;
+        let object_json = serde_json::to_string(&objects).map_err(storage_failure)?;
+        self.prepare_native_annotation_artifacts(&context, sample_id)?;
+        let operation_payload = serde_json::to_string(&AnnotationOperationPayload {
+            project_id: project_id.to_string(),
+            image_id: sample_id.to_string(),
+            object_count: Some(objects.len()),
+            content_sha256: Some(sha256_hex(object_json.as_bytes())),
+            decision: None,
+            note: None,
+        })
+        .map_err(storage_failure)?;
+        let operation = self
+            .storage
+            .begin_audit(AuditEntry {
+                request_id,
+                role: role_name(role),
+                action: "save_annotations",
+                project_id: Some(project_id),
+                image_id: Some(sample_id),
+                message: "annotation save requested",
+                payload: &operation_payload,
+            })
+            .map_err(storage_failure)?;
+        let saved = match project_storage::save_remote_annotation_payload(
+            &context.sqlite,
+            sample_id,
+            &expectation,
+            &object_json,
+            &operation.operation_id,
+        ) {
+            Ok(saved) => saved,
+            Err(error) => {
+                let service_error = remote_mutation_error(error);
+                self.fail_audit_best_effort(&operation, failure_message(service_error));
+                return Err(service_error);
+            }
+        };
+        let state = AnnotationState {
+            image_id: sample_id.to_string(),
+            revision: Some(saved.revision.clone()),
+            objects,
+            status: "草稿".to_string(),
+            updated_at: Some(saved.saved_at.clone()),
+        };
+        if let Err(error) = self.persist_native_annotation(&context, sample_id, &state) {
+            match project_storage::compensate_remote_annotation_save(
+                &context.sqlite,
+                sample_id,
+                &operation.operation_id,
+                &saved.revision,
+                saved.previous_annotation.as_ref(),
+                &saved.previous_metadata,
+            ) {
+                Ok(true) => {
+                    self.fail_audit_best_effort(
+                        &operation,
+                        "annotation native persistence failed and was compensated",
+                    );
+                }
+                Ok(false) | Err(_) => {
+                    self.note_pending_audit_best_effort(
+                        &operation,
+                        "annotation project commit requires startup reconciliation",
+                    );
+                }
+            }
+            return Err(error);
+        }
+        self.complete_audit_best_effort(&operation, "annotation saved");
+        Ok(state)
+    }
+
+    pub(super) fn submit_annotations(
+        &self,
+        project_id: &str,
+        sample_id: &str,
+        request_id: &str,
+        role: Role,
+    ) -> Result<AnnotationWorkflowView, ServiceError> {
+        self.annotation_workflow_mutation(
+            AnnotationWorkflowRequest {
+                project_id,
+                sample_id,
+                request_id,
+                role,
+                action: "submit_annotations",
+                payload: AnnotationOperationPayload {
+                    project_id: project_id.to_string(),
+                    image_id: sample_id.to_string(),
+                    object_count: None,
+                    content_sha256: None,
+                    decision: None,
+                    note: None,
+                },
+            },
+            |sqlite, image_id, operation_id| {
+                project_storage::submit_remote_annotation(sqlite, image_id, operation_id)
+            },
+        )
+    }
+
+    pub(super) fn review_annotations(
+        &self,
+        project_id: &str,
+        sample_id: &str,
+        request_id: &str,
+        role: Role,
+        decision: &str,
+        note: &str,
+    ) -> Result<AnnotationWorkflowView, ServiceError> {
+        if !matches!(decision, "approved" | "rejected")
+            || note.chars().count() > MAX_REVIEW_NOTE_CHARS
+            || note
+                .chars()
+                .any(|character| character.is_control() && character != '\n' && character != '\t')
+        {
+            return Err(ServiceError::AnnotationValidation);
+        }
+        self.annotation_workflow_mutation(
+            AnnotationWorkflowRequest {
+                project_id,
+                sample_id,
+                request_id,
+                role,
+                action: "review_annotations",
+                payload: AnnotationOperationPayload {
+                    project_id: project_id.to_string(),
+                    image_id: sample_id.to_string(),
+                    object_count: None,
+                    content_sha256: None,
+                    decision: Some(decision.to_string()),
+                    note: Some(note.to_string()),
+                },
+            },
+            |sqlite, image_id, operation_id| {
+                project_storage::review_remote_annotation(
+                    sqlite,
+                    image_id,
+                    operation_id,
+                    decision,
+                    note,
+                )
+            },
+        )
     }
 
     pub(super) fn sample_content(
@@ -1038,6 +1296,21 @@ impl RemoteSampleService {
                 "create_project" => self.reconcile_pending_create(&record)?,
                 "update_project" => self.reconcile_pending_update(&record)?,
                 "update_sample_metadata" => self.reconcile_pending_sample_update(&record),
+                "save_annotations" => self.reconcile_pending_annotation_mutation(
+                    &record,
+                    "annotation.save",
+                    Some("annotation.save.rollback"),
+                    true,
+                ),
+                "submit_annotations" => self.reconcile_pending_annotation_mutation(
+                    &record,
+                    "annotation.submit",
+                    None,
+                    false,
+                ),
+                "review_annotations" => {
+                    self.reconcile_pending_annotation_mutation(&record, "qa.review", None, false)
+                }
                 "delete_project" => {
                     let project_id = record.project_id.as_deref().ok_or(ServiceError::Storage)?;
                     validate_lifecycle_record_payload(&record, project_id)?;
@@ -1320,6 +1593,124 @@ impl RemoteSampleService {
         }
     }
 
+    fn reconcile_pending_annotation_mutation(
+        &self,
+        record: &OperationRecord,
+        committed_action: &str,
+        compensated_action: Option<&str>,
+        repair_native: bool,
+    ) {
+        let operation = AuditOperation {
+            operation_id: record.operation_id.clone(),
+        };
+        let payload = match serde_json::from_str::<AnnotationOperationPayload>(&record.payload) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    operation_id = %record.operation_id,
+                    "failed to parse pending annotation operation"
+                );
+                self.mark_sample_reconciliation_indeterminate(
+                    &operation,
+                    "annotation mutation payload is indeterminate",
+                );
+                return;
+            }
+        };
+        if record.project_id.as_deref() != Some(payload.project_id.as_str())
+            || record.image_id.as_deref() != Some(payload.image_id.as_str())
+            || validate_project_id(&payload.project_id).is_err()
+            || validate_sample_id(&payload.image_id).is_err()
+        {
+            self.mark_sample_reconciliation_indeterminate(
+                &operation,
+                "annotation mutation identity is inconsistent",
+            );
+            return;
+        }
+        let context = match self.sample_project_context(&payload.project_id) {
+            Ok(context) => context,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    operation_id = %record.operation_id,
+                    "pending annotation project evidence is unavailable"
+                );
+                self.mark_sample_reconciliation_indeterminate(
+                    &operation,
+                    "annotation project evidence is indeterminate",
+                );
+                return;
+            }
+        };
+        let evidence = match project_storage::remote_mutation_evidence(
+            &context.sqlite,
+            &record.operation_id,
+            &payload.image_id,
+            committed_action,
+            compensated_action,
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    operation_id = %record.operation_id,
+                    "pending annotation project evidence could not be read"
+                );
+                self.mark_sample_reconciliation_indeterminate(
+                    &operation,
+                    "annotation project evidence is indeterminate",
+                );
+                return;
+            }
+        };
+        match evidence {
+            SampleMutationEvidence::Committed => {
+                if repair_native {
+                    let state = match self.annotation_state_in_context(&context, &payload.image_id)
+                    {
+                        Ok(state) if state.revision.is_some() => state,
+                        _ => {
+                            self.mark_sample_reconciliation_indeterminate(
+                                &operation,
+                                "annotation native state cannot be repaired from project evidence",
+                            );
+                            return;
+                        }
+                    };
+                    if let Err(error) =
+                        self.persist_native_annotation(&context, &payload.image_id, &state)
+                    {
+                        tracing::error!(
+                            ?error,
+                            operation_id = %record.operation_id,
+                            "annotation native state repair failed"
+                        );
+                        self.note_pending_audit_best_effort(
+                            &operation,
+                            "annotation project commit is valid; native repair remains pending",
+                        );
+                        return;
+                    }
+                }
+                self.complete_sample_reconciliation(
+                    &operation,
+                    "annotation mutation reconciled from project evidence",
+                );
+            }
+            SampleMutationEvidence::Compensated => self.fail_sample_reconciliation(
+                &operation,
+                "annotation mutation was compensated in project storage",
+            ),
+            SampleMutationEvidence::None | SampleMutationEvidence::Indeterminate => self
+                .mark_sample_reconciliation_indeterminate(
+                    &operation,
+                    "annotation mutation has no conclusive project evidence",
+                ),
+        }
+    }
+
     fn complete_sample_reconciliation(&self, operation: &AuditOperation, message: &str) {
         if let Err(error) = self.storage.complete_audit(operation, message) {
             tracing::error!(
@@ -1412,8 +1803,31 @@ impl RemoteSampleService {
                     continue;
                 }
             };
-            if let Err(error) = self.ensure_project_manifest(&project_dir, require_active_root) {
-                tracing::error!(project_id, ?error, "project manifest could not be repaired");
+            match self.ensure_project_manifest(&project_dir, require_active_root) {
+                Ok(_) if require_active_root => {
+                    match validate_managed_directory_chain(&project_dir, &["annotations"]) {
+                        Ok(annotations_dir) => {
+                            if let Err(error) =
+                                self.cleanup_annotation_temporary_files(&annotations_dir)
+                            {
+                                tracing::error!(
+                                    project_id,
+                                    ?error,
+                                    "annotation temporary files could not be cleaned"
+                                );
+                            }
+                        }
+                        Err(error) => tracing::error!(
+                            project_id,
+                            ?error,
+                            "annotation directory is not managed"
+                        ),
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(project_id, ?error, "project manifest could not be repaired");
+                }
             }
         }
         Ok(())
@@ -1727,6 +2141,209 @@ impl RemoteSampleService {
         page.items.into_iter().next().ok_or(ServiceError::NotFound)
     }
 
+    fn annotation_state_in_context(
+        &self,
+        context: &SampleProjectContext,
+        sample_id: &str,
+    ) -> Result<AnnotationState, ServiceError> {
+        let sample = self.stored_sample(context, sample_id)?;
+        let payload = project_storage::read_annotation_payload(&context.sqlite, sample_id)
+            .map_err(storage_failure)?;
+        match payload {
+            Some(payload) => Ok(AnnotationState {
+                image_id: sample_id.to_string(),
+                revision: Some(payload.revision),
+                objects: serde_json::from_str(&payload.object_json)
+                    .map_err(|_| ServiceError::Storage)?,
+                status: sample.image.status,
+                updated_at: Some(payload.updated_at),
+            }),
+            None => Ok(AnnotationState {
+                image_id: sample_id.to_string(),
+                revision: None,
+                objects: Vec::new(),
+                status: sample.image.status,
+                updated_at: None,
+            }),
+        }
+    }
+
+    fn annotation_workflow_mutation<F>(
+        &self,
+        request: AnnotationWorkflowRequest<'_>,
+        mutation: F,
+    ) -> Result<AnnotationWorkflowView, ServiceError>
+    where
+        F: FnOnce(
+            &Path,
+            &str,
+            &str,
+        ) -> Result<RemoteWorkflowState, project_storage::RemoteMutationError>,
+    {
+        self.ensure_configured_root()?;
+        validate_project_id(request.project_id)?;
+        validate_sample_id(request.sample_id)?;
+        let _mutation_guard = mutation_guard();
+        let context = self.sample_project_context(request.project_id)?;
+        self.stored_sample(&context, request.sample_id)?;
+        let operation_payload = serde_json::to_string(&request.payload).map_err(storage_failure)?;
+        let operation = self
+            .storage
+            .begin_audit(AuditEntry {
+                request_id: request.request_id,
+                role: role_name(request.role),
+                action: request.action,
+                project_id: Some(request.project_id),
+                image_id: Some(request.sample_id),
+                message: "annotation workflow mutation requested",
+                payload: &operation_payload,
+            })
+            .map_err(storage_failure)?;
+        let state = match mutation(&context.sqlite, request.sample_id, &operation.operation_id) {
+            Ok(state) => state,
+            Err(error) => {
+                let service_error = remote_mutation_error(error);
+                self.fail_audit_best_effort(&operation, failure_message(service_error));
+                return Err(service_error);
+            }
+        };
+        self.complete_audit_best_effort(&operation, "annotation workflow updated");
+        Ok(annotation_workflow_view(state))
+    }
+
+    fn validate_annotation_objects(
+        &self,
+        context: &SampleProjectContext,
+        image: &StoredImage,
+        values: Vec<serde_json::Value>,
+    ) -> Result<Vec<AnnotationObject>, ServiceError> {
+        if values.len() > MAX_ANNOTATION_OBJECTS {
+            return Err(ServiceError::AnnotationValidation);
+        }
+        let classes = project_storage::read_enabled_classes(&context.sqlite)
+            .map_err(storage_failure)?
+            .into_iter()
+            .map(|class| (class.id, class.label))
+            .collect::<HashMap<_, _>>();
+        let mut ids = HashSet::new();
+        let mut objects = Vec::with_capacity(values.len());
+        for value in values {
+            let object = parse_annotation_object(value, image, &classes)?;
+            if !ids.insert(object.id.clone()) {
+                return Err(ServiceError::AnnotationValidation);
+            }
+            objects.push(object);
+        }
+        Ok(objects)
+    }
+
+    fn native_annotation_paths(
+        &self,
+        context: &SampleProjectContext,
+        sample_id: &str,
+    ) -> (PathBuf, PathBuf) {
+        let target = context.annotations_dir.join(format!("{sample_id}.json"));
+        let backup = context.annotations_dir.join(format!(
+            ".annotation-{}.bak",
+            sha256_hex(sample_id.as_bytes())
+        ));
+        (target, backup)
+    }
+
+    fn prepare_native_annotation_artifacts(
+        &self,
+        context: &SampleProjectContext,
+        sample_id: &str,
+    ) -> Result<(), ServiceError> {
+        let (target, backup) = self.native_annotation_paths(context, sample_id);
+        let target_exists = self
+            .validate_optional_project_file(&context.annotations_dir, &target)?
+            .is_some();
+        let backup_exists = self
+            .validate_optional_project_file(&context.annotations_dir, &backup)?
+            .is_some();
+        match (target_exists, backup_exists) {
+            (true, true) => fs::remove_file(backup).map_err(storage_failure),
+            (false, true) => {
+                fs::rename(&backup, &target).map_err(storage_failure)?;
+                self.validate_required_project_file(&context.annotations_dir, &target)?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn persist_native_annotation(
+        &self,
+        context: &SampleProjectContext,
+        sample_id: &str,
+        state: &AnnotationState,
+    ) -> Result<(), ServiceError> {
+        self.prepare_native_annotation_artifacts(context, sample_id)?;
+        let (target, backup) = self.native_annotation_paths(context, sample_id);
+        let temporary = context.annotations_dir.join(format!(
+            ".annotation-{}-{}-{}.tmp",
+            sha256_hex(sample_id.as_bytes()),
+            std::process::id(),
+            ANNOTATION_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let bytes = serde_json::to_vec_pretty(state).map_err(storage_failure)?;
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+                .map_err(storage_failure)?;
+            file.write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(storage_failure)?;
+            drop(file);
+            self.validate_required_project_file(&context.annotations_dir, &temporary)?;
+            let had_target = self
+                .validate_optional_project_file(&context.annotations_dir, &target)?
+                .is_some();
+            self.validate_optional_project_file(&context.annotations_dir, &backup)?;
+            if had_target {
+                fs::rename(&target, &backup).map_err(storage_failure)?;
+            }
+            if let Err(error) = fs::rename(&temporary, &target).map_err(storage_failure) {
+                if had_target {
+                    let _ = fs::remove_file(&target);
+                    if fs::rename(&backup, &target).is_err() {
+                        return Err(ServiceError::Storage);
+                    }
+                }
+                return Err(error);
+            }
+            if let Err(error) =
+                self.validate_required_project_file(&context.annotations_dir, &target)
+            {
+                let _ = fs::remove_file(&target);
+                if had_target && fs::rename(&backup, &target).is_err() {
+                    return Err(ServiceError::Storage);
+                }
+                return Err(error);
+            }
+            if had_target {
+                if let Err(error) = fs::remove_file(&backup) {
+                    tracing::warn!(
+                        %error,
+                        "native annotation backup cleanup is deferred"
+                    );
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err()
+            && fs::symlink_metadata(&temporary)
+                .ok()
+                .is_some_and(|metadata| metadata.is_file() && !is_symlink_or_reparse(&metadata))
+        {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
     fn sample_project_context(
         &self,
         project_id: &str,
@@ -1742,12 +2359,15 @@ impl RemoteSampleService {
         let original_dir = validate_managed_directory_chain(&project_dir, &["assets", "original"])?;
         let thumbnail_dir =
             validate_managed_directory_chain(&project_dir, &["assets", "thumbnails"])?;
+        let annotations_dir = validate_managed_directory_chain(&project_dir, &["annotations"])?;
         self.cleanup_thumbnail_temporary_files(&thumbnail_dir)?;
+        self.cleanup_annotation_temporary_files(&annotations_dir)?;
         Ok(SampleProjectContext {
             manifest,
             sqlite,
             original_dir,
             thumbnail_dir,
+            annotations_dir,
         })
     }
 
@@ -1898,6 +2518,29 @@ impl RemoteSampleService {
                 continue;
             }
             self.validate_managed_asset_file(thumbnail_dir, &path)?;
+            fs::remove_file(path).map_err(storage_failure)?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_annotation_temporary_files(
+        &self,
+        annotations_dir: &Path,
+    ) -> Result<(), ServiceError> {
+        for entry in fs::read_dir(annotations_dir).map_err(storage_failure)? {
+            let entry = entry.map_err(storage_failure)?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !name.starts_with(".annotation-") || !name.ends_with(".tmp") {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(storage_failure)?;
+            if is_symlink_or_reparse(&metadata) || !metadata.is_file() {
+                continue;
+            }
+            self.validate_required_project_file(annotations_dir, &path)?;
             fs::remove_file(path).map_err(storage_failure)?;
         }
         Ok(())
@@ -2508,6 +3151,174 @@ fn valid_qa_status(value: &str) -> bool {
     matches!(value, "" | "待质检" | "通过" | "驳回")
 }
 
+fn parse_annotation_object(
+    value: serde_json::Value,
+    image: &StoredImage,
+    classes: &HashMap<u32, String>,
+) -> Result<AnnotationObject, ServiceError> {
+    let object = value
+        .as_object()
+        .ok_or(ServiceError::AnnotationValidation)?;
+    let allowed = [
+        "id",
+        "classId",
+        "label",
+        "type",
+        "bbox",
+        "polygon",
+        "attributes",
+    ];
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(ServiceError::AnnotationValidation);
+    }
+    let id = annotation_text(object.get("id"), MAX_ANNOTATION_ID_CHARS)?;
+    let class_id = object
+        .get("classId")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(ServiceError::AnnotationValidation)?;
+    let label = annotation_text(object.get("label"), MAX_ANNOTATION_LABEL_CHARS)?;
+    if classes.get(&class_id).map(String::as_str) != Some(label.as_str()) {
+        return Err(ServiceError::AnnotationValidation);
+    }
+    let object_type = annotation_text(object.get("type"), 32)?;
+    let attributes_object = object
+        .get("attributes")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(ServiceError::AnnotationValidation)?;
+    if serde_json::to_vec(attributes_object)
+        .map_err(|_| ServiceError::AnnotationValidation)?
+        .len()
+        > MAX_ANNOTATION_ATTRIBUTES_BYTES
+    {
+        return Err(ServiceError::AnnotationValidation);
+    }
+    let attributes = attributes_object
+        .clone()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    match object_type.as_str() {
+        "bbox" => {
+            if object.contains_key("polygon") {
+                return Err(ServiceError::AnnotationValidation);
+            }
+            let bbox = object
+                .get("bbox")
+                .and_then(serde_json::Value::as_object)
+                .ok_or(ServiceError::AnnotationValidation)?;
+            if bbox.len() != 4
+                || bbox
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "x" | "y" | "width" | "height"))
+            {
+                return Err(ServiceError::AnnotationValidation);
+            }
+            let x = annotation_number(bbox.get("x"))?;
+            let y = annotation_number(bbox.get("y"))?;
+            let width = annotation_number(bbox.get("width"))?;
+            let height = annotation_number(bbox.get("height"))?;
+            if x < 0.0
+                || y < 0.0
+                || width <= 0.0
+                || height <= 0.0
+                || x + width > f64::from(image.width)
+                || y + height > f64::from(image.height)
+            {
+                return Err(ServiceError::AnnotationValidation);
+            }
+            Ok(AnnotationObject {
+                id,
+                class_id,
+                label,
+                object_type,
+                bbox: Some(BBox {
+                    x,
+                    y,
+                    width,
+                    height,
+                }),
+                polygon: None,
+                attributes,
+            })
+        }
+        "polygon" => {
+            if object.contains_key("bbox") {
+                return Err(ServiceError::AnnotationValidation);
+            }
+            let polygon = object
+                .get("polygon")
+                .and_then(serde_json::Value::as_array)
+                .ok_or(ServiceError::AnnotationValidation)?;
+            if polygon.len() < 3 || polygon.len() > 10_000 {
+                return Err(ServiceError::AnnotationValidation);
+            }
+            let mut points = Vec::with_capacity(polygon.len());
+            for point in polygon {
+                let point = point
+                    .as_object()
+                    .ok_or(ServiceError::AnnotationValidation)?;
+                if point.len() != 2 || point.keys().any(|key| !matches!(key.as_str(), "x" | "y")) {
+                    return Err(ServiceError::AnnotationValidation);
+                }
+                let x = annotation_number(point.get("x"))?;
+                let y = annotation_number(point.get("y"))?;
+                if x < 0.0 || y < 0.0 || x > f64::from(image.width) || y > f64::from(image.height) {
+                    return Err(ServiceError::AnnotationValidation);
+                }
+                points.push(Point { x, y });
+            }
+            let distinct = points
+                .iter()
+                .enumerate()
+                .filter(|(index, point)| {
+                    points[..*index]
+                        .iter()
+                        .all(|existing| existing.x != point.x || existing.y != point.y)
+                })
+                .count();
+            if distinct < 3 {
+                return Err(ServiceError::AnnotationValidation);
+            }
+            Ok(AnnotationObject {
+                id,
+                class_id,
+                label,
+                object_type,
+                bbox: None,
+                polygon: Some(points),
+                attributes,
+            })
+        }
+        _ => Err(ServiceError::AnnotationValidation),
+    }
+}
+
+fn annotation_text(
+    value: Option<&serde_json::Value>,
+    max_chars: usize,
+) -> Result<String, ServiceError> {
+    let value = value
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ServiceError::AnnotationValidation)?;
+    if value.is_empty() || value.chars().count() > max_chars || value.chars().any(char::is_control)
+    {
+        Err(ServiceError::AnnotationValidation)
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn annotation_number(value: Option<&serde_json::Value>) -> Result<f64, ServiceError> {
+    let value = value
+        .and_then(serde_json::Value::as_f64)
+        .ok_or(ServiceError::AnnotationValidation)?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(ServiceError::AnnotationValidation)
+    }
+}
+
 fn sample_view(sample: StoredSample) -> Result<SampleView, ServiceError> {
     let file_name = validated_relative_asset_path(&sample.image.file_name)?
         .to_string_lossy()
@@ -2534,6 +3345,15 @@ fn sample_class_view(class: StoredSampleClass) -> SampleClassView {
         id: class.id,
         label: class.label,
         object_count: class.object_count,
+    }
+}
+
+fn annotation_workflow_view(state: RemoteWorkflowState) -> AnnotationWorkflowView {
+    AnnotationWorkflowView {
+        image_id: state.image_id,
+        status: state.status,
+        qa_status: state.qa_status,
+        review_note: state.review_note,
     }
 }
 
@@ -2748,8 +3568,10 @@ fn validate_lifecycle_record_payload(
 fn failure_message(error: ServiceError) -> &'static str {
     match error {
         ServiceError::Validation => "project mutation validation failed",
+        ServiceError::AnnotationValidation => "annotation validation failed",
         ServiceError::NotFound => "project was not found",
         ServiceError::Conflict => "project mutation conflicted with existing state",
+        ServiceError::RevisionConflict => "annotation revision conflict",
         ServiceError::UnsupportedMedia => "project media format is not supported",
         ServiceError::Storage => "project storage operation failed",
     }
@@ -2765,6 +3587,14 @@ fn trashed_result(project_id: &str) -> ProjectLifecycleResult {
 fn storage_failure(error: impl std::fmt::Display) -> ServiceError {
     tracing::error!(%error, "remote sample storage operation failed");
     ServiceError::Storage
+}
+
+fn remote_mutation_error(error: RemoteMutationError) -> ServiceError {
+    match error {
+        RemoteMutationError::NotFound => ServiceError::NotFound,
+        RemoteMutationError::RevisionConflict => ServiceError::RevisionConflict,
+        RemoteMutationError::Storage(error) => storage_failure(error),
+    }
 }
 
 #[cfg(test)]

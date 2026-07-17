@@ -1,6 +1,7 @@
 use crate::project_fs::ProjectManifest;
 use rusqlite::{
     params, params_from_iter, types::Value as SqlValue, Connection, OpenFlags, OptionalExtension,
+    TransactionBehavior,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -107,6 +108,43 @@ pub struct AnnotationSaveResult {
     pub revision: String,
     pub saved_at: String,
     pub audit_event_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnnotationRevisionExpectation {
+    Missing,
+    AnyExisting,
+    Strong(Vec<String>),
+    Never,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteAnnotationSaveResult {
+    pub revision: String,
+    pub saved_at: String,
+    pub previous_annotation: Option<AnnotationPayload>,
+    pub previous_metadata: StoredSampleMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteWorkflowState {
+    pub image_id: String,
+    pub status: String,
+    pub qa_status: String,
+    pub review_note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteMutationError {
+    NotFound,
+    RevisionConflict,
+    Storage(String),
+}
+
+impl From<String> for RemoteMutationError {
+    fn from(error: String) -> Self {
+        Self::Storage(error)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -757,6 +795,30 @@ pub fn read_classes(path: &Path) -> Result<Vec<StoredClass>, String> {
     Ok(classes)
 }
 
+pub fn read_enabled_classes(path: &Path) -> Result<Vec<StoredClass>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    initialize_project_database(path)?;
+    validate_project_database_artifacts(path)?;
+    let connection = open_project_database_read_only(path)?;
+    let mut statement = connection
+        .prepare("SELECT id, label, color FROM classes WHERE enabled = 1 ORDER BY id")
+        .map_err(|err| err.to_string())?;
+    let classes = statement
+        .query_map([], |row| {
+            Ok(StoredClass {
+                id: row.get(0)?,
+                label: row.get(1)?,
+                color: row.get(2)?,
+            })
+        })
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    Ok(classes)
+}
+
 pub fn refresh_sample_class_links(
     path: &Path,
     classification_links: &[(String, u32)],
@@ -1319,7 +1381,8 @@ pub fn read_annotation_payload(
         return Ok(None);
     }
     initialize_project_database(path)?;
-    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    validate_project_database_artifacts(path)?;
+    let connection = open_project_database_read_only(path)?;
     connection
         .query_row(
             "SELECT image_id, revision, object_json, updated_at FROM annotations WHERE id = ?1",
@@ -1345,10 +1408,14 @@ pub fn read_annotation_versions(
         return Ok(Vec::new());
     }
     initialize_project_database(path)?;
-    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    validate_project_database_artifacts(path)?;
+    let connection = open_project_database_read_only(path)?;
     let mut statement = connection
         .prepare(
-            "SELECT id, image_id, revision, object_json, created_at FROM annotation_versions WHERE image_id = ?1 ORDER BY created_at",
+            "SELECT id, image_id, revision, object_json, created_at
+             FROM annotation_versions
+             WHERE image_id = ?1
+             ORDER BY created_at, rowid",
         )
         .map_err(|err| err.to_string())?;
     let rows = statement
@@ -1365,6 +1432,419 @@ pub fn read_annotation_versions(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| err.to_string())?;
     Ok(rows)
+}
+
+pub fn save_remote_annotation_payload(
+    path: &Path,
+    image_id: &str,
+    expectation: &AnnotationRevisionExpectation,
+    object_json: &str,
+    operation_id: &str,
+) -> Result<RemoteAnnotationSaveResult, RemoteMutationError> {
+    initialize_project_database(path).map_err(RemoteMutationError::Storage)?;
+    validate_project_database_artifacts(path).map_err(RemoteMutationError::Storage)?;
+    let mut connection =
+        open_project_database_writable(path).map_err(RemoteMutationError::Storage)?;
+    validate_project_database_artifacts(path).map_err(RemoteMutationError::Storage)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    let previous_metadata = transaction
+        .query_row(
+            "SELECT split, status, qa_status, review_note FROM images WHERE id = ?1",
+            [image_id],
+            |row| {
+                Ok(StoredSampleMetadata {
+                    split: row.get(0)?,
+                    status: row.get(1)?,
+                    qa_status: row.get(2)?,
+                    review_note: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?
+        .ok_or(RemoteMutationError::NotFound)?;
+    let previous_annotation = transaction
+        .query_row(
+            "SELECT image_id, revision, object_json, updated_at
+             FROM annotations WHERE id = ?1",
+            [image_id],
+            |row| {
+                Ok(AnnotationPayload {
+                    image_id: row.get(0)?,
+                    revision: row.get(1)?,
+                    object_json: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    let current_revision = previous_annotation
+        .as_ref()
+        .map(|annotation| annotation.revision.as_str());
+    if !annotation_expectation_matches(expectation, current_revision) {
+        return Err(RemoteMutationError::RevisionConflict);
+    }
+
+    let revision = unique_id("rev");
+    let saved_at = now_unix_millis_string();
+    transaction
+        .execute(
+            r#"
+            INSERT INTO annotations (id, image_id, revision, object_json, updated_at)
+            VALUES (?1, ?1, ?2, ?3, ?4)
+            ON CONFLICT(id) DO UPDATE SET
+                revision = excluded.revision,
+                object_json = excluded.object_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![image_id, revision, object_json, saved_at],
+        )
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    transaction
+        .execute(
+            "INSERT INTO annotation_versions
+                (id, image_id, revision, object_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                format!("{operation_id}:version"),
+                image_id,
+                revision,
+                object_json,
+                saved_at
+            ],
+        )
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    transaction
+        .execute(
+            "UPDATE images
+             SET status = '草稿', qa_status = '', review_note = NULL
+             WHERE id = ?1",
+            [image_id],
+        )
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    transaction
+        .execute(
+            "INSERT INTO audit_events (id, action, image_id, message, created_at)
+             VALUES (?1, 'annotation.save', ?2, 'remote annotation saved', ?3)",
+            params![operation_id, image_id, saved_at],
+        )
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    transaction
+        .commit()
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    validate_project_database_artifacts(path).map_err(RemoteMutationError::Storage)?;
+
+    Ok(RemoteAnnotationSaveResult {
+        revision,
+        saved_at,
+        previous_annotation,
+        previous_metadata,
+    })
+}
+
+pub fn compensate_remote_annotation_save(
+    path: &Path,
+    image_id: &str,
+    operation_id: &str,
+    applied_revision: &str,
+    previous_annotation: Option<&AnnotationPayload>,
+    previous_metadata: &StoredSampleMetadata,
+) -> Result<bool, String> {
+    initialize_project_database(path)?;
+    validate_project_database_artifacts(path)?;
+    let mut connection = open_project_database_writable(path)?;
+    validate_project_database_artifacts(path)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let rollback_id = format!("{operation_id}:rollback");
+    let rollback_exists = transaction
+        .query_row(
+            "SELECT action, image_id FROM audit_events WHERE id = ?1",
+            [&rollback_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .is_some_and(|(action, event_image_id)| {
+            action == "annotation.save.rollback" && event_image_id.as_deref() == Some(image_id)
+        });
+    if rollback_exists {
+        return Ok(true);
+    }
+    let current_revision = current_annotation_revision(&transaction, image_id)?;
+    let committed_event = transaction
+        .query_row(
+            "SELECT action, image_id FROM audit_events WHERE id = ?1",
+            [operation_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if current_revision.as_deref() != Some(applied_revision)
+        || committed_event
+            .as_ref()
+            .is_none_or(|(action, event_image_id)| {
+                action != "annotation.save" || event_image_id.as_deref() != Some(image_id)
+            })
+    {
+        return Ok(false);
+    }
+
+    match previous_annotation {
+        Some(previous) => {
+            transaction
+                .execute(
+                    "UPDATE annotations
+                     SET revision = ?2, object_json = ?3, updated_at = ?4
+                     WHERE id = ?1",
+                    params![
+                        image_id,
+                        previous.revision,
+                        previous.object_json,
+                        previous.updated_at
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        None => {
+            transaction
+                .execute("DELETE FROM annotations WHERE id = ?1", [image_id])
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    transaction
+        .execute(
+            "DELETE FROM annotation_versions WHERE id = ?1 AND revision = ?2",
+            params![format!("{operation_id}:version"), applied_revision],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE images
+             SET split = ?2, status = ?3, qa_status = ?4, review_note = ?5
+             WHERE id = ?1",
+            params![
+                image_id,
+                previous_metadata.split,
+                previous_metadata.status,
+                previous_metadata.qa_status,
+                previous_metadata.review_note
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO audit_events (id, action, image_id, message, created_at)
+             VALUES (?1, 'annotation.save.rollback', ?2, 'remote annotation save compensated', ?3)",
+            params![rollback_id, image_id, now_unix_millis_string()],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    validate_project_database_artifacts(path)?;
+    Ok(true)
+}
+
+pub fn submit_remote_annotation(
+    path: &Path,
+    image_id: &str,
+    operation_id: &str,
+) -> Result<RemoteWorkflowState, RemoteMutationError> {
+    initialize_project_database(path).map_err(RemoteMutationError::Storage)?;
+    validate_project_database_artifacts(path).map_err(RemoteMutationError::Storage)?;
+    let mut connection =
+        open_project_database_writable(path).map_err(RemoteMutationError::Storage)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    let exists = transaction
+        .query_row("SELECT 1 FROM images WHERE id = ?1", [image_id], |_| Ok(()))
+        .optional()
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?
+        .is_some();
+    if !exists {
+        return Err(RemoteMutationError::NotFound);
+    }
+    transaction
+        .execute(
+            "UPDATE images
+             SET status = '待质检', qa_status = '待质检', review_note = NULL
+             WHERE id = ?1",
+            [image_id],
+        )
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    transaction
+        .execute(
+            "UPDATE task_items
+             SET status = '待质检', qa_status = '待质检', review_note = NULL
+             WHERE image_id = ?1",
+            [image_id],
+        )
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    transaction
+        .execute(
+            "INSERT INTO audit_events (id, action, image_id, message, created_at)
+             VALUES (?1, 'annotation.submit', ?2, 'remote annotation submitted', ?3)",
+            params![operation_id, image_id, now_unix_millis_string()],
+        )
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    transaction
+        .commit()
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    validate_project_database_artifacts(path).map_err(RemoteMutationError::Storage)?;
+    read_remote_workflow_state(path, image_id)
+        .map_err(RemoteMutationError::Storage)?
+        .ok_or(RemoteMutationError::NotFound)
+}
+
+pub fn review_remote_annotation(
+    path: &Path,
+    image_id: &str,
+    operation_id: &str,
+    decision: &str,
+    note: &str,
+) -> Result<RemoteWorkflowState, RemoteMutationError> {
+    let (status, qa_status, message) = match decision {
+        "approved" => ("通过", "通过", "remote review approved"),
+        "rejected" => ("草稿", "驳回", "remote review rejected"),
+        _ => {
+            return Err(RemoteMutationError::Storage(
+                "invalid review decision".to_string(),
+            ))
+        }
+    };
+    initialize_project_database(path).map_err(RemoteMutationError::Storage)?;
+    validate_project_database_artifacts(path).map_err(RemoteMutationError::Storage)?;
+    let mut connection =
+        open_project_database_writable(path).map_err(RemoteMutationError::Storage)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    let exists = transaction
+        .query_row("SELECT 1 FROM images WHERE id = ?1", [image_id], |_| Ok(()))
+        .optional()
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?
+        .is_some();
+    if !exists {
+        return Err(RemoteMutationError::NotFound);
+    }
+    transaction
+        .execute(
+            "UPDATE images SET status = ?2, qa_status = ?3, review_note = ?4 WHERE id = ?1",
+            params![image_id, status, qa_status, note],
+        )
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    transaction
+        .execute(
+            "UPDATE task_items
+             SET status = ?2, qa_status = ?3, review_note = ?4
+             WHERE image_id = ?1",
+            params![image_id, status, qa_status, note],
+        )
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    transaction
+        .execute(
+            "INSERT INTO qa_reviews (id, image_id, decision, note, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                operation_id,
+                image_id,
+                qa_status,
+                note,
+                now_unix_millis_string()
+            ],
+        )
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    transaction
+        .execute(
+            "INSERT INTO audit_events (id, action, image_id, message, created_at)
+             VALUES (?1, 'qa.review', ?2, ?3, ?4)",
+            params![operation_id, image_id, message, now_unix_millis_string()],
+        )
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    transaction
+        .commit()
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    validate_project_database_artifacts(path).map_err(RemoteMutationError::Storage)?;
+    read_remote_workflow_state(path, image_id)
+        .map_err(RemoteMutationError::Storage)?
+        .ok_or(RemoteMutationError::NotFound)
+}
+
+pub fn read_remote_workflow_state(
+    path: &Path,
+    image_id: &str,
+) -> Result<Option<RemoteWorkflowState>, String> {
+    initialize_project_database(path)?;
+    validate_project_database_artifacts(path)?;
+    let connection = open_project_database_read_only(path)?;
+    connection
+        .query_row(
+            "SELECT id, status, qa_status, review_note FROM images WHERE id = ?1",
+            [image_id],
+            |row| {
+                Ok(RemoteWorkflowState {
+                    image_id: row.get(0)?,
+                    status: row.get(1)?,
+                    qa_status: row.get(2)?,
+                    review_note: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
+pub fn remote_mutation_evidence(
+    path: &Path,
+    operation_id: &str,
+    image_id: &str,
+    committed_action: &str,
+    compensated_action: Option<&str>,
+) -> Result<SampleMutationEvidence, String> {
+    initialize_project_database(path)?;
+    validate_project_database_artifacts(path)?;
+    let connection = open_project_database_read_only(path)?;
+    let committed = connection
+        .query_row(
+            "SELECT action, image_id FROM audit_events WHERE id = ?1",
+            [operation_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let rollback_id = format!("{operation_id}:rollback");
+    let compensated = connection
+        .query_row(
+            "SELECT action, image_id FROM audit_events WHERE id = ?1",
+            [&rollback_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+
+    let committed_matches = committed.as_ref().is_some_and(|(action, event_image_id)| {
+        action == committed_action && event_image_id.as_deref() == Some(image_id)
+    });
+    let compensated_matches = compensated_action.is_some_and(|expected| {
+        compensated
+            .as_ref()
+            .is_some_and(|(action, event_image_id)| {
+                action == expected && event_image_id.as_deref() == Some(image_id)
+            })
+    });
+    if committed_matches && compensated_matches {
+        Ok(SampleMutationEvidence::Compensated)
+    } else if committed_matches && compensated.is_none() {
+        Ok(SampleMutationEvidence::Committed)
+    } else if committed.is_none() && compensated.is_none() {
+        Ok(SampleMutationEvidence::None)
+    } else {
+        Ok(SampleMutationEvidence::Indeterminate)
+    }
 }
 
 pub fn submit_image_for_review(path: &Path, image_id: &str) -> Result<(), String> {
@@ -1725,10 +2205,30 @@ fn current_annotation_revision(
         .map_err(|err| err.to_string())
 }
 
+fn annotation_expectation_matches(
+    expectation: &AnnotationRevisionExpectation,
+    current_revision: Option<&str>,
+) -> bool {
+    match expectation {
+        AnnotationRevisionExpectation::Missing => current_revision.is_none(),
+        AnnotationRevisionExpectation::AnyExisting => current_revision.is_some(),
+        AnnotationRevisionExpectation::Strong(revisions) => current_revision
+            .is_some_and(|current| revisions.iter().any(|revision| revision == current)),
+        AnnotationRevisionExpectation::Never => false,
+    }
+}
+
 fn now_unix_string() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+fn now_unix_millis_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().to_string())
         .unwrap_or_else(|_| "0".to_string())
 }
 

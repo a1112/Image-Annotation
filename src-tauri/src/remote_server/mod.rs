@@ -1,3 +1,4 @@
+mod annotations;
 mod auth;
 mod config;
 mod error;
@@ -75,7 +76,13 @@ pub fn build_router_with_private_routes(
             service.clone(),
         )))
         .with_reader(with_api_body_limit(samples::reader_routes(service.clone())))
+        .with_reader(with_api_body_limit(annotations::reader_routes(
+            service.clone(),
+        )))
         .with_editor(with_api_body_limit(samples::editor_routes(service.clone())))
+        .with_editor(with_api_body_limit(annotations::editor_routes(
+            service.clone(),
+        )))
         .with_admin(with_api_body_limit(projects::admin_routes(service)));
     let private_routes = protect_private_route_groups(private_route_groups);
     let routes = Router::new()

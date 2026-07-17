@@ -132,6 +132,22 @@ impl ApiError {
         )
     }
 
+    fn revision_conflict() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "revision_conflict",
+            "annotation revision has changed",
+        )
+    }
+
+    fn annotation_validation() -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "annotation_validation",
+            "the annotation payload is invalid for this sample",
+        )
+    }
+
     fn storage() -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -195,8 +211,10 @@ impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
         match error {
             ServiceError::Validation => Self::validation(),
+            ServiceError::AnnotationValidation => Self::annotation_validation(),
             ServiceError::NotFound => Self::not_found(),
             ServiceError::Conflict => Self::conflict(),
+            ServiceError::RevisionConflict => Self::revision_conflict(),
             ServiceError::UnsupportedMedia => Self::unsupported_image_format(),
             ServiceError::Storage => Self::storage(),
         }
