@@ -22,6 +22,9 @@ use tower_http::{
     trace::TraceLayer,
 };
 
+const DEFAULT_API_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+const MULTIPART_FRAMING_ALLOWANCE_BYTES: usize = 1024 * 1024;
+
 pub use auth::Role;
 pub use config::{ConfigError, ServerConfig};
 
@@ -38,35 +41,58 @@ pub fn build_router_with_private_routes(
     let authenticator = Arc::new(TokenAuthenticator::from_config(&config));
     let admin_routes = Router::new()
         .route("/api/v1/projects", post(create_project))
-        .route_layer(middleware::from_fn(require_admin));
+        .route_layer(middleware::from_fn_with_state(Role::Admin, require_role));
+    let project_routes = with_api_body_limit(
+        Router::new()
+            .route("/api/v1/projects", get(list_projects))
+            .merge(admin_routes),
+    );
     let routes = Router::new()
         .route("/api/v1/health", get(health))
-        .route("/api/v1/projects", get(list_projects))
-        .merge(admin_routes)
+        .merge(project_routes)
         .nest("/api/v1", additional_private_routes)
         .fallback(not_found)
-        .method_not_allowed_fallback(method_not_allowed);
-    let routes = with_body_limit(routes, config.max_upload_bytes).layer(
-        middleware::from_fn_with_state(authenticator, authenticate_private_api),
-    );
+        .method_not_allowed_fallback(method_not_allowed)
+        .layer(DefaultBodyLimit::max(DEFAULT_API_BODY_LIMIT_BYTES))
+        .layer(middleware::from_fn(envelope_body_limit_rejections))
+        .layer(middleware::from_fn_with_state(
+            authenticator,
+            authenticate_private_api,
+        ));
 
     Ok(routes
         .layer(cors_layer(&config.allowed_origins))
         .layer(TraceLayer::new_for_http())
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(RequestIdGenerator))
-        .layer(middleware::from_fn(remove_empty_request_id)))
+        .layer(middleware::from_fn(remove_incoming_request_id)))
 }
 
-fn with_body_limit(router: Router, max_upload_bytes: usize) -> Router {
+fn with_api_body_limit(router: Router) -> Router {
     router
-        .layer(DefaultBodyLimit::max(max_upload_bytes))
-        .layer(RequestBodyLimitLayer::new(max_upload_bytes))
-        .layer(middleware::from_fn(envelope_body_limit_rejections))
+        .layer(DefaultBodyLimit::max(DEFAULT_API_BODY_LIMIT_BYTES))
+        .layer(RequestBodyLimitLayer::new(DEFAULT_API_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn_with_state(
-            max_upload_bytes,
+            DEFAULT_API_BODY_LIMIT_BYTES,
             enforce_declared_body_limit,
         ))
+}
+
+pub fn with_upload_body_limit(router: Router, max_upload_bytes: usize) -> Router {
+    let extractor_limit = max_upload_bytes.saturating_add(MULTIPART_FRAMING_ALLOWANCE_BYTES);
+    router.layer(DefaultBodyLimit::max(extractor_limit))
+}
+
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        shutdown_signal_unix().await;
+    }
+
+    #[cfg(not(unix))]
+    {
+        shutdown_signal_ctrl_c().await;
+    }
 }
 
 async fn health(request: Request) -> Response {
@@ -120,9 +146,13 @@ async fn authenticate_private_api(
     }
 }
 
-async fn require_admin(request: Request, next: Next) -> Response {
+pub async fn require_role(
+    State(required_role): State<Role>,
+    request: Request,
+    next: Next,
+) -> Response {
     match request.extensions().get::<Role>().copied() {
-        Some(role) if role.allows(Role::Admin) => next.run(request).await,
+        Some(role) if role.allows(required_role) => next.run(request).await,
         Some(_) => ApiError::forbidden().into_response(request_id(request.extensions())),
         None => ApiError::unauthorized().into_response(request_id(request.extensions())),
     }
@@ -136,15 +166,8 @@ async fn method_not_allowed(request: Request) -> Response {
     ApiError::method_not_allowed().into_response(request_id(request.extensions()))
 }
 
-async fn remove_empty_request_id(mut request: Request, next: Next) -> Response {
-    let has_empty_request_id = request
-        .headers()
-        .get("x-request-id")
-        .is_some_and(|value| value.as_bytes().is_empty());
-    if has_empty_request_id {
-        request.headers_mut().remove("x-request-id");
-    }
-
+async fn remove_incoming_request_id(mut request: Request, next: Next) -> Response {
+    request.headers_mut().remove("x-request-id");
     next.run(request).await
 }
 
@@ -177,6 +200,42 @@ async fn envelope_body_limit_rejections(request: Request, next: Next) -> Respons
     }
 }
 
+#[cfg(unix)]
+async fn shutdown_signal_unix() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(signal) => signal,
+        Err(error) => {
+            tracing::error!(%error, "failed to listen for SIGTERM");
+            shutdown_signal_ctrl_c().await;
+            return;
+        }
+    };
+
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => log_ctrl_c_result(result),
+        signal = terminate.recv() => {
+            if signal.is_some() {
+                tracing::info!("SIGTERM received");
+            } else {
+                tracing::error!("SIGTERM signal stream closed");
+            }
+        }
+    }
+}
+
+async fn shutdown_signal_ctrl_c() {
+    log_ctrl_c_result(tokio::signal::ctrl_c().await);
+}
+
+fn log_ctrl_c_result(result: std::io::Result<()>) {
+    match result {
+        Ok(()) => tracing::info!("Ctrl+C received"),
+        Err(error) => tracing::error!(%error, "failed to listen for Ctrl+C"),
+    }
+}
+
 fn cors_layer(origins: &[String]) -> CorsLayer {
     let layer = CorsLayer::new()
         .allow_methods([
@@ -186,7 +245,20 @@ fn cors_layer(origins: &[String]) -> CorsLayer {
             Method::PUT,
             Method::DELETE,
         ])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::IF_MATCH,
+            header::IF_NONE_MATCH,
+            header::RANGE,
+        ])
+        .expose_headers([
+            header::ETAG,
+            header::CONTENT_RANGE,
+            header::ACCEPT_RANGES,
+            header::CONTENT_DISPOSITION,
+            header::HeaderName::from_static("x-request-id"),
+        ]);
 
     if origins.is_empty() {
         layer

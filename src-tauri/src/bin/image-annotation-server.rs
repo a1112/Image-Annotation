@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     tracing::info!(%local_addr, "remote sample server listening");
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(remote_server::shutdown_signal())
         .await?;
 
     Ok(())
@@ -30,11 +30,4 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("image_annotation=info,tower_http=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
-}
-
-async fn shutdown_signal() {
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => tracing::info!("shutdown signal received"),
-        Err(error) => tracing::error!(%error, "failed to listen for shutdown signal"),
-    }
 }

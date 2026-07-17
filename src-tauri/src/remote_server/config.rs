@@ -10,6 +10,7 @@ use clap::Parser;
 
 const DEFAULT_BIND: &str = "127.0.0.1:17311";
 const DEFAULT_MAX_UPLOAD_MIB: &str = "2048";
+const MIN_TOKEN_BYTES: usize = 32;
 
 #[derive(Clone, Parser)]
 #[command(
@@ -28,13 +29,28 @@ pub struct ServerConfig {
     )]
     pub data_dir: PathBuf,
 
-    #[arg(long, env = "IMAGE_ANNOTATION_READER_TOKEN")]
+    #[arg(
+        long,
+        env = "IMAGE_ANNOTATION_READER_TOKEN",
+        hide_env_values = true,
+        hide_default_value = true
+    )]
     pub reader_token: Option<String>,
 
-    #[arg(long, env = "IMAGE_ANNOTATION_EDITOR_TOKEN")]
+    #[arg(
+        long,
+        env = "IMAGE_ANNOTATION_EDITOR_TOKEN",
+        hide_env_values = true,
+        hide_default_value = true
+    )]
     pub editor_token: Option<String>,
 
-    #[arg(long, env = "IMAGE_ANNOTATION_ADMIN_TOKEN")]
+    #[arg(
+        long,
+        env = "IMAGE_ANNOTATION_ADMIN_TOKEN",
+        hide_env_values = true,
+        hide_default_value = true
+    )]
     pub admin_token: Option<String>,
 
     #[arg(
@@ -78,6 +94,17 @@ impl ServerConfig {
             return Err(ConfigError::new(
                 "token_required_for_non_loopback_bind",
                 "at least one role token is required for a non-loopback bind address",
+            ));
+        }
+
+        if tokens
+            .iter()
+            .flatten()
+            .any(|token| token.len() < MIN_TOKEN_BYTES)
+        {
+            return Err(ConfigError::new(
+                "token_too_short",
+                "configured role tokens must be at least 32 bytes",
             ));
         }
 

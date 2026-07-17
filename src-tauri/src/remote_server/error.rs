@@ -56,10 +56,10 @@ impl ApiError {
     }
 
     pub(crate) fn payload_too_large() -> Self {
-        Self::new(
+        Self::from_rejection(
             StatusCode::PAYLOAD_TOO_LARGE,
             "payload_too_large",
-            "the request body exceeds the configured upload limit",
+            "the request body exceeds the configured limit",
         )
     }
 
@@ -85,6 +85,14 @@ impl ApiError {
         let mut response = (status, Json(envelope)).into_response();
         response.extensions_mut().insert(ErrorEnvelopeMarker);
         response
+    }
+
+    pub(crate) fn from_rejection(
+        status: StatusCode,
+        code: &'static str,
+        message: &'static str,
+    ) -> Self {
+        Self::new(status, code, message)
     }
 
     fn new(status: StatusCode, code: &'static str, message: &'static str) -> Self {
