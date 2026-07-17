@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Component, Path, PathBuf},
     sync::OnceLock,
 };
@@ -194,11 +195,7 @@ pub fn read_manifest(project_id: &str) -> Option<ProjectManifest> {
 
 pub fn write_manifest(manifest: &ProjectManifest) -> Result<(), String> {
     let path = project_paths(&manifest.id).manifest;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    let data = serde_json::to_string_pretty(manifest).map_err(|err| err.to_string())?;
-    fs::write(path, data).map_err(|err| err.to_string())
+    write_manifest_to_path(manifest, &path)
 }
 
 pub fn write_manifest_to_path(manifest: &ProjectManifest, path: &Path) -> Result<(), String> {
@@ -206,7 +203,76 @@ pub fn write_manifest_to_path(manifest: &ProjectManifest, path: &Path) -> Result
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
     let data = serde_json::to_string_pretty(manifest).map_err(|err| err.to_string())?;
-    fs::write(path, data).map_err(|err| err.to_string())
+    let temporary_path = manifest_temporary_path(path);
+    let backup_path = manifest_backup_path(path);
+    remove_file_if_present(&temporary_path)?;
+    let mut temporary = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary_path)
+        .map_err(|err| err.to_string())?;
+    temporary
+        .write_all(data.as_bytes())
+        .and_then(|()| temporary.sync_all())
+        .map_err(|err| err.to_string())?;
+    drop(temporary);
+
+    remove_file_if_present(&backup_path)?;
+    let had_target = path.exists();
+    if had_target {
+        fs::rename(path, &backup_path).map_err(|err| err.to_string())?;
+    }
+    if let Err(error) = fs::rename(&temporary_path, path) {
+        if had_target {
+            let _ = remove_file_if_present(path);
+            if let Err(restore_error) = fs::rename(&backup_path, path) {
+                return Err(format!(
+                    "manifest replacement failed; backup restoration failed: {restore_error}"
+                ));
+            }
+        }
+        return Err(error.to_string());
+    }
+    remove_file_if_present(&backup_path)
+}
+
+pub fn recover_manifest_backup(path: &Path) -> Result<bool, String> {
+    let temporary_path = manifest_temporary_path(path);
+    let backup_path = manifest_backup_path(path);
+    if read_manifest_from_path(path).is_some() {
+        remove_file_if_present(&temporary_path)?;
+        remove_file_if_present(&backup_path)?;
+        return Ok(false);
+    }
+    if read_manifest_from_path(&backup_path).is_none() {
+        return Ok(false);
+    }
+
+    remove_file_if_present(path)?;
+    fs::rename(&backup_path, path).map_err(|err| err.to_string())?;
+    remove_file_if_present(&temporary_path)?;
+    Ok(true)
+}
+
+fn read_manifest_from_path(path: &Path) -> Option<ProjectManifest> {
+    let data = fs::read(path).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+fn manifest_temporary_path(path: &Path) -> PathBuf {
+    path.with_extension("json.tmp")
+}
+
+fn manifest_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
+}
+
+fn remove_file_if_present(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 pub fn list_project_manifests() -> Vec<ProjectManifest> {

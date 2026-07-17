@@ -36,6 +36,13 @@ impl ServerBuildError {
         }
     }
 
+    pub(crate) const fn project_state_conflict() -> Self {
+        Self {
+            code: "project_state_conflict",
+            message: "active and trashed project storage are both present",
+        }
+    }
+
     pub const fn code(&self) -> &'static str {
         self.code
     }

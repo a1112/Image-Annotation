@@ -2,11 +2,11 @@ use std::{
     fs,
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Barrier, OnceLock,
+        Arc, Barrier, Mutex, OnceLock,
     },
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -22,12 +22,13 @@ use axum::{
 use clap::CommandFactory;
 use http_body_util::BodyExt;
 use image_annotation_lib::{
-    project_fs::{self, ProjectManifest},
+    project_fs::ProjectManifest,
     remote_server::{
         build_router, build_router_with_private_routes, shutdown_signal, with_upload_body_limit,
         PrivateRouteGroups, Role, ServerConfig,
     },
 };
+use rusqlite::OptionalExtension;
 use serde_json::Value;
 use tower::ServiceExt;
 
@@ -41,6 +42,7 @@ const HELP_ADMIN_SECRET: &str = "help-admin-0123456789abcdef0123456789abcdef";
 const CONCURRENT_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_CONCURRENT_TEST_DATA_DIR";
 static PROJECT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static PROCESS_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
+static TEST_SCHEMA_MIGRATION: Mutex<()> = Mutex::new(());
 
 struct RemoveDirectoryOnDrop(PathBuf);
 
@@ -48,6 +50,66 @@ impl Drop for RemoveDirectoryOnDrop {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+struct RemoteProjectCleanup {
+    data_dir: PathBuf,
+    project_id: String,
+}
+
+impl RemoteProjectCleanup {
+    fn new(data_dir: &Path, project_id: &str) -> Self {
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            project_id: project_id.to_string(),
+        }
+    }
+}
+
+impl Drop for RemoteProjectCleanup {
+    fn drop(&mut self) {
+        remove_directory_entry(&self.data_dir.join("projects").join(&self.project_id));
+        remove_directory_entry(
+            &self
+                .data_dir
+                .join("trash")
+                .join("projects")
+                .join(&self.project_id),
+        );
+        if let Ok(connection) = rusqlite::Connection::open(self.data_dir.join("server.sqlite")) {
+            let _ = connection.execute(
+                "DELETE FROM trashed_projects WHERE project_id = ?1",
+                [&self.project_id],
+            );
+            let _ = connection.execute(
+                "DELETE FROM project_metadata WHERE project_id = ?1",
+                [&self.project_id],
+            );
+        }
+    }
+}
+
+struct RemoveLinksOnDrop(Vec<PathBuf>);
+
+impl Drop for RemoveLinksOnDrop {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            remove_directory_entry(path);
+        }
+    }
+}
+
+fn remove_directory_entry(path: &Path) {
+    if !path.exists() && fs::symlink_metadata(path).is_err() {
+        return;
+    }
+    if fs::remove_dir(path).is_ok() {
+        return;
+    }
+    if fs::remove_file(path).is_ok() {
+        return;
+    }
+    let _ = fs::remove_dir_all(path);
 }
 
 fn process_data_root() -> PathBuf {
@@ -65,6 +127,19 @@ fn process_data_root() -> PathBuf {
             root
         })
         .clone()
+}
+
+fn run_ignored_test_in_subprocess(test_name: &str) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--ignored", "--nocapture"])
+        .output()
+        .unwrap();
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{rendered}");
 }
 
 fn unique_project(prefix: &str) -> (String, String) {
@@ -85,6 +160,77 @@ fn fixture_manifest(id: &str, name: &str, root: &std::path::Path) -> ProjectMani
         class_count: 0,
         image_count: 0,
     }
+}
+
+fn ensure_lifecycle_test_columns(connection: &rusqlite::Connection) {
+    let _guard = TEST_SCHEMA_MIGRATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !sqlite_column_exists(connection, "trashed_projects", "state") {
+        connection
+            .execute(
+                "ALTER TABLE trashed_projects
+                 ADD COLUMN state TEXT NOT NULL DEFAULT 'trashed'",
+                [],
+            )
+            .unwrap();
+    }
+    if !sqlite_column_exists(connection, "service_audit", "status") {
+        connection
+            .execute(
+                "ALTER TABLE service_audit
+                 ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'",
+                [],
+            )
+            .unwrap();
+    }
+}
+
+fn sqlite_column_exists(connection: &rusqlite::Connection, table: &str, column: &str) -> bool {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap();
+    let exists = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+    exists
+}
+
+fn set_trash_state(connection: &rusqlite::Connection, project_id: &str, state: &str) {
+    connection
+        .execute(
+            r#"
+            INSERT INTO trashed_projects (project_id, trashed_at, state)
+            VALUES (?1, 'interrupted-at', ?2)
+            ON CONFLICT(project_id) DO UPDATE SET state = excluded.state
+            "#,
+            rusqlite::params![project_id, state],
+        )
+        .unwrap();
+}
+
+fn trash_state(data_dir: &Path, project_id: &str) -> Option<String> {
+    rusqlite::Connection::open(data_dir.join("server.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT state FROM trashed_projects WHERE project_id = ?1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn create_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
 }
 
 fn test_config(bind_ip: Ipv4Addr) -> ServerConfig {
@@ -152,6 +298,23 @@ async fn router_request(
     let json = serde_json::from_slice(&body).expect("response should be valid JSON");
 
     (status, headers, json)
+}
+
+async fn create_empty_project(app: &Router, name: &str, project_id: &str) -> Value {
+    let (status, _, project) = router_request(
+        app,
+        Method::POST,
+        "/api/v1/projects",
+        ADMIN_TOKEN,
+        Some(serde_json::json!({
+            "name": name,
+            "datasetType": "yolo-detect"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{project}");
+    assert_eq!(project["data"]["id"], project_id);
+    project
 }
 
 fn assert_request_id(headers: &axum::http::HeaderMap, body: &Value) {
@@ -871,7 +1034,7 @@ async fn admin_project_lifecycle_moves_directories_and_records_audit() {
     assert!(!audit_text.contains(ADMIN_TOKEN));
     for action in [
         "create_project",
-        "rename_project",
+        "update_project",
         "delete_project",
         "restore_project",
     ] {
@@ -888,6 +1051,431 @@ async fn admin_project_lifecycle_moves_directories_and_records_audit() {
             .unwrap();
         assert_eq!(exists, 1, "missing server table {table}");
     }
+}
+
+#[test]
+fn startup_reconciles_interrupted_project_lifecycle_states() {
+    run_ignored_test_in_subprocess("startup_reconciles_interrupted_project_lifecycle_states_child");
+}
+
+#[tokio::test]
+#[ignore]
+async fn startup_reconciles_interrupted_project_lifecycle_states_child() {
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    let cases = [
+        unique_project("Task3 reconcile trashing active"),
+        unique_project("Task3 reconcile trashing trash"),
+        unique_project("Task3 reconcile restoring trash"),
+        unique_project("Task3 reconcile restoring active"),
+    ];
+    let _cleanup: Vec<_> = cases
+        .iter()
+        .map(|(_, project_id)| RemoteProjectCleanup::new(&data_dir, project_id))
+        .collect();
+
+    for (name, project_id) in &cases {
+        create_empty_project(&app, name, project_id).await;
+    }
+
+    let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    ensure_lifecycle_test_columns(&connection);
+    set_trash_state(&connection, &cases[0].1, "trashing");
+    set_trash_state(&connection, &cases[1].1, "trashing");
+    set_trash_state(&connection, &cases[2].1, "restoring");
+    set_trash_state(&connection, &cases[3].1, "restoring");
+    drop(connection);
+
+    for case_index in [1_usize, 2] {
+        fs::rename(
+            data_dir.join("projects").join(&cases[case_index].1),
+            data_dir
+                .join("trash")
+                .join("projects")
+                .join(&cases[case_index].1),
+        )
+        .unwrap();
+    }
+
+    let _reconciled = build_router(config).unwrap();
+
+    for case_index in [0_usize, 1] {
+        let project_id = &cases[case_index].1;
+        assert!(!data_dir.join("projects").join(project_id).exists());
+        assert!(data_dir
+            .join("trash")
+            .join("projects")
+            .join(project_id)
+            .is_dir());
+        assert_eq!(
+            trash_state(&data_dir, project_id).as_deref(),
+            Some("trashed")
+        );
+    }
+    for case_index in [2_usize, 3] {
+        let project_id = &cases[case_index].1;
+        assert!(data_dir.join("projects").join(project_id).is_dir());
+        assert!(!data_dir
+            .join("trash")
+            .join("projects")
+            .join(project_id)
+            .exists());
+        assert_eq!(trash_state(&data_dir, project_id), None);
+    }
+}
+
+#[test]
+fn startup_rejects_active_and_trash_collision_without_changing_either() {
+    run_ignored_test_in_subprocess(
+        "startup_rejects_active_and_trash_collision_without_changing_either_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn startup_rejects_active_and_trash_collision_without_changing_either_child() {
+    let (name, project_id) = unique_project("Task3 reconcile collision");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+    create_empty_project(&app, &name, &project_id).await;
+
+    let active_dir = data_dir.join("projects").join(&project_id);
+    let trash_dir = data_dir.join("trash").join("projects").join(&project_id);
+    fs::create_dir(&trash_dir).unwrap();
+    fs::write(trash_dir.join("collision-marker"), b"do not remove").unwrap();
+    let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    ensure_lifecycle_test_columns(&connection);
+    set_trash_state(&connection, &project_id, "trashing");
+    drop(connection);
+
+    let error = match build_router(config) {
+        Ok(_) => panic!("startup should reject simultaneous active and trash directories"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "project_state_conflict");
+    assert!(active_dir.join("project.json").is_file());
+    assert_eq!(
+        fs::read(trash_dir.join("collision-marker")).unwrap(),
+        b"do not remove"
+    );
+    assert_eq!(
+        trash_state(&data_dir, &project_id).as_deref(),
+        Some("trashing")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_create_for_same_project_id_has_one_winner() {
+    let (name, project_id) = unique_project("Task3 concurrent create");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let first_app = build_router(config.clone()).unwrap();
+    let second_app = build_router(config).unwrap();
+    let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+    let mut requests = Vec::new();
+
+    for index in 0..12 {
+        let app = if index % 2 == 0 {
+            first_app.clone()
+        } else {
+            second_app.clone()
+        };
+        let name = name.clone();
+        requests.push(tokio::spawn(async move {
+            router_request(
+                &app,
+                Method::POST,
+                "/api/v1/projects",
+                ADMIN_TOKEN,
+                Some(serde_json::json!({
+                    "name": name,
+                    "datasetType": "yolo-detect"
+                })),
+            )
+            .await
+            .0
+        }));
+    }
+
+    let mut statuses = Vec::new();
+    for request in requests {
+        statuses.push(request.await.unwrap());
+    }
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CREATED)
+            .count(),
+        1,
+        "{statuses:?}"
+    );
+    assert!(
+        statuses
+            .iter()
+            .filter(|status| **status != StatusCode::CREATED)
+            .all(|status| *status == StatusCode::CONFLICT),
+        "{statuses:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_rename_and_delete_leave_one_consistent_trashed_project() {
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let rename_app = build_router(config.clone()).unwrap();
+    let delete_app = build_router(config).unwrap();
+
+    for _ in 0..10 {
+        let (name, project_id) = unique_project("Task3 concurrent mutation");
+        let renamed = format!("{name} renamed");
+        let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+        create_empty_project(&rename_app, &name, &project_id).await;
+        let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+        ensure_lifecycle_test_columns(&connection);
+        drop(connection);
+        let project_uri = format!("/api/v1/projects/{project_id}");
+
+        let (renamed_response, deleted_response) = tokio::join!(
+            router_request(
+                &rename_app,
+                Method::PATCH,
+                &project_uri,
+                ADMIN_TOKEN,
+                Some(serde_json::json!({"name": renamed}))
+            ),
+            router_request(&delete_app, Method::DELETE, &project_uri, ADMIN_TOKEN, None)
+        );
+
+        assert!(
+            matches!(renamed_response.0, StatusCode::OK | StatusCode::NOT_FOUND),
+            "{}",
+            renamed_response.2
+        );
+        assert_eq!(deleted_response.0, StatusCode::OK, "{}", deleted_response.2);
+        let active_dir = data_dir.join("projects").join(&project_id);
+        let trash_dir = data_dir.join("trash").join("projects").join(&project_id);
+        assert!(!active_dir.exists());
+        assert!(trash_dir.is_dir());
+        assert_eq!(
+            trash_state(&data_dir, &project_id).as_deref(),
+            Some("trashed")
+        );
+
+        let manifest: ProjectManifest =
+            serde_json::from_slice(&fs::read(trash_dir.join("project.json")).unwrap()).unwrap();
+        let indexed_name: String = rusqlite::Connection::open(trash_dir.join("project.sqlite"))
+            .unwrap()
+            .query_row("SELECT name FROM projects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(manifest.name, indexed_name);
+    }
+}
+
+#[tokio::test]
+async fn mutations_record_intent_completion_failure_and_update_action() {
+    let (name, project_id) = unique_project("Task3 audit intent");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+    let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    ensure_lifecycle_test_columns(&connection);
+    drop(connection);
+
+    let created = create_empty_project(&app, &name, &project_id).await;
+    let create_request_id = created["requestId"].as_str().unwrap();
+    let (duplicate_status, _, duplicate) = router_request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        ADMIN_TOKEN,
+        Some(serde_json::json!({
+            "name": name,
+            "datasetType": "yolo-detect"
+        })),
+    )
+    .await;
+    assert_eq!(duplicate_status, StatusCode::CONFLICT, "{duplicate}");
+    let duplicate_request_id = duplicate["requestId"].as_str().unwrap();
+    let (update_status, _, updated) = router_request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/projects/{project_id}"),
+        ADMIN_TOKEN,
+        Some(serde_json::json!({"description": "description only"})),
+    )
+    .await;
+    assert_eq!(update_status, StatusCode::OK, "{updated}");
+    let update_request_id = updated["requestId"].as_str().unwrap();
+
+    let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    let create_status: String = connection
+        .query_row(
+            "SELECT status FROM service_audit WHERE request_id = ?1",
+            [create_request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let duplicate_status: String = connection
+        .query_row(
+            "SELECT status FROM service_audit WHERE request_id = ?1",
+            [duplicate_request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let (update_action, update_status): (String, String) = connection
+        .query_row(
+            "SELECT action, status FROM service_audit WHERE request_id = ?1",
+            [update_request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    assert_eq!(create_status, "completed");
+    assert_eq!(duplicate_status, "failed");
+    assert_eq!(update_action, "update_project");
+    assert_eq!(update_status, "completed");
+}
+
+#[test]
+fn startup_repairs_corrupt_manifest_from_sqlite_and_prefers_valid_backup() {
+    run_ignored_test_in_subprocess(
+        "startup_repairs_corrupt_manifest_from_sqlite_and_prefers_valid_backup_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn startup_repairs_corrupt_manifest_from_sqlite_and_prefers_valid_backup_child() {
+    let (sqlite_name, sqlite_project_id) = unique_project("Task3 sqlite manifest recovery");
+    let (backup_name, backup_project_id) = unique_project("Task3 backup manifest recovery");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    let _sqlite_cleanup = RemoteProjectCleanup::new(&data_dir, &sqlite_project_id);
+    let _backup_cleanup = RemoteProjectCleanup::new(&data_dir, &backup_project_id);
+    create_empty_project(&app, &sqlite_name, &sqlite_project_id).await;
+    create_empty_project(&app, &backup_name, &backup_project_id).await;
+
+    let sqlite_project_dir = data_dir.join("projects").join(&sqlite_project_id);
+    let sqlite_manifest_path = sqlite_project_dir.join("project.json");
+    fs::write(&sqlite_manifest_path, b"{ interrupted manifest").unwrap();
+
+    let backup_project_dir = data_dir.join("projects").join(&backup_project_id);
+    let backup_manifest_path = backup_project_dir.join("project.json");
+    let backup_path = backup_manifest_path.with_extension("json.bak");
+    fs::rename(&backup_manifest_path, &backup_path).unwrap();
+    fs::write(&backup_manifest_path, b"{ interrupted replacement").unwrap();
+    rusqlite::Connection::open(backup_project_dir.join("project.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE projects SET name = 'sqlite fallback should not win' WHERE id = ?1",
+            [&backup_project_id],
+        )
+        .unwrap();
+
+    let repaired_app = build_router(config).unwrap();
+    for (project_id, expected_name) in [
+        (&sqlite_project_id, &sqlite_name),
+        (&backup_project_id, &backup_name),
+    ] {
+        let (status, _, project) = router_request(
+            &repaired_app,
+            Method::GET,
+            &format!("/api/v1/projects/{project_id}"),
+            READER_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{project}");
+        assert_eq!(project["data"]["name"], expected_name.as_str());
+        let manifest: ProjectManifest = serde_json::from_slice(
+            &fs::read(
+                data_dir
+                    .join("projects")
+                    .join(project_id)
+                    .join("project.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.name, expected_name.as_str());
+    }
+    assert!(!backup_path.exists());
+}
+
+#[tokio::test]
+async fn project_mutations_reject_existing_directory_links_outside_configured_roots() {
+    let (_, project_id) = unique_project("Task3 escaped path");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    let active_dir = data_dir.join("projects").join(&project_id);
+    let trash_dir = data_dir.join("trash").join("projects").join(&project_id);
+    let external_dir = std::env::temp_dir().join(format!(
+        "image-annotation-external-project-{}-{}",
+        std::process::id(),
+        PROJECT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&external_dir).unwrap();
+    fs::write(external_dir.join("sentinel"), b"external data").unwrap();
+    let _external_cleanup = RemoveDirectoryOnDrop(external_dir.clone());
+    let _link_cleanup = RemoveLinksOnDrop(vec![active_dir.clone(), trash_dir.clone()]);
+    match create_directory_link(&external_dir, &active_dir) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            return;
+        }
+        Err(error) => panic!("failed to create test directory link: {error}"),
+    }
+
+    let (status, _, response) = router_request(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/projects/{project_id}"),
+        ADMIN_TOKEN,
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{response}");
+    assert_eq!(response["error"]["code"], "storage");
+    assert!(fs::symlink_metadata(&active_dir).is_ok());
+    assert!(fs::symlink_metadata(&trash_dir).is_err());
+    assert_eq!(
+        fs::read(external_dir.join("sentinel")).unwrap(),
+        b"external data"
+    );
+}
+
+#[test]
+fn server_database_uses_wal_after_initialization() {
+    let config = test_config(Ipv4Addr::LOCALHOST);
+    let data_dir = config.data_dir.clone();
+    let _app = build_router(config).unwrap();
+
+    let mode: String = rusqlite::Connection::open(data_dir.join("server.sqlite"))
+        .unwrap()
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode.to_ascii_lowercase(), "wal");
 }
 
 #[tokio::test]
@@ -965,21 +1553,16 @@ async fn project_routes_reject_invalid_input_and_enforce_admin_mutations() {
 }
 
 #[tokio::test]
-async fn remote_projects_never_fall_back_to_test_data_for_corrupt_workspace_manifest() {
+async fn corrupt_workspace_manifest_never_falls_back_outside_the_configured_root() {
     let (workspace_name, project_id) = unique_project("Task3 workspace only");
-    let test_name = format!("{workspace_name} external test fixture");
     let mut config = test_config(Ipv4Addr::LOCALHOST);
     config.reader_token = Some(READER_TOKEN.to_string());
     let data_dir = config.data_dir.clone();
     let app = build_router(config).unwrap();
     let workspace_dir = data_dir.join("projects").join(&project_id);
     let workspace_manifest_path = workspace_dir.join("project.json");
-    let test_dir = project_fs::test_project_paths(&project_id).root;
-    let test_manifest_path = test_dir.join("project.json");
     let _workspace_guard = RemoveDirectoryOnDrop(workspace_dir.clone());
-    let _test_guard = RemoveDirectoryOnDrop(test_dir.clone());
     fs::create_dir_all(&workspace_dir).unwrap();
-    fs::create_dir_all(&test_dir).unwrap();
     fs::write(
         &workspace_manifest_path,
         serde_json::to_vec_pretty(&fixture_manifest(
@@ -988,11 +1571,6 @@ async fn remote_projects_never_fall_back_to_test_data_for_corrupt_workspace_mani
             &workspace_dir,
         ))
         .unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        &test_manifest_path,
-        serde_json::to_vec_pretty(&fixture_manifest(&project_id, &test_name, &test_dir)).unwrap(),
     )
     .unwrap();
 
@@ -1013,8 +1591,7 @@ async fn remote_projects_never_fall_back_to_test_data_for_corrupt_workspace_mani
     );
     assert_eq!(corrupt_project["error"]["code"], "storage");
     let corrupt_response = corrupt_project.to_string();
-    assert!(!corrupt_response.contains(&test_name));
-    assert!(!corrupt_response.contains(&test_dir.to_string_lossy().to_string()));
+    assert!(!corrupt_response.contains(&workspace_dir.to_string_lossy().to_string()));
 
     let (list_status, _, listed) =
         router_request(&app, Method::GET, "/api/v1/projects", READER_TOKEN, None).await;
