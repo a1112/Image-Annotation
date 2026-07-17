@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use axum::{
     body::Body,
     extract::{
@@ -23,6 +25,7 @@ use super::{
         AssetPayload, AssetSource, RemoteSampleService, SamplePatch, SampleQueryOptions,
         ServiceError,
     },
+    Role,
 };
 
 const DEFAULT_SAMPLE_LIMIT: u32 = 50;
@@ -127,6 +130,7 @@ async fn get_sample(
 
 async fn update_sample(
     State(service): State<RemoteSampleService>,
+    Extension(role): Extension<Role>,
     Extension(request_id): Extension<RequestId>,
     path: Result<Path<(String, String)>, PathRejection>,
     payload: Result<Json<UpdateSampleRequest>, JsonRejection>,
@@ -140,10 +144,13 @@ async fn update_sample(
         Ok(payload) => payload,
         Err(error) => return error.into_response(response_request_id),
     };
+    let audit_request_id = response_request_id.clone();
     let result = run_blocking(move || {
         service.update_sample(
             &project_id,
             &sample_id,
+            &audit_request_id,
+            role,
             SamplePatch {
                 split: payload.split,
                 status: payload.status,
@@ -198,6 +205,7 @@ async fn asset_service_response(
         Ok(asset) => asset,
         Err(error) => return ApiError::from(error).into_response(request_id),
     };
+    let content_disposition = content_disposition(&asset.download_name);
     if request_headers
         .get(header::IF_NONE_MATCH)
         .is_some_and(|value| etag_matches(value, &asset.etag))
@@ -206,6 +214,7 @@ async fn asset_service_response(
             StatusCode::NOT_MODIFIED,
             asset.content_type,
             &asset.etag,
+            content_disposition,
             None,
             asset.size,
             Body::empty(),
@@ -230,6 +239,9 @@ async fn asset_service_response(
                     HeaderValue::from_str(&format!("bytes */{size}"))
                         .expect("content range is valid"),
                 );
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_DISPOSITION, content_disposition);
                 return response;
             }
         },
@@ -247,6 +259,7 @@ async fn asset_service_response(
                 StatusCode::PARTIAL_CONTENT,
                 asset.content_type,
                 &asset.etag,
+                content_disposition,
                 Some((start, end, size)),
                 length,
                 body,
@@ -261,6 +274,7 @@ async fn asset_service_response(
                 StatusCode::OK,
                 asset.content_type,
                 &asset.etag,
+                content_disposition,
                 None,
                 size,
                 body,
@@ -302,6 +316,7 @@ fn asset_response(
     status: StatusCode,
     content_type: &'static str,
     etag: &str,
+    content_disposition: HeaderValue,
     content_range: Option<(u64, u64, u64)>,
     content_length: u64,
     body: Body,
@@ -310,6 +325,7 @@ fn asset_response(
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::ETAG, etag)
+        .header(header::CONTENT_DISPOSITION, content_disposition)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, content_length)
         .body(body)
@@ -322,6 +338,44 @@ fn asset_response(
         );
     }
     response
+}
+
+fn content_disposition(download_name: &str) -> HeaderValue {
+    let mut fallback = download_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, ' ' | '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if fallback.trim_matches(['.', ' ']).is_empty() {
+        fallback = "download".to_string();
+    }
+    let encoded = rfc5987_encode(download_name);
+    HeaderValue::from_str(&format!(
+        "inline; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+    ))
+    .expect("sanitized content disposition is valid")
+}
+
+fn rfc5987_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            )
+        {
+            encoded.push(char::from(byte));
+        } else {
+            write!(&mut encoded, "%{byte:02X}").expect("writing to a string cannot fail");
+        }
+    }
+    encoded
 }
 
 fn etag_matches(value: &HeaderValue, etag: &str) -> bool {

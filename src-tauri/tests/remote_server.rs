@@ -724,6 +724,36 @@ fn sha256_etag(bytes: &[u8]) -> String {
     format!("\"sha256-{encoded}\"")
 }
 
+fn bmp_fixture_bytes() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(70);
+    bytes.extend_from_slice(b"BM");
+    bytes.extend_from_slice(&70_u32.to_le_bytes());
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(&54_u32.to_le_bytes());
+    bytes.extend_from_slice(&40_u32.to_le_bytes());
+    bytes.extend_from_slice(&2_i32.to_le_bytes());
+    bytes.extend_from_slice(&2_i32.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&24_u16.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&[0; 16]);
+    bytes.extend_from_slice(&[0, 0, 255, 0, 255, 0, 0, 0]);
+    bytes.extend_from_slice(&[255, 0, 0, 255, 255, 255, 0, 0]);
+    bytes
+}
+
+fn webp_fixture_bytes() -> Vec<u8> {
+    let pixels =
+        image::RgbImage::from_raw(2, 2, vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255])
+            .unwrap();
+    let mut output = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(pixels)
+        .write_to(&mut output, image::ImageFormat::WebP)
+        .unwrap();
+    output.into_inner()
+}
+
 fn assert_request_id(headers: &axum::http::HeaderMap, body: &Value) {
     let header_request_id = headers
         .get("x-request-id")
@@ -3454,6 +3484,66 @@ async fn sample_detail_and_patch_validate_fields_and_roles_child() {
     assert_eq!(updated["data"]["reviewNote"], "needs another pass");
     assert_eq!(updated["data"]["annotationRevision"], "fixture-revision");
 
+    let patch_request_id = updated["requestId"].as_str().unwrap();
+    let server = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    let (
+        audit_role,
+        audit_action,
+        audit_project_id,
+        audit_image_id,
+        audit_state,
+        audit_message,
+        audit_payload,
+    ): (String, String, String, String, String, String, String) = server
+        .query_row(
+            "SELECT role, action, project_id, image_id, state, message, payload
+             FROM service_audit WHERE request_id = ?1",
+            [patch_request_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(audit_role, "editor");
+    assert_eq!(audit_action, "update_sample_metadata");
+    assert_eq!(audit_project_id, project_id);
+    assert_eq!(audit_image_id, "demo_001");
+    assert_eq!(audit_state, "completed");
+    assert_eq!(audit_message, "sample metadata updated");
+    let audit_payload: Value = serde_json::from_str(&audit_payload).unwrap();
+    assert_eq!(audit_payload["projectId"], project_id);
+    assert_eq!(audit_payload["imageId"], "demo_001");
+    assert_eq!(audit_payload["patch"]["split"], "val");
+    assert_eq!(audit_payload["patch"]["status"], "草稿");
+
+    let missing_uri = format!("/api/v1/projects/{project_id}/samples/missing-sample");
+    let (missing_status, _, missing) = router_request(
+        &app,
+        Method::PATCH,
+        &missing_uri,
+        EDITOR_TOKEN,
+        Some(serde_json::json!({"split": "test"})),
+    )
+    .await;
+    assert_eq!(missing_status, StatusCode::NOT_FOUND, "{missing}");
+    let completed_missing: u64 = server
+        .query_row(
+            "SELECT COUNT(*) FROM service_audit
+             WHERE request_id = ?1 AND action = 'update_sample_metadata' AND state = 'completed'",
+            [missing["requestId"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(completed_missing, 0);
+
     for invalid in [
         serde_json::json!({"split": "production"}),
         serde_json::json!({"status": "deleted"}),
@@ -3527,8 +3617,29 @@ async fn sample_content_supports_etag_head_and_single_byte_ranges_child() {
     let mut config = test_config(Ipv4Addr::LOCALHOST);
     config.reader_token = Some(READER_TOKEN.to_string());
     config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
     let app = build_router(config).unwrap();
     create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let original_dir = project_dir.join("assets").join("original");
+    let nested_dir = original_dir.join("nested");
+    fs::create_dir(&nested_dir).unwrap();
+    let indexed_name = "nested/报告 sample; 100%.png";
+    fs::copy(
+        original_dir
+            .join("images")
+            .join("train")
+            .join("demo_001.png"),
+        nested_dir.join("报告 sample; 100%.png"),
+    )
+    .unwrap();
+    rusqlite::Connection::open(project_dir.join("project.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE images SET file_name = ?1 WHERE id = 'demo_001'",
+            [indexed_name],
+        )
+        .unwrap();
     let uri = format!("/api/v1/projects/{project_id}/samples/demo_001/content");
 
     let (status, headers, bytes) =
@@ -3538,6 +3649,18 @@ async fn sample_content_supports_etag_head_and_single_byte_ranges_child() {
     assert_eq!(headers[header::ACCEPT_RANGES], "bytes");
     assert!(!bytes.is_empty());
     let etag = headers[header::ETAG].to_str().unwrap().to_string();
+    let disposition = headers[header::CONTENT_DISPOSITION].to_str().unwrap();
+    assert!(disposition.starts_with("inline; filename=\""));
+    assert!(disposition.contains("filename*=UTF-8''"));
+    assert!(disposition.contains("%E6%8A%A5%E5%91%8A"));
+    assert!(disposition.contains("%3B"));
+    assert!(disposition.contains("%25"));
+    assert!(!disposition.contains("sample; 100%"));
+    assert!(!disposition.contains("nested"));
+    assert!(!disposition.contains('\\'));
+    assert!(!disposition.contains('\r'));
+    assert!(!disposition.contains('\n'));
+    assert!(!disposition.contains(&data_dir.to_string_lossy().to_string()));
 
     let (cached_status, cached_headers, cached_body) = router_raw_request(
         &app,
@@ -3549,6 +3672,10 @@ async fn sample_content_supports_etag_head_and_single_byte_ranges_child() {
     .await;
     assert_eq!(cached_status, StatusCode::NOT_MODIFIED);
     assert_eq!(cached_headers[header::ETAG], etag);
+    assert_eq!(
+        cached_headers[header::CONTENT_DISPOSITION],
+        headers[header::CONTENT_DISPOSITION]
+    );
     assert!(cached_body.is_empty());
 
     let (head_status, head_headers, head_body) =
@@ -3556,6 +3683,10 @@ async fn sample_content_supports_etag_head_and_single_byte_ranges_child() {
     assert_eq!(head_status, StatusCode::OK);
     assert_eq!(head_headers[header::CONTENT_TYPE], "image/png");
     assert_eq!(head_headers[header::ETAG], etag);
+    assert_eq!(
+        head_headers[header::CONTENT_DISPOSITION],
+        headers[header::CONTENT_DISPOSITION]
+    );
     assert!(head_body.is_empty());
 
     let (range_status, range_headers, range_body) = router_raw_request(
@@ -3573,6 +3704,10 @@ async fn sample_content_supports_etag_head_and_single_byte_ranges_child() {
         format!("bytes 0-9/{}", bytes.len())
     );
     assert_eq!(range_headers[header::ACCEPT_RANGES], "bytes");
+    assert_eq!(
+        range_headers[header::CONTENT_DISPOSITION],
+        headers[header::CONTENT_DISPOSITION]
+    );
 
     for range in ["bytes=999999-", "bytes=0-1,4-5", "items=0-1"] {
         let (range_status, range_headers, range_body) =
@@ -3618,6 +3753,9 @@ async fn thumbnail_is_generated_in_project_storage_with_sha256_etag_child() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::CONTENT_TYPE], "image/jpeg");
     assert_eq!(headers[header::ETAG], sha256_etag(&bytes));
+    let disposition = headers[header::CONTENT_DISPOSITION].to_str().unwrap();
+    assert!(disposition.starts_with("inline; filename=\""));
+    assert!(disposition.contains("demo_001-thumbnail.jpg"));
     let files = fs::read_dir(&thumbnail_dir)
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
@@ -3629,7 +3767,7 @@ async fn thumbnail_is_generated_in_project_storage_with_sha256_etag_child() {
     assert!(width <= 320 && height <= 320);
 
     let etag = headers[header::ETAG].to_str().unwrap().to_string();
-    let (cached_status, _, cached_body) = router_raw_request(
+    let (cached_status, cached_headers, cached_body) = router_raw_request(
         &app,
         Method::GET,
         &uri,
@@ -3638,7 +3776,94 @@ async fn thumbnail_is_generated_in_project_storage_with_sha256_etag_child() {
     )
     .await;
     assert_eq!(cached_status, StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        cached_headers[header::CONTENT_DISPOSITION],
+        headers[header::CONTENT_DISPOSITION]
+    );
     assert!(cached_body.is_empty());
+}
+
+async fn assert_thumbnail_fixture_supported(
+    name_prefix: &str,
+    extension: &str,
+    content_type: &str,
+    source: Vec<u8>,
+) {
+    let decoded_source = image::load_from_memory(&source).unwrap();
+    assert!(decoded_source.width() > 0);
+    assert!(decoded_source.height() > 0);
+    let (name, project_id) = unique_project(name_prefix);
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let file_name = format!("fixture.{extension}");
+    fs::write(
+        project_dir.join("assets").join("original").join(&file_name),
+        &source,
+    )
+    .unwrap();
+    rusqlite::Connection::open(project_dir.join("project.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE images SET file_name = ?1, width = 2, height = 2 WHERE id = 'demo_001'",
+            [&file_name],
+        )
+        .unwrap();
+
+    let content_uri = format!("/api/v1/projects/{project_id}/samples/demo_001/content");
+    let (content_status, content_headers, content) =
+        router_raw_request(&app, Method::GET, &content_uri, READER_TOKEN, &[]).await;
+    assert_eq!(content_status, StatusCode::OK);
+    assert_eq!(content_headers[header::CONTENT_TYPE], content_type);
+    assert_eq!(content, source);
+
+    let thumbnail_uri = format!("/api/v1/projects/{project_id}/samples/demo_001/thumbnail");
+    let (thumbnail_status, thumbnail_headers, thumbnail) =
+        router_raw_request(&app, Method::GET, &thumbnail_uri, READER_TOKEN, &[]).await;
+    assert_eq!(thumbnail_status, StatusCode::OK);
+    assert_eq!(thumbnail_headers[header::CONTENT_TYPE], "image/jpeg");
+    let decoded_thumbnail = image::load_from_memory(&thumbnail).unwrap();
+    assert!(decoded_thumbnail.width() > 0 && decoded_thumbnail.width() <= 320);
+    assert!(decoded_thumbnail.height() > 0 && decoded_thumbnail.height() <= 320);
+    assert_eq!(thumbnail_headers[header::ETAG], sha256_etag(&thumbnail));
+}
+
+#[test]
+fn bmp_sample_generates_a_jpeg_thumbnail() {
+    run_ignored_test_in_subprocess("bmp_sample_generates_a_jpeg_thumbnail_child");
+}
+
+#[tokio::test]
+#[ignore]
+async fn bmp_sample_generates_a_jpeg_thumbnail_child() {
+    assert_thumbnail_fixture_supported(
+        "Task4 BMP thumbnail",
+        "bmp",
+        "image/bmp",
+        bmp_fixture_bytes(),
+    )
+    .await;
+}
+
+#[test]
+fn webp_sample_generates_a_jpeg_thumbnail() {
+    run_ignored_test_in_subprocess("webp_sample_generates_a_jpeg_thumbnail_child");
+}
+
+#[tokio::test]
+#[ignore]
+async fn webp_sample_generates_a_jpeg_thumbnail_child() {
+    assert_thumbnail_fixture_supported(
+        "Task4 WebP thumbnail",
+        "webp",
+        "image/webp",
+        webp_fixture_bytes(),
+    )
+    .await;
 }
 
 #[test]

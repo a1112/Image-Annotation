@@ -900,6 +900,34 @@ pub fn update_sample_metadata(
     Ok(updated == 1)
 }
 
+pub fn restore_sample_metadata(
+    path: &Path,
+    image_id: &str,
+    split: &str,
+    status: &str,
+    qa_status: &str,
+    review_note: Option<&str>,
+) -> Result<(), String> {
+    initialize_project_database(path)?;
+    validate_project_database_artifacts(path)?;
+    let connection = open_project_database_writable(path)?;
+    validate_project_database_artifacts(path)?;
+    let updated = connection
+        .execute(
+            "UPDATE images
+             SET split = ?2, status = ?3, qa_status = ?4, review_note = ?5
+             WHERE id = ?1",
+            params![image_id, split, status, qa_status, review_note],
+        )
+        .map_err(|err| err.to_string())?;
+    validate_project_database_artifacts(path)?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err("sample metadata rollback target was not found".to_string())
+    }
+}
+
 fn open_project_database_read_only(path: &Path) -> Result<Connection, String> {
     Connection::open_with_flags(
         path,

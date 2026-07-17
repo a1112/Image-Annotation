@@ -139,12 +139,21 @@ pub(super) struct SampleQueryOptions {
     pub query: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct SamplePatch {
     pub split: Option<String>,
     pub status: Option<String>,
     pub qa_status: Option<String>,
     pub review_note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SampleMutationPayload<'a> {
+    project_id: &'a str,
+    image_id: &'a str,
+    patch: &'a SamplePatch,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -194,6 +203,7 @@ pub(super) struct AssetPayload {
     pub size: u64,
     pub content_type: &'static str,
     pub etag: String,
+    pub download_name: String,
 }
 
 struct SampleProjectContext {
@@ -323,6 +333,8 @@ impl RemoteSampleService {
         &self,
         project_id: &str,
         sample_id: &str,
+        request_id: &str,
+        role: Role,
         patch: SamplePatch,
     ) -> Result<SampleView, ServiceError> {
         self.ensure_configured_root()?;
@@ -331,7 +343,26 @@ impl RemoteSampleService {
         validate_sample_patch(&patch)?;
         let _mutation_guard = mutation_guard();
         let context = self.sample_project_context(project_id)?;
-        let updated = project_storage::update_sample_metadata(
+        let previous = self.stored_sample(&context, sample_id)?;
+        let operation_payload = serde_json::to_string(&SampleMutationPayload {
+            project_id,
+            image_id: sample_id,
+            patch: &patch,
+        })
+        .map_err(storage_failure)?;
+        let operation = self
+            .storage
+            .begin_audit(AuditEntry {
+                request_id,
+                role: role_name(role),
+                action: "update_sample_metadata",
+                project_id: Some(project_id),
+                image_id: Some(sample_id),
+                message: "sample metadata update requested",
+                payload: &operation_payload,
+            })
+            .map_err(storage_failure)?;
+        let updated = match project_storage::update_sample_metadata(
             &context.sqlite,
             sample_id,
             patch.split.as_deref(),
@@ -339,11 +370,40 @@ impl RemoteSampleService {
             patch.qa_status.as_deref(),
             patch.review_note.as_deref(),
         )
-        .map_err(storage_failure)?;
+        .map_err(storage_failure)
+        {
+            Ok(updated) => updated,
+            Err(error) => {
+                self.fail_audit_best_effort(&operation, failure_message(error));
+                return Err(error);
+            }
+        };
         if !updated {
+            self.fail_audit_best_effort(&operation, failure_message(ServiceError::NotFound));
             return Err(ServiceError::NotFound);
         }
-        self.get_sample_locked(project_id, sample_id)
+        let updated_sample = self
+            .refresh_sample_classes(&context)
+            .and_then(|()| self.stored_sample(&context, sample_id))
+            .and_then(sample_view);
+        let updated_sample = match updated_sample {
+            Ok(updated_sample) => updated_sample,
+            Err(error) => {
+                self.restore_sample_metadata_best_effort(&context, &previous);
+                self.fail_audit_best_effort(&operation, failure_message(error));
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .storage
+            .complete_audit(&operation, "sample metadata updated")
+        {
+            tracing::error!(%error, "failed to complete sample metadata audit operation");
+            self.restore_sample_metadata_best_effort(&context, &previous);
+            self.fail_audit_best_effort(&operation, failure_message(ServiceError::Storage));
+            return Err(ServiceError::Storage);
+        }
+        Ok(updated_sample)
     }
 
     pub(super) fn sample_content(
@@ -366,6 +426,7 @@ impl RemoteSampleService {
         Ok(AssetPayload {
             content_type: image_content_type(&path)?,
             etag: metadata_etag(&metadata),
+            download_name: indexed_download_name(&sample.image.file_name, sample_id)?,
             size: metadata.len(),
             source: AssetSource::File(file),
         })
@@ -407,6 +468,7 @@ impl RemoteSampleService {
         Ok(AssetPayload {
             etag: format!("\"sha256-{}\"", sha256_hex(&bytes)),
             content_type: "image/jpeg",
+            download_name: thumbnail_download_name(&sample.image.file_name, sample_id)?,
             size: bytes.len() as u64,
             source: AssetSource::Bytes(bytes),
         })
@@ -1822,6 +1884,23 @@ impl RemoteSampleService {
         }
     }
 
+    fn restore_sample_metadata_best_effort(
+        &self,
+        context: &SampleProjectContext,
+        previous: &StoredSample,
+    ) {
+        if let Err(error) = project_storage::restore_sample_metadata(
+            &context.sqlite,
+            &previous.image.id,
+            &previous.image.split,
+            &previous.image.status,
+            &previous.image.qa_status,
+            previous.image.review_note.as_deref(),
+        ) {
+            tracing::error!(%error, "failed to roll back sample metadata update");
+        }
+    }
+
     fn fail_audit_best_effort(&self, operation: &AuditOperation, message: &str) {
         if let Err(error) = self.storage.fail_audit(operation, message) {
             tracing::error!(%error, "failed to record project audit failure");
@@ -2163,6 +2242,45 @@ fn image_content_type(path: &Path) -> Result<&'static str, ServiceError> {
         Some("bmp") => Ok("image/bmp"),
         Some("webp") => Ok("image/webp"),
         _ => Err(ServiceError::UnsupportedMedia),
+    }
+}
+
+fn indexed_download_name(value: &str, sample_id: &str) -> Result<String, ServiceError> {
+    let relative = validated_relative_asset_path(value)?;
+    let file_name = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(sample_id);
+    Ok(sanitize_download_name(file_name, sample_id))
+}
+
+fn thumbnail_download_name(value: &str, sample_id: &str) -> Result<String, ServiceError> {
+    let source_name = indexed_download_name(value, sample_id)?;
+    let stem = Path::new(&source_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(sample_id);
+    Ok(format!(
+        "{}-thumbnail.jpg",
+        sanitize_download_name(stem, sample_id)
+    ))
+}
+
+fn sanitize_download_name(value: &str, fallback: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '"' | '\\' | '/') {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if sanitized.trim_matches(['.', ' ']).is_empty() {
+        fallback.to_string()
+    } else {
+        sanitized
     }
 }
 
