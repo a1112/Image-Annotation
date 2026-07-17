@@ -13,15 +13,14 @@ use axum::{
     body::Body,
     extract::Multipart,
     http::{header, Method, Request, StatusCode},
-    middleware,
     routing::post,
     Router,
 };
 use clap::CommandFactory;
 use http_body_util::BodyExt;
 use image_annotation_lib::remote_server::{
-    build_router, build_router_with_private_routes, require_role, shutdown_signal,
-    with_upload_body_limit, Role, ServerConfig,
+    build_router, build_router_with_private_routes, shutdown_signal, with_upload_body_limit,
+    PrivateRouteGroups, Role, ServerConfig,
 };
 use serde_json::Value;
 use tower::ServiceExt;
@@ -390,44 +389,124 @@ async fn reader_cannot_admin() {
 }
 
 #[tokio::test]
-async fn require_role_layer_blocks_before_handler() {
-    let handler_called = Arc::new(AtomicBool::new(false));
-    let handler_state = handler_called.clone();
-    let protected_routes = Router::new()
-        .route(
-            "/admin-probe",
-            post(move || {
-                let handler_state = handler_state.clone();
-                async move {
-                    handler_state.store(true, Ordering::SeqCst);
-                    StatusCode::NO_CONTENT
-                }
-            }),
-        )
-        .route_layer(middleware::from_fn_with_state(Role::Admin, require_role));
+async fn role_classified_routes_enforce_editor_and_admin_before_handlers() {
+    let editor_called = Arc::new(AtomicBool::new(false));
+    let editor_state = editor_called.clone();
+    let editor_routes = Router::new().route(
+        "/editor-probe",
+        post(move || {
+            let editor_state = editor_state.clone();
+            async move {
+                editor_state.store(true, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }
+        }),
+    );
+    let admin_called = Arc::new(AtomicBool::new(false));
+    let admin_state = admin_called.clone();
+    let admin_routes = Router::new().route(
+        "/admin-probe",
+        post(move || {
+            let admin_state = admin_state.clone();
+            async move {
+                admin_state.store(true, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }
+        }),
+    );
     let mut config = test_config(Ipv4Addr::LOCALHOST);
     config.reader_token = Some(READER_TOKEN.to_string());
-    let app = build_router_with_private_routes(config, protected_routes).unwrap();
-    let response = app
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let groups = PrivateRouteGroups::default()
+        .with_editor(editor_routes)
+        .with_admin(admin_routes);
+    let app = build_router_with_private_routes(config, groups).unwrap();
+
+    let reader_response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/admin-probe")
+                .uri("/api/v1/editor-probe")
                 .header(header::AUTHORIZATION, format!("Bearer {READER_TOKEN}"))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    let status = response.status();
-    let headers = response.headers().clone();
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let json: Value = serde_json::from_slice(&body).unwrap();
+    let reader_status = reader_response.status();
+    let reader_headers = reader_response.headers().clone();
+    let reader_body = reader_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let reader_json: Value = serde_json::from_slice(&reader_body).unwrap();
 
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(json["error"]["code"], "forbidden");
-    assert!(!handler_called.load(Ordering::SeqCst));
-    assert_request_id(&headers, &json);
+    assert_eq!(reader_status, StatusCode::FORBIDDEN);
+    assert_eq!(reader_json["error"]["code"], "forbidden");
+    assert!(!editor_called.load(Ordering::SeqCst));
+    assert_request_id(&reader_headers, &reader_json);
+
+    let editor_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/editor-probe")
+                .header(header::AUTHORIZATION, format!("Bearer {EDITOR_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(editor_response.status(), StatusCode::NO_CONTENT);
+    assert!(editor_called.load(Ordering::SeqCst));
+
+    let editor_admin_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin-probe")
+                .header(header::AUTHORIZATION, format!("Bearer {EDITOR_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let editor_admin_status = editor_admin_response.status();
+    let editor_admin_headers = editor_admin_response.headers().clone();
+    let editor_admin_body = editor_admin_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let editor_admin_json: Value = serde_json::from_slice(&editor_admin_body).unwrap();
+
+    assert_eq!(editor_admin_status, StatusCode::FORBIDDEN);
+    assert_eq!(editor_admin_json["error"]["code"], "forbidden");
+    assert!(!admin_called.load(Ordering::SeqCst));
+    assert_request_id(&editor_admin_headers, &editor_admin_json);
+
+    let admin_response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin-probe")
+                .header(header::AUTHORIZATION, format!("Bearer {ADMIN_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(admin_response.status(), StatusCode::NO_CONTENT);
+    assert!(admin_called.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -693,19 +772,20 @@ async fn configured_limit_overrides_multipart_default() {
     let body = multipart_body(BOUNDARY, 2 * 1024 * 1024 + 64 * 1024);
 
     let mut config = test_config(Ipv4Addr::LOCALHOST);
-    config.reader_token = Some(READER_TOKEN.to_string());
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
     config.max_upload_bytes = 4 * 1024 * 1024;
-    let private_routes = with_upload_body_limit(
+    let editor_routes = with_upload_body_limit(
         Router::new().route("/multipart-probe", post(accept_multipart)),
         config.max_upload_bytes,
     );
-    let app = build_router_with_private_routes(config, private_routes).unwrap();
+    let groups = PrivateRouteGroups::default().with_editor(editor_routes);
+    let app = build_router_with_private_routes(config, groups).unwrap();
     let response = app
         .oneshot(
             Request::builder()
                 .method(Method::POST)
                 .uri("/api/v1/multipart-probe")
-                .header(header::AUTHORIZATION, format!("Bearer {READER_TOKEN}"))
+                .header(header::AUTHORIZATION, format!("Bearer {EDITOR_TOKEN}"))
                 .header(
                     header::CONTENT_TYPE,
                     format!("multipart/form-data; boundary={BOUNDARY}"),
@@ -728,19 +808,20 @@ async fn upload_limit_leaves_room_for_multipart_framing() {
     assert!(body.len() > FILE_BYTES);
 
     let mut config = test_config(Ipv4Addr::LOCALHOST);
-    config.reader_token = Some(READER_TOKEN.to_string());
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
     config.max_upload_bytes = FILE_BYTES;
-    let private_routes = with_upload_body_limit(
+    let editor_routes = with_upload_body_limit(
         Router::new().route("/multipart-framing-probe", post(accept_multipart)),
         config.max_upload_bytes,
     );
-    let app = build_router_with_private_routes(config, private_routes).unwrap();
+    let groups = PrivateRouteGroups::default().with_editor(editor_routes);
+    let app = build_router_with_private_routes(config, groups).unwrap();
     let response = app
         .oneshot(
             Request::builder()
                 .method(Method::POST)
                 .uri("/api/v1/multipart-framing-probe")
-                .header(header::AUTHORIZATION, format!("Bearer {READER_TOKEN}"))
+                .header(header::AUTHORIZATION, format!("Bearer {EDITOR_TOKEN}"))
                 .header(
                     header::CONTENT_TYPE,
                     format!("multipart/form-data; boundary={BOUNDARY}"),

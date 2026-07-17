@@ -28,29 +28,52 @@ const MULTIPART_FRAMING_ALLOWANCE_BYTES: usize = 1024 * 1024;
 pub use auth::Role;
 pub use config::{ConfigError, ServerConfig};
 
+#[derive(Default)]
+pub struct PrivateRouteGroups {
+    reader: Option<Router>,
+    editor: Option<Router>,
+    admin: Option<Router>,
+}
+
+impl PrivateRouteGroups {
+    pub fn with_reader(mut self, routes: Router) -> Self {
+        self.reader = Some(merge_optional_router(self.reader, routes));
+        self
+    }
+
+    pub fn with_editor(mut self, routes: Router) -> Self {
+        self.editor = Some(merge_optional_router(self.editor, routes));
+        self
+    }
+
+    pub fn with_admin(mut self, routes: Router) -> Self {
+        self.admin = Some(merge_optional_router(self.admin, routes));
+        self
+    }
+}
+
 pub fn build_router(config: ServerConfig) -> Result<Router, ConfigError> {
-    build_router_with_private_routes(config, Router::new())
+    build_router_with_private_routes(config, PrivateRouteGroups::default())
 }
 
 pub fn build_router_with_private_routes(
     config: ServerConfig,
-    additional_private_routes: Router,
+    private_route_groups: PrivateRouteGroups,
 ) -> Result<Router, ConfigError> {
     config.validate()?;
 
     let authenticator = Arc::new(TokenAuthenticator::from_config(&config));
-    let admin_routes = Router::new()
-        .route("/api/v1/projects", post(create_project))
-        .route_layer(middleware::from_fn_with_state(Role::Admin, require_role));
-    let project_routes = with_api_body_limit(
-        Router::new()
-            .route("/api/v1/projects", get(list_projects))
-            .merge(admin_routes),
-    );
+    let private_route_groups = private_route_groups
+        .with_reader(with_api_body_limit(
+            Router::new().route("/projects", get(list_projects)),
+        ))
+        .with_admin(with_api_body_limit(
+            Router::new().route("/projects", post(create_project)),
+        ));
+    let private_routes = protect_private_route_groups(private_route_groups);
     let routes = Router::new()
         .route("/api/v1/health", get(health))
-        .merge(project_routes)
-        .nest("/api/v1", additional_private_routes)
+        .nest("/api/v1", private_routes)
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(DEFAULT_API_BODY_LIMIT_BYTES))
@@ -66,6 +89,28 @@ pub fn build_router_with_private_routes(
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(RequestIdGenerator))
         .layer(middleware::from_fn(remove_incoming_request_id)))
+}
+
+fn merge_optional_router(existing: Option<Router>, routes: Router) -> Router {
+    match existing {
+        Some(existing) => existing.merge(routes),
+        None => routes,
+    }
+}
+
+fn protect_private_route_groups(groups: PrivateRouteGroups) -> Router {
+    [
+        (groups.reader, Role::Reader),
+        (groups.editor, Role::Editor),
+        (groups.admin, Role::Admin),
+    ]
+    .into_iter()
+    .fold(Router::new(), |router, (routes, role)| {
+        let Some(routes) = routes else {
+            return router;
+        };
+        router.merge(routes.route_layer(middleware::from_fn_with_state(role, require_role)))
+    })
 }
 
 fn with_api_body_limit(router: Router) -> Router {
@@ -146,11 +191,7 @@ async fn authenticate_private_api(
     }
 }
 
-pub async fn require_role(
-    State(required_role): State<Role>,
-    request: Request,
-    next: Next,
-) -> Response {
+async fn require_role(State(required_role): State<Role>, request: Request, next: Next) -> Response {
     match request.extensions().get::<Role>().copied() {
         Some(role) if role.allows(required_role) => next.run(request).await,
         Some(_) => ApiError::forbidden().into_response(request_id(request.extensions())),
