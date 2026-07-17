@@ -6,6 +6,7 @@ pub mod http_backend;
 pub mod importers;
 mod platform;
 pub mod project_fs;
+pub mod remote_server;
 pub mod storage;
 pub mod windows;
 
