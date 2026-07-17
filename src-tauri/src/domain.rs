@@ -308,10 +308,16 @@ impl SampleRepository {
     }
 
     pub fn workspace_dataset_projects(&self) -> Vec<DatasetProject> {
-        self.dataset_projects_from(
+        self.workspace_dataset_projects_from_manifests(
             project_fs::list_workspace_project_manifests(),
-            project_fs::workspace_project_paths,
         )
+    }
+
+    pub fn workspace_dataset_projects_from_manifests(
+        &self,
+        manifests: Vec<project_fs::ProjectManifest>,
+    ) -> Vec<DatasetProject> {
+        self.dataset_projects_from(manifests, project_fs::workspace_project_paths)
     }
 
     fn dataset_projects_from(

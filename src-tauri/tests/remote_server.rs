@@ -9,7 +9,7 @@ use std::{
         Arc, Barrier, Mutex, OnceLock,
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -40,6 +40,8 @@ const HELP_READER_SECRET: &str = "help-reader-0123456789abcdef0123456789abcdef";
 const HELP_EDITOR_SECRET: &str = "help-editor-0123456789abcdef0123456789abcdef";
 const HELP_ADMIN_SECRET: &str = "help-admin-0123456789abcdef0123456789abcdef";
 const CONCURRENT_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_CONCURRENT_TEST_DATA_DIR";
+const ISOLATED_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_ISOLATED_TEST_DATA_DIR";
+const LEASE_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_LEASE_TEST_DATA_DIR";
 static PROJECT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static PROCESS_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
 static TEST_SCHEMA_MIGRATION: Mutex<()> = Mutex::new(());
@@ -115,6 +117,11 @@ fn remove_directory_entry(path: &Path) {
 fn process_data_root() -> PathBuf {
     PROCESS_DATA_ROOT
         .get_or_init(|| {
+            if let Some(root) = std::env::var_os(ISOLATED_DATA_DIR_ENV) {
+                let root = PathBuf::from(root);
+                fs::create_dir_all(&root).unwrap();
+                return root;
+            }
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -130,8 +137,10 @@ fn process_data_root() -> PathBuf {
 }
 
 fn run_ignored_test_in_subprocess(test_name: &str) {
+    let data_dir = unique_temp_root("image-annotation-isolated-child");
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test_name, "--ignored", "--nocapture"])
+        .env(ISOLATED_DATA_DIR_ENV, &data_dir)
         .output()
         .unwrap();
     let rendered = format!(
@@ -139,6 +148,7 @@ fn run_ignored_test_in_subprocess(test_name: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let _ = fs::remove_dir_all(data_dir);
     assert!(output.status.success(), "{rendered}");
 }
 
@@ -149,17 +159,12 @@ fn unique_project(prefix: &str) -> (String, String) {
     (name, id)
 }
 
-fn fixture_manifest(id: &str, name: &str, root: &std::path::Path) -> ProjectManifest {
-    ProjectManifest {
-        id: id.to_string(),
-        name: name.to_string(),
-        source_dataset_key: "remote-workspace-test".to_string(),
-        format: "yolo-detect".to_string(),
-        root_path: root.to_string_lossy().to_string(),
-        created_at: "fixture-created-at".to_string(),
-        class_count: 0,
-        image_count: 0,
-    }
+fn unique_temp_root(prefix: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        PROJECT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn ensure_lifecycle_test_columns(connection: &rusqlite::Connection) {
@@ -184,6 +189,41 @@ fn ensure_lifecycle_test_columns(connection: &rusqlite::Connection) {
             )
             .unwrap();
     }
+    for (table, column, definition) in [
+        ("service_audit", "operation_id", "TEXT"),
+        (
+            "service_audit",
+            "state",
+            "TEXT NOT NULL DEFAULT 'completed'",
+        ),
+        ("service_audit", "payload", "TEXT NOT NULL DEFAULT '{}'"),
+        ("service_audit", "updated_at", "TEXT NOT NULL DEFAULT ''"),
+        ("trashed_projects", "operation_id", "TEXT"),
+    ] {
+        if !sqlite_column_exists(connection, table, column) {
+            connection
+                .execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                    [],
+                )
+                .unwrap();
+        }
+    }
+    connection
+        .execute(
+            "UPDATE service_audit
+             SET operation_id = 'legacy-' || id
+             WHERE operation_id IS NULL",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE service_audit SET state = status
+             WHERE state = 'completed' AND status <> 'completed'",
+            [],
+        )
+        .unwrap();
 }
 
 fn sqlite_column_exists(connection: &rusqlite::Connection, table: &str, column: &str) -> bool {
@@ -198,16 +238,97 @@ fn sqlite_column_exists(connection: &rusqlite::Connection, table: &str, column: 
     exists
 }
 
-fn set_trash_state(connection: &rusqlite::Connection, project_id: &str, state: &str) {
+fn insert_pending_operation(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    action: &str,
+) -> String {
+    ensure_lifecycle_test_columns(connection);
+    let operation_id = format!(
+        "fixture-operation-{}-{}",
+        PROJECT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        project_id
+    );
+    let payload = serde_json::json!({"projectId": project_id}).to_string();
     connection
         .execute(
             r#"
-            INSERT INTO trashed_projects (project_id, trashed_at, state)
-            VALUES (?1, 'interrupted-at', ?2)
-            ON CONFLICT(project_id) DO UPDATE SET state = excluded.state
+            INSERT INTO service_audit (
+                operation_id, request_id, role, action, project_id, image_id,
+                message, status, state, payload, created_at, updated_at
+            )
+            VALUES (
+                ?1, ?2, 'admin', ?3, ?4, NULL,
+                'fixture pending operation', 'pending', 'pending', ?5,
+                'fixture-created-at', 'fixture-created-at'
+            )
             "#,
-            rusqlite::params![project_id, state],
+            rusqlite::params![
+                operation_id,
+                format!("fixture-request-{project_id}"),
+                action,
+                project_id,
+                payload
+            ],
         )
+        .unwrap();
+    operation_id
+}
+
+fn set_trash_state(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    state: &str,
+    operation_id: Option<&str>,
+) {
+    ensure_lifecycle_test_columns(connection);
+    connection
+        .execute(
+            r#"
+            INSERT INTO trashed_projects (project_id, trashed_at, state, operation_id)
+            VALUES (?1, 'interrupted-at', ?2, ?3)
+            ON CONFLICT(project_id) DO UPDATE SET
+                state = excluded.state,
+                operation_id = excluded.operation_id
+            "#,
+            rusqlite::params![project_id, state, operation_id],
+        )
+        .unwrap();
+}
+
+fn operation_state(data_dir: &Path, operation_id: &str) -> Option<String> {
+    rusqlite::Connection::open(data_dir.join("server.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT state FROM service_audit WHERE operation_id = ?1",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+}
+
+fn install_completion_failure_trigger(data_dir: &Path, trigger_name: &str, action: &str) {
+    let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    ensure_lifecycle_test_columns(&connection);
+    connection
+        .execute_batch(&format!(
+            r#"
+            CREATE TRIGGER {trigger_name}
+            BEFORE UPDATE ON service_audit
+            WHEN OLD.action = '{action}' AND NEW.status = 'completed'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected audit completion failure');
+            END;
+            "#
+        ))
+        .unwrap();
+}
+
+fn drop_test_trigger(data_dir: &Path, trigger_name: &str) {
+    rusqlite::Connection::open(data_dir.join("server.sqlite"))
+        .unwrap()
+        .execute_batch(&format!("DROP TRIGGER IF EXISTS {trigger_name};"))
         .unwrap();
 }
 
@@ -231,6 +352,16 @@ fn create_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 fn create_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[cfg(unix)]
+fn create_file_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_file_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
 }
 
 fn test_config(bind_ip: Ipv4Addr) -> ServerConfig {
@@ -433,6 +564,7 @@ fn concurrent_router_initialization_for_same_data_dir_succeeds() {
             "--nocapture",
         ])
         .env(CONCURRENT_DATA_DIR_ENV, &data_dir)
+        .env(ISOLATED_DATA_DIR_ENV, &data_dir)
         .output()
         .unwrap();
     let rendered = format!(
@@ -486,6 +618,231 @@ fn concurrent_router_initialization_child() {
             "round {round} concurrent router initialization failures: {results:?}"
         );
     }
+}
+
+#[test]
+fn data_root_lease_rejects_a_second_server_process() {
+    run_ignored_test_in_subprocess("data_root_lease_coordinator_child");
+}
+
+#[test]
+#[ignore]
+fn data_root_lease_coordinator_child() {
+    let data_dir = unique_temp_root("image-annotation-data-lease");
+    let _cleanup = RemoveDirectoryOnDrop(data_dir.clone());
+    fs::create_dir_all(&data_dir).unwrap();
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.data_dir = data_dir.clone();
+    let app = build_router(config).unwrap();
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "data_root_lease_contender_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(LEASE_DATA_DIR_ENV, &data_dir)
+        .output()
+        .unwrap();
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    drop(app);
+    assert!(output.status.success(), "{rendered}");
+}
+
+#[test]
+#[ignore]
+fn data_root_lease_contender_child() {
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.data_dir = PathBuf::from(std::env::var_os(LEASE_DATA_DIR_ENV).unwrap());
+
+    let error = match build_router(config) {
+        Ok(_) => panic!("a second process must not acquire the same data root"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "data_root_in_use");
+}
+
+#[test]
+fn project_root_link_outside_data_root_is_rejected() {
+    run_ignored_test_in_subprocess("project_root_link_outside_data_root_is_rejected_child");
+}
+
+#[test]
+fn trash_parent_link_is_rejected_without_external_writes() {
+    run_ignored_test_in_subprocess("trash_parent_link_is_rejected_without_external_writes_child");
+}
+
+#[test]
+#[ignore]
+fn trash_parent_link_is_rejected_without_external_writes_child() {
+    let data_dir = unique_temp_root("image-annotation-linked-trash");
+    let external_dir = unique_temp_root("image-annotation-linked-trash-external");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::create_dir_all(&external_dir).unwrap();
+    fs::write(external_dir.join("sentinel"), b"outside").unwrap();
+    let _data_cleanup = RemoveDirectoryOnDrop(data_dir.clone());
+    let _external_cleanup = RemoveDirectoryOnDrop(external_dir.clone());
+    let trash_link = data_dir.join("trash");
+    let _link_cleanup = RemoveLinksOnDrop(vec![trash_link.clone()]);
+    match create_directory_link(&external_dir, &trash_link) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            return;
+        }
+        Err(error) => panic!("failed to create trash parent link: {error}"),
+    }
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.data_dir = data_dir;
+
+    let error = match build_router(config) {
+        Ok(_) => panic!("linked trash parent outside data root must be rejected"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "server_initialization_failed");
+    assert_eq!(fs::read(external_dir.join("sentinel")).unwrap(), b"outside");
+    assert!(!external_dir.join("projects").exists());
+}
+
+#[test]
+fn linked_data_root_is_rejected() {
+    run_ignored_test_in_subprocess("linked_data_root_is_rejected_child");
+}
+
+#[test]
+#[ignore]
+fn linked_data_root_is_rejected_child() {
+    let data_root_link = unique_temp_root("image-annotation-linked-data-root");
+    let external_dir = unique_temp_root("image-annotation-linked-data-root-external");
+    fs::create_dir_all(&external_dir).unwrap();
+    fs::write(external_dir.join("sentinel"), b"outside").unwrap();
+    let _external_cleanup = RemoveDirectoryOnDrop(external_dir.clone());
+    let _link_cleanup = RemoveLinksOnDrop(vec![data_root_link.clone()]);
+    match create_directory_link(&external_dir, &data_root_link) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            return;
+        }
+        Err(error) => panic!("failed to create data root link: {error}"),
+    }
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.data_dir = data_root_link;
+
+    let error = match build_router(config) {
+        Ok(_) => panic!("linked data root must be rejected"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "server_initialization_failed");
+    assert_eq!(fs::read(external_dir.join("sentinel")).unwrap(), b"outside");
+    assert!(!external_dir.join("projects").exists());
+    assert!(!external_dir.join("server.sqlite").exists());
+}
+
+#[test]
+#[ignore]
+fn project_root_link_outside_data_root_is_rejected_child() {
+    let data_dir = unique_temp_root("image-annotation-linked-root");
+    let external_dir = unique_temp_root("image-annotation-linked-root-external");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::create_dir_all(&external_dir).unwrap();
+    fs::write(external_dir.join("sentinel"), b"outside").unwrap();
+    let _data_cleanup = RemoveDirectoryOnDrop(data_dir.clone());
+    let _external_cleanup = RemoveDirectoryOnDrop(external_dir.clone());
+    let projects_link = data_dir.join("projects");
+    let _link_cleanup = RemoveLinksOnDrop(vec![projects_link.clone()]);
+    match create_directory_link(&external_dir, &projects_link) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            return;
+        }
+        Err(error) => panic!("failed to create project root link: {error}"),
+    }
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.data_dir = data_dir;
+
+    let error = match build_router(config) {
+        Ok(_) => panic!("linked projects root outside data root must be rejected"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "server_initialization_failed");
+    assert_eq!(fs::read(external_dir.join("sentinel")).unwrap(), b"outside");
+}
+
+#[test]
+fn server_database_link_outside_data_root_is_rejected() {
+    run_ignored_test_in_subprocess("server_database_link_outside_data_root_is_rejected_child");
+}
+
+#[test]
+#[ignore]
+fn server_database_link_outside_data_root_is_rejected_child() {
+    let data_dir = unique_temp_root("image-annotation-linked-server-db");
+    let external_dir = unique_temp_root("image-annotation-linked-server-db-external");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::create_dir_all(&external_dir).unwrap();
+    let external_db = external_dir.join("external.sqlite");
+    rusqlite::Connection::open(&external_db)
+        .unwrap()
+        .execute("CREATE TABLE sentinel (value TEXT NOT NULL)", [])
+        .unwrap();
+    let server_db_link = data_dir.join("server.sqlite");
+    let _data_cleanup = RemoveDirectoryOnDrop(data_dir.clone());
+    let _external_cleanup = RemoveDirectoryOnDrop(external_dir.clone());
+    let _link_cleanup = RemoveLinksOnDrop(vec![server_db_link.clone()]);
+    match create_file_link(&external_db, &server_db_link) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            return;
+        }
+        Err(error) => panic!("failed to create server database link: {error}"),
+    }
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.data_dir = data_dir;
+
+    let error = match build_router(config) {
+        Ok(_) => panic!("linked server database outside data root must be rejected"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "server_initialization_failed");
+    let external = rusqlite::Connection::open(&external_db).unwrap();
+    let service_tables: i64 = external
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table' AND name = 'service_audit'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(service_tables, 0);
 }
 
 #[test]
@@ -955,6 +1312,33 @@ async fn admin_project_lifecycle_moves_directories_and_records_audit() {
     assert_eq!(deleted["data"]["status"], "trashed");
     assert!(!active_dir.exists());
     assert!(trash_dir.join("project.json").is_file());
+    let lifecycle_db = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    ensure_lifecycle_test_columns(&lifecycle_db);
+    let (delete_operation_id, delete_action, delete_state, delete_payload): (
+        String,
+        String,
+        String,
+        String,
+    ) = lifecycle_db
+        .query_row(
+            r#"
+            SELECT t.operation_id, a.action, a.state, a.payload
+            FROM trashed_projects t
+            JOIN service_audit a ON a.operation_id = t.operation_id
+            WHERE t.project_id = ?1
+            "#,
+            [&project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert!(!delete_operation_id.is_empty());
+    assert_eq!(delete_action, "delete_project");
+    assert_eq!(delete_state, "completed");
+    assert_eq!(
+        serde_json::from_str::<Value>(&delete_payload).unwrap()["projectId"],
+        project_id
+    );
+    drop(lifecycle_db);
 
     let (missing_status, _, missing) =
         router_request(&app, Method::GET, &project_uri, READER_TOKEN, None).await;
@@ -1082,10 +1466,36 @@ async fn startup_reconciles_interrupted_project_lifecycle_states_child() {
 
     let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
     ensure_lifecycle_test_columns(&connection);
-    set_trash_state(&connection, &cases[0].1, "trashing");
-    set_trash_state(&connection, &cases[1].1, "trashing");
-    set_trash_state(&connection, &cases[2].1, "restoring");
-    set_trash_state(&connection, &cases[3].1, "restoring");
+    let operation_ids = [
+        insert_pending_operation(&connection, &cases[0].1, "delete_project"),
+        insert_pending_operation(&connection, &cases[1].1, "delete_project"),
+        insert_pending_operation(&connection, &cases[2].1, "restore_project"),
+        insert_pending_operation(&connection, &cases[3].1, "restore_project"),
+    ];
+    set_trash_state(
+        &connection,
+        &cases[0].1,
+        "trashing",
+        Some(&operation_ids[0]),
+    );
+    set_trash_state(
+        &connection,
+        &cases[1].1,
+        "trashing",
+        Some(&operation_ids[1]),
+    );
+    set_trash_state(
+        &connection,
+        &cases[2].1,
+        "restoring",
+        Some(&operation_ids[2]),
+    );
+    set_trash_state(
+        &connection,
+        &cases[3].1,
+        "restoring",
+        Some(&operation_ids[3]),
+    );
     drop(connection);
 
     for case_index in [1_usize, 2] {
@@ -1113,6 +1523,10 @@ async fn startup_reconciles_interrupted_project_lifecycle_states_child() {
             trash_state(&data_dir, project_id).as_deref(),
             Some("trashed")
         );
+        assert_eq!(
+            operation_state(&data_dir, &operation_ids[case_index]).as_deref(),
+            Some("completed")
+        );
     }
     for case_index in [2_usize, 3] {
         let project_id = &cases[case_index].1;
@@ -1123,6 +1537,10 @@ async fn startup_reconciles_interrupted_project_lifecycle_states_child() {
             .join(project_id)
             .exists());
         assert_eq!(trash_state(&data_dir, project_id), None);
+        assert_eq!(
+            operation_state(&data_dir, &operation_ids[case_index]).as_deref(),
+            Some("completed")
+        );
     }
 }
 
@@ -1150,7 +1568,8 @@ async fn startup_rejects_active_and_trash_collision_without_changing_either_chil
     fs::write(trash_dir.join("collision-marker"), b"do not remove").unwrap();
     let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
     ensure_lifecycle_test_columns(&connection);
-    set_trash_state(&connection, &project_id, "trashing");
+    let operation_id = insert_pending_operation(&connection, &project_id, "delete_project");
+    set_trash_state(&connection, &project_id, "trashing", Some(&operation_id));
     drop(connection);
 
     let error = match build_router(config) {
@@ -1167,6 +1586,509 @@ async fn startup_rejects_active_and_trash_collision_without_changing_either_chil
     assert_eq!(
         trash_state(&data_dir, &project_id).as_deref(),
         Some("trashing")
+    );
+}
+
+#[test]
+fn startup_rejects_missing_or_mismatched_lifecycle_operation() {
+    run_ignored_test_in_subprocess(
+        "startup_rejects_missing_or_mismatched_lifecycle_operation_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn startup_rejects_missing_or_mismatched_lifecycle_operation_child() {
+    let (name, project_id) = unique_project("Task3 operation mismatch");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+    create_empty_project(&app, &name, &project_id).await;
+    let active_dir = data_dir.join("projects").join(&project_id);
+    let trash_dir = data_dir.join("trash").join("projects").join(&project_id);
+    let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    let wrong_operation = insert_pending_operation(&connection, &project_id, "restore_project");
+    set_trash_state(&connection, &project_id, "trashing", Some(&wrong_operation));
+    drop(connection);
+
+    let wrong_action_error = match build_router(config.clone()) {
+        Ok(_) => panic!("mismatched lifecycle action must reject startup"),
+        Err(error) => error,
+    };
+    assert_eq!(wrong_action_error.code(), "server_initialization_failed");
+    assert!(active_dir.is_dir());
+    assert!(!trash_dir.exists());
+
+    let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    connection
+        .execute(
+            "DELETE FROM trashed_projects WHERE project_id = ?1",
+            [&project_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM service_audit WHERE operation_id = ?1",
+            [&wrong_operation],
+        )
+        .unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .unwrap();
+    set_trash_state(
+        &connection,
+        &project_id,
+        "trashing",
+        Some("missing-operation"),
+    );
+    drop(connection);
+
+    let missing_operation_error = match build_router(config) {
+        Ok(_) => panic!("missing lifecycle operation must reject startup"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        missing_operation_error.code(),
+        "server_initialization_failed"
+    );
+    assert!(active_dir.is_dir());
+    assert!(!trash_dir.exists());
+}
+
+#[test]
+fn restore_rejects_tombstone_with_mismatched_operation() {
+    run_ignored_test_in_subprocess("restore_rejects_tombstone_with_mismatched_operation_child");
+}
+
+#[tokio::test]
+#[ignore]
+async fn restore_rejects_tombstone_with_mismatched_operation_child() {
+    let (name, project_id) = unique_project("Task3 runtime operation mismatch");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+    create_empty_project(&app, &name, &project_id).await;
+    let project_uri = format!("/api/v1/projects/{project_id}");
+    let (delete_status, _, deleted) =
+        router_request(&app, Method::DELETE, &project_uri, ADMIN_TOKEN, None).await;
+    assert_eq!(delete_status, StatusCode::OK, "{deleted}");
+    let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    let wrong_operation = insert_pending_operation(&connection, &project_id, "update_project");
+    connection
+        .execute(
+            "UPDATE trashed_projects SET operation_id = ?1 WHERE project_id = ?2",
+            rusqlite::params![wrong_operation, project_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let (restore_status, _, restore) = router_request(
+        &app,
+        Method::POST,
+        &format!("{project_uri}/restore"),
+        ADMIN_TOKEN,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        restore_status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{restore}"
+    );
+    assert_eq!(restore["error"]["code"], "storage");
+    assert!(!data_dir.join("projects").join(&project_id).exists());
+    assert!(data_dir
+        .join("trash")
+        .join("projects")
+        .join(&project_id)
+        .is_dir());
+}
+
+#[test]
+fn pending_create_completion_is_reconciled_on_startup() {
+    run_ignored_test_in_subprocess("pending_create_completion_is_reconciled_on_startup_child");
+}
+
+#[test]
+fn pending_create_rejects_a_different_valid_project() {
+    run_ignored_test_in_subprocess("pending_create_rejects_a_different_valid_project_child");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pending_create_rejects_a_different_valid_project_child() {
+    let (name, project_id) = unique_project("Task3 pending create mismatch");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+    install_completion_failure_trigger(
+        &data_dir,
+        "fail_mismatched_create_completion",
+        "create_project",
+    );
+
+    let (status, _, created) = router_request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        ADMIN_TOKEN,
+        Some(serde_json::json!({
+            "name": name,
+            "datasetType": "yolo-detect"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let request_id = created["requestId"].as_str().unwrap();
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let manifest_path = project_dir.join("project.json");
+    let mut manifest: ProjectManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest.name = "Different valid project".to_string();
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    rusqlite::Connection::open(project_dir.join("project.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE projects SET name = ?1 WHERE id = ?2",
+            rusqlite::params![manifest.name, project_id],
+        )
+        .unwrap();
+    drop_test_trigger(&data_dir, "fail_mismatched_create_completion");
+
+    let error = match build_router(config) {
+        Ok(_) => panic!("a pending create must not complete a different valid project"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "server_initialization_failed");
+    assert!(project_dir.is_dir());
+    let state: String = rusqlite::Connection::open(data_dir.join("server.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT state FROM service_audit WHERE request_id = ?1",
+            [request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "pending");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pending_create_completion_is_reconciled_on_startup_child() {
+    let (name, project_id) = unique_project("Task3 pending create");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+    install_completion_failure_trigger(&data_dir, "fail_create_completion", "create_project");
+
+    let (status, _, created) = router_request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        ADMIN_TOKEN,
+        Some(serde_json::json!({
+            "name": name,
+            "datasetType": "yolo-detect"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let request_id = created["requestId"].as_str().unwrap();
+    let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    let (operation_id, pending_state, payload): (String, String, String) = connection
+        .query_row(
+            "SELECT operation_id, state, payload FROM service_audit WHERE request_id = ?1",
+            [request_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(pending_state, "pending");
+    assert_eq!(
+        serde_json::from_str::<Value>(&payload).unwrap()["projectId"],
+        project_id
+    );
+    drop(connection);
+    drop_test_trigger(&data_dir, "fail_create_completion");
+
+    let _reconciled = build_router(config).unwrap();
+    assert_eq!(
+        operation_state(&data_dir, &operation_id).as_deref(),
+        Some("completed")
+    );
+}
+
+#[test]
+fn failed_create_removes_its_partial_project_before_marking_failed() {
+    run_ignored_test_in_subprocess(
+        "failed_create_removes_its_partial_project_before_marking_failed_child",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn failed_create_removes_its_partial_project_before_marking_failed_child() {
+    let (name, project_id) = unique_project("Task3 partial create");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+    let request_app = app.clone();
+    let request_name = name.clone();
+    let request = tokio::spawn(async move {
+        router_request(
+            &request_app,
+            Method::POST,
+            "/api/v1/projects",
+            ADMIN_TOKEN,
+            Some(serde_json::json!({
+                "name": request_name,
+                "datasetType": "yolo-detect",
+                "demoTemplate": "demo-bbox"
+            })),
+        )
+        .await
+    });
+    let active_dir = data_dir.join("projects").join(&project_id);
+    let started = Instant::now();
+    while !active_dir.is_dir() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "project creation never created its active directory"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    fs::create_dir(active_dir.join("project.json.tmp"))
+        .expect("test must inject a manifest replacement failure");
+
+    let (status, _, response) = request.await.unwrap();
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{response}");
+    assert!(
+        !active_dir.exists(),
+        "partial active project was not cleaned"
+    );
+    let request_id = response["requestId"].as_str().unwrap();
+    let state: String = rusqlite::Connection::open(data_dir.join("server.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT state FROM service_audit WHERE request_id = ?1",
+            [request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "failed");
+}
+
+#[test]
+fn failed_update_rolls_back_before_marking_operation_failed() {
+    run_ignored_test_in_subprocess(
+        "failed_update_rolls_back_before_marking_operation_failed_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn failed_update_rolls_back_before_marking_operation_failed_child() {
+    let (name, project_id) = unique_project("Task3 compensated update");
+    let renamed = format!("{name} renamed");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+    create_empty_project(&app, &name, &project_id).await;
+    install_completion_failure_trigger(&data_dir, "fail_update_completion", "update_project");
+
+    let (status, _, response) = router_request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/projects/{project_id}"),
+        ADMIN_TOKEN,
+        Some(serde_json::json!({
+            "name": renamed,
+            "description": "must roll back"
+        })),
+    )
+    .await;
+    drop_test_trigger(&data_dir, "fail_update_completion");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{response}");
+    let request_id = response["requestId"].as_str().unwrap();
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let manifest: ProjectManifest =
+        serde_json::from_slice(&fs::read(project_dir.join("project.json")).unwrap()).unwrap();
+    let indexed_name: String = rusqlite::Connection::open(project_dir.join("project.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT name FROM projects WHERE id = ?1",
+            [&project_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(manifest.name, name);
+    assert_eq!(indexed_name, name);
+
+    let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    let description: Option<String> = connection
+        .query_row(
+            "SELECT description FROM project_metadata WHERE project_id = ?1",
+            [&project_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    let (state, payload): (String, String) = connection
+        .query_row(
+            "SELECT state, payload FROM service_audit WHERE request_id = ?1",
+            [request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(description, None);
+    assert_eq!(state, "failed");
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["old"]["name"], name);
+    assert_eq!(payload["new"]["name"], renamed);
+}
+
+#[test]
+fn name_update_with_only_audit_completion_failure_returns_success() {
+    run_ignored_test_in_subprocess(
+        "name_update_with_only_audit_completion_failure_returns_success_child",
+    );
+}
+
+#[test]
+fn lifecycle_completion_failure_returns_success_and_reconciles() {
+    run_ignored_test_in_subprocess(
+        "lifecycle_completion_failure_returns_success_and_reconciles_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn lifecycle_completion_failure_returns_success_and_reconciles_child() {
+    let (name, project_id) = unique_project("Task3 lifecycle completion");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+    create_empty_project(&app, &name, &project_id).await;
+    let project_uri = format!("/api/v1/projects/{project_id}");
+
+    install_completion_failure_trigger(&data_dir, "fail_delete_completion", "delete_project");
+    let (delete_status, _, deleted) =
+        router_request(&app, Method::DELETE, &project_uri, ADMIN_TOKEN, None).await;
+    assert_eq!(delete_status, StatusCode::OK, "{deleted}");
+    assert!(!data_dir.join("projects").join(&project_id).exists());
+    assert!(data_dir
+        .join("trash")
+        .join("projects")
+        .join(&project_id)
+        .is_dir());
+    assert_eq!(
+        trash_state(&data_dir, &project_id).as_deref(),
+        Some("trashing")
+    );
+    drop_test_trigger(&data_dir, "fail_delete_completion");
+
+    let reconciled_delete = build_router(config.clone()).unwrap();
+    assert_eq!(
+        trash_state(&data_dir, &project_id).as_deref(),
+        Some("trashed")
+    );
+    install_completion_failure_trigger(&data_dir, "fail_restore_completion", "restore_project");
+    let (restore_status, _, restored) = router_request(
+        &reconciled_delete,
+        Method::POST,
+        &format!("{project_uri}/restore"),
+        ADMIN_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(restore_status, StatusCode::OK, "{restored}");
+    assert!(data_dir.join("projects").join(&project_id).is_dir());
+    assert!(!data_dir
+        .join("trash")
+        .join("projects")
+        .join(&project_id)
+        .exists());
+    assert_eq!(
+        trash_state(&data_dir, &project_id).as_deref(),
+        Some("restoring")
+    );
+    drop_test_trigger(&data_dir, "fail_restore_completion");
+
+    let _reconciled_restore = build_router(config).unwrap();
+    assert_eq!(trash_state(&data_dir, &project_id), None);
+    let pending_lifecycle_operations: i64 =
+        rusqlite::Connection::open(data_dir.join("server.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM service_audit
+                 WHERE project_id = ?1
+                   AND action IN ('delete_project', 'restore_project')
+                   AND state = 'pending'",
+                [&project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(pending_lifecycle_operations, 0);
+}
+
+#[tokio::test]
+#[ignore]
+async fn name_update_with_only_audit_completion_failure_returns_success_child() {
+    let (name, project_id) = unique_project("Task3 pending update");
+    let renamed = format!("{name} renamed");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+    create_empty_project(&app, &name, &project_id).await;
+    install_completion_failure_trigger(&data_dir, "fail_name_update_completion", "update_project");
+
+    let (status, _, updated) = router_request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/projects/{project_id}"),
+        ADMIN_TOKEN,
+        Some(serde_json::json!({"name": renamed})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["data"]["name"], renamed);
+    let request_id = updated["requestId"].as_str().unwrap();
+    let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    let operation_id: String = connection
+        .query_row(
+            "SELECT operation_id FROM service_audit WHERE request_id = ?1 AND state = 'pending'",
+            [request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
+    drop_test_trigger(&data_dir, "fail_name_update_completion");
+
+    let _reconciled = build_router(config).unwrap();
+    assert_eq!(
+        operation_state(&data_dir, &operation_id).as_deref(),
+        Some("completed")
     );
 }
 
@@ -1318,32 +2240,43 @@ async fn mutations_record_intent_completion_failure_and_update_action() {
     let update_request_id = updated["requestId"].as_str().unwrap();
 
     let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
-    let create_status: String = connection
+    let (create_state, create_operation_id, create_payload): (String, String, String) = connection
         .query_row(
-            "SELECT status FROM service_audit WHERE request_id = ?1",
+            "SELECT state, operation_id, payload
+             FROM service_audit WHERE request_id = ?1",
             [create_request_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    let duplicate_status: String = connection
+    let duplicate_state: String = connection
         .query_row(
-            "SELECT status FROM service_audit WHERE request_id = ?1",
+            "SELECT state FROM service_audit WHERE request_id = ?1",
             [duplicate_request_id],
             |row| row.get(0),
         )
         .unwrap();
-    let (update_action, update_status): (String, String) = connection
+    let (update_action, update_state, update_payload): (String, String, String) = connection
         .query_row(
-            "SELECT action, status FROM service_audit WHERE request_id = ?1",
+            "SELECT action, state, payload
+             FROM service_audit WHERE request_id = ?1",
             [update_request_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
 
-    assert_eq!(create_status, "completed");
-    assert_eq!(duplicate_status, "failed");
+    assert_eq!(create_state, "completed");
+    assert!(!create_operation_id.is_empty());
+    assert_eq!(
+        serde_json::from_str::<Value>(&create_payload).unwrap()["projectId"],
+        project_id
+    );
+    assert_eq!(duplicate_state, "failed");
     assert_eq!(update_action, "update_project");
-    assert_eq!(update_status, "completed");
+    assert_eq!(update_state, "completed");
+    assert_eq!(
+        serde_json::from_str::<Value>(&update_payload).unwrap()["new"]["description"],
+        "description only"
+    );
 }
 
 #[test]
@@ -1358,6 +2291,7 @@ fn startup_repairs_corrupt_manifest_from_sqlite_and_prefers_valid_backup() {
 async fn startup_repairs_corrupt_manifest_from_sqlite_and_prefers_valid_backup_child() {
     let (sqlite_name, sqlite_project_id) = unique_project("Task3 sqlite manifest recovery");
     let (backup_name, backup_project_id) = unique_project("Task3 backup manifest recovery");
+    let (stale_name, stale_project_id) = unique_project("Task3 stale manifest artifacts");
     let mut config = test_config(Ipv4Addr::LOCALHOST);
     config.reader_token = Some(READER_TOKEN.to_string());
     config.admin_token = Some(ADMIN_TOKEN.to_string());
@@ -1365,8 +2299,10 @@ async fn startup_repairs_corrupt_manifest_from_sqlite_and_prefers_valid_backup_c
     let app = build_router(config.clone()).unwrap();
     let _sqlite_cleanup = RemoteProjectCleanup::new(&data_dir, &sqlite_project_id);
     let _backup_cleanup = RemoteProjectCleanup::new(&data_dir, &backup_project_id);
+    let _stale_cleanup = RemoteProjectCleanup::new(&data_dir, &stale_project_id);
     create_empty_project(&app, &sqlite_name, &sqlite_project_id).await;
     create_empty_project(&app, &backup_name, &backup_project_id).await;
+    create_empty_project(&app, &stale_name, &stale_project_id).await;
 
     let sqlite_project_dir = data_dir.join("projects").join(&sqlite_project_id);
     let sqlite_manifest_path = sqlite_project_dir.join("project.json");
@@ -1375,8 +2311,17 @@ async fn startup_repairs_corrupt_manifest_from_sqlite_and_prefers_valid_backup_c
     let backup_project_dir = data_dir.join("projects").join(&backup_project_id);
     let backup_manifest_path = backup_project_dir.join("project.json");
     let backup_path = backup_manifest_path.with_extension("json.bak");
+    let backup_temp_path = backup_manifest_path.with_extension("json.tmp");
     fs::rename(&backup_manifest_path, &backup_path).unwrap();
     fs::write(&backup_manifest_path, b"{ interrupted replacement").unwrap();
+    let mut interrupted_temp: ProjectManifest =
+        serde_json::from_slice(&fs::read(&backup_path).unwrap()).unwrap();
+    interrupted_temp.name = "uncommitted temporary name".to_string();
+    fs::write(
+        &backup_temp_path,
+        serde_json::to_vec_pretty(&interrupted_temp).unwrap(),
+    )
+    .unwrap();
     rusqlite::Connection::open(backup_project_dir.join("project.sqlite"))
         .unwrap()
         .execute(
@@ -1385,10 +2330,18 @@ async fn startup_repairs_corrupt_manifest_from_sqlite_and_prefers_valid_backup_c
         )
         .unwrap();
 
+    let stale_project_dir = data_dir.join("projects").join(&stale_project_id);
+    let stale_manifest_path = stale_project_dir.join("project.json");
+    let stale_backup_path = stale_manifest_path.with_extension("json.bak");
+    let stale_temp_path = stale_manifest_path.with_extension("json.tmp");
+    fs::copy(&stale_manifest_path, &stale_backup_path).unwrap();
+    fs::copy(&stale_manifest_path, &stale_temp_path).unwrap();
+
     let repaired_app = build_router(config).unwrap();
     for (project_id, expected_name) in [
         (&sqlite_project_id, &sqlite_name),
         (&backup_project_id, &backup_name),
+        (&stale_project_id, &stale_name),
     ] {
         let (status, _, project) = router_request(
             &repaired_app,
@@ -1413,6 +2366,165 @@ async fn startup_repairs_corrupt_manifest_from_sqlite_and_prefers_valid_backup_c
         assert_eq!(manifest.name, expected_name.as_str());
     }
     assert!(!backup_path.exists());
+    assert!(!backup_temp_path.exists());
+    assert!(!stale_backup_path.exists());
+    assert!(!stale_temp_path.exists());
+}
+
+#[test]
+fn project_file_links_outside_project_directory_are_rejected() {
+    run_ignored_test_in_subprocess(
+        "project_file_links_outside_project_directory_are_rejected_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn project_file_links_outside_project_directory_are_rejected_child() {
+    let (manifest_name, manifest_project_id) = unique_project("Task3 linked manifest");
+    let (sqlite_name, sqlite_project_id) = unique_project("Task3 linked sqlite");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    let _manifest_cleanup = RemoteProjectCleanup::new(&data_dir, &manifest_project_id);
+    let _sqlite_cleanup = RemoteProjectCleanup::new(&data_dir, &sqlite_project_id);
+    create_empty_project(&app, &manifest_name, &manifest_project_id).await;
+    create_empty_project(&app, &sqlite_name, &sqlite_project_id).await;
+
+    let external_dir = unique_temp_root("image-annotation-linked-project-files");
+    fs::create_dir_all(&external_dir).unwrap();
+    let _external_cleanup = RemoveDirectoryOnDrop(external_dir.clone());
+    let manifest_path = data_dir
+        .join("projects")
+        .join(&manifest_project_id)
+        .join("project.json");
+    let sqlite_path = data_dir
+        .join("projects")
+        .join(&sqlite_project_id)
+        .join("project.sqlite");
+    let external_manifest = external_dir.join("project.json");
+    let external_sqlite = external_dir.join("project.sqlite");
+    fs::copy(&manifest_path, &external_manifest).unwrap();
+    fs::copy(&sqlite_path, &external_sqlite).unwrap();
+    let external_manifest_bytes = fs::read(&external_manifest).unwrap();
+    let external_sqlite_bytes = fs::read(&external_sqlite).unwrap();
+    fs::remove_file(&manifest_path).unwrap();
+    fs::remove_file(&sqlite_path).unwrap();
+    let _link_cleanup = RemoveLinksOnDrop(vec![manifest_path.clone(), sqlite_path.clone()]);
+
+    for (target, link) in [
+        (&external_manifest, &manifest_path),
+        (&external_sqlite, &sqlite_path),
+    ] {
+        match create_file_link(target, link) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("failed to create project file link: {error}"),
+        }
+    }
+
+    for project_id in [&manifest_project_id, &sqlite_project_id] {
+        let (status, _, response) = router_request(
+            &app,
+            Method::GET,
+            &format!("/api/v1/projects/{project_id}"),
+            READER_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{response}");
+        assert_eq!(response["error"]["code"], "storage");
+        assert!(!response
+            .to_string()
+            .contains(&external_dir.to_string_lossy().to_string()));
+    }
+    let (list_status, _, listed) =
+        router_request(&app, Method::GET, "/api/v1/projects", READER_TOKEN, None).await;
+    assert_eq!(list_status, StatusCode::OK, "{listed}");
+    for project_id in [&manifest_project_id, &sqlite_project_id] {
+        assert!(!listed["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|project| project["id"] == project_id.as_str()));
+    }
+    assert_eq!(
+        fs::read(&external_manifest).unwrap(),
+        external_manifest_bytes
+    );
+    assert_eq!(fs::read(&external_sqlite).unwrap(), external_sqlite_bytes);
+    assert!(!external_dir.join("project.sqlite-wal").exists());
+    assert!(!external_dir.join("project.sqlite-shm").exists());
+}
+
+#[test]
+fn remote_list_excludes_projects_linked_to_external_roots() {
+    run_ignored_test_in_subprocess("remote_list_excludes_projects_linked_to_external_roots_child");
+}
+
+#[tokio::test]
+#[ignore]
+async fn remote_list_excludes_projects_linked_to_external_roots_child() {
+    let (name, project_id) = unique_project("Task3 external root");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    let _cleanup = RemoteProjectCleanup::new(&data_dir, &project_id);
+    create_empty_project(&app, &name, &project_id).await;
+    let external_dir = unique_temp_root("image-annotation-external-manifest-root");
+    fs::create_dir_all(&external_dir).unwrap();
+    let _external_cleanup = RemoveDirectoryOnDrop(external_dir.clone());
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let manifest_path = project_dir.join("project.json");
+    let mut manifest: ProjectManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest.source_dataset_key = "local-linked".to_string();
+    manifest.root_path = external_dir.to_string_lossy().to_string();
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    rusqlite::Connection::open(project_dir.join("project.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE projects SET source_dataset_key = 'local-linked', root_path = ?1
+             WHERE id = ?2",
+            rusqlite::params![external_dir.to_string_lossy(), project_id],
+        )
+        .unwrap();
+
+    let project_uri = format!("/api/v1/projects/{project_id}");
+    let (get_status, _, detail) =
+        router_request(&app, Method::GET, &project_uri, READER_TOKEN, None).await;
+    assert_eq!(get_status, StatusCode::INTERNAL_SERVER_ERROR, "{detail}");
+    assert_eq!(detail["error"]["code"], "storage");
+    assert!(!detail
+        .to_string()
+        .contains(&external_dir.to_string_lossy().to_string()));
+
+    let (list_status, _, listed) =
+        router_request(&app, Method::GET, "/api/v1/projects", READER_TOKEN, None).await;
+    assert_eq!(list_status, StatusCode::OK, "{listed}");
+    assert!(!listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|project| project["id"] == project_id));
+    assert!(!listed
+        .to_string()
+        .contains(&external_dir.to_string_lossy().to_string()));
 }
 
 #[tokio::test]
@@ -1557,22 +2669,13 @@ async fn corrupt_workspace_manifest_never_falls_back_outside_the_configured_root
     let (workspace_name, project_id) = unique_project("Task3 workspace only");
     let mut config = test_config(Ipv4Addr::LOCALHOST);
     config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
     let data_dir = config.data_dir.clone();
     let app = build_router(config).unwrap();
     let workspace_dir = data_dir.join("projects").join(&project_id);
     let workspace_manifest_path = workspace_dir.join("project.json");
-    let _workspace_guard = RemoveDirectoryOnDrop(workspace_dir.clone());
-    fs::create_dir_all(&workspace_dir).unwrap();
-    fs::write(
-        &workspace_manifest_path,
-        serde_json::to_vec_pretty(&fixture_manifest(
-            &project_id,
-            &workspace_name,
-            &workspace_dir,
-        ))
-        .unwrap(),
-    )
-    .unwrap();
+    let _workspace_guard = RemoteProjectCleanup::new(&data_dir, &project_id);
+    create_empty_project(&app, &workspace_name, &project_id).await;
 
     let project_uri = format!("/api/v1/projects/{project_id}");
     let (workspace_status, _, workspace_project) =
@@ -1581,6 +2684,11 @@ async fn corrupt_workspace_manifest_never_falls_back_outside_the_configured_root
     assert_eq!(workspace_project["data"]["name"], workspace_name);
 
     fs::write(&workspace_manifest_path, b"{ invalid workspace manifest").unwrap();
+    fs::write(
+        workspace_dir.join("project.sqlite"),
+        b"invalid project sqlite",
+    )
+    .unwrap();
 
     let (corrupt_status, _, corrupt_project) =
         router_request(&app, Method::GET, &project_uri, READER_TOKEN, None).await;

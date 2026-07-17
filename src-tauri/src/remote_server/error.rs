@@ -36,6 +36,13 @@ impl ServerBuildError {
         }
     }
 
+    pub(crate) const fn data_root_in_use() -> Self {
+        Self {
+            code: "data_root_in_use",
+            message: "the configured data directory is already used by another server process",
+        }
+    }
+
     pub(crate) const fn project_state_conflict() -> Self {
         Self {
             code: "project_state_conflict",

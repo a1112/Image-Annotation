@@ -205,6 +205,7 @@ pub fn write_manifest_to_path(manifest: &ProjectManifest, path: &Path) -> Result
     let data = serde_json::to_string_pretty(manifest).map_err(|err| err.to_string())?;
     let temporary_path = manifest_temporary_path(path);
     let backup_path = manifest_backup_path(path);
+    validate_manifest_artifacts(path, &temporary_path, &backup_path)?;
     remove_file_if_present(&temporary_path)?;
     let mut temporary = OpenOptions::new()
         .create_new(true)
@@ -239,6 +240,7 @@ pub fn write_manifest_to_path(manifest: &ProjectManifest, path: &Path) -> Result
 pub fn recover_manifest_backup(path: &Path) -> Result<bool, String> {
     let temporary_path = manifest_temporary_path(path);
     let backup_path = manifest_backup_path(path);
+    validate_manifest_artifacts(path, &temporary_path, &backup_path)?;
     if read_manifest_from_path(path).is_some() {
         remove_file_if_present(&temporary_path)?;
         remove_file_if_present(&backup_path)?;
@@ -265,6 +267,49 @@ fn manifest_temporary_path(path: &Path) -> PathBuf {
 
 fn manifest_backup_path(path: &Path) -> PathBuf {
     path.with_extension("json.bak")
+}
+
+fn validate_manifest_artifacts(
+    manifest: &Path,
+    temporary: &Path,
+    backup: &Path,
+) -> Result<(), String> {
+    let parent = manifest
+        .parent()
+        .ok_or_else(|| "manifest path has no parent directory".to_string())?;
+    let canonical_parent = fs::canonicalize(parent).map_err(|error| error.to_string())?;
+    for path in [manifest, temporary, backup] {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if is_symlink_or_reparse(&metadata) || !metadata.is_file() {
+            return Err("manifest artifact is not a regular file".to_string());
+        }
+        let canonical = fs::canonicalize(path).map_err(|error| error.to_string())?;
+        if canonical.parent() != Some(canonical_parent.as_path()) {
+            return Err("manifest artifact is outside its project directory".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn remove_file_if_present(path: &Path) -> Result<(), String> {
