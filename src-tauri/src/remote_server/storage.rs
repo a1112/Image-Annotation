@@ -1,9 +1,12 @@
 use std::{
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{params, Connection, OptionalExtension};
+
+static SERVER_DATABASE_INITIALIZATION: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone)]
 pub(super) struct ServerStorage {
@@ -25,48 +28,58 @@ impl ServerStorage {
         let storage = Self {
             path: data_dir.join("server.sqlite"),
         };
+        let _initialization_guard = SERVER_DATABASE_INITIALIZATION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let connection = storage.connection()?;
+        if journal_mode(&connection)? != "wal" {
+            connection
+                .query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
+                .map_err(|error| error.to_string())?;
+        }
         connection
-            .execute_batch(
-                r#"
-                PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = NORMAL;
-
-                CREATE TABLE IF NOT EXISTS service_audit (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    request_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    action TEXT NOT NULL,
-                    project_id TEXT,
-                    image_id TEXT,
-                    message TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_service_audit_request_id
-                    ON service_audit(request_id);
-                CREATE INDEX IF NOT EXISTS idx_service_audit_project_id
-                    ON service_audit(project_id);
-
-                CREATE TABLE IF NOT EXISTS trashed_projects (
-                    project_id TEXT PRIMARY KEY,
-                    trashed_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS import_sessions (
-                    id TEXT PRIMARY KEY,
-                    project_id TEXT,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS project_metadata (
-                    project_id TEXT PRIMARY KEY,
-                    description TEXT NOT NULL DEFAULT ''
-                );
-                "#,
-            )
+            .pragma_update(None, "synchronous", "NORMAL")
             .map_err(|error| error.to_string())?;
+        if !schema_is_current(&connection)? {
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS service_audit (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        request_id TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        action TEXT NOT NULL,
+                        project_id TEXT,
+                        image_id TEXT,
+                        message TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_service_audit_request_id
+                        ON service_audit(request_id);
+                    CREATE INDEX IF NOT EXISTS idx_service_audit_project_id
+                        ON service_audit(project_id);
+
+                    CREATE TABLE IF NOT EXISTS trashed_projects (
+                        project_id TEXT PRIMARY KEY,
+                        trashed_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS import_sessions (
+                        id TEXT PRIMARY KEY,
+                        project_id TEXT,
+                        status TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS project_metadata (
+                        project_id TEXT PRIMARY KEY,
+                        description TEXT NOT NULL DEFAULT ''
+                    );
+                    "#,
+                )
+                .map_err(|error| error.to_string())?;
+        }
         Ok(storage)
     }
 
@@ -177,6 +190,39 @@ impl ServerStorage {
             .map_err(|error| error.to_string())?;
         Ok(connection)
     }
+}
+
+fn journal_mode(connection: &Connection) -> Result<String, String> {
+    connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+        .map(|mode| mode.to_ascii_lowercase())
+        .map_err(|error| error.to_string())
+}
+
+fn schema_is_current(connection: &Connection) -> Result<bool, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM sqlite_schema
+            WHERE
+                (type = 'table' AND name IN (
+                    'service_audit',
+                    'trashed_projects',
+                    'import_sessions',
+                    'project_metadata'
+                ))
+                OR
+                (type = 'index' AND name IN (
+                    'idx_service_audit_request_id',
+                    'idx_service_audit_project_id'
+                ))
+            "#,
+            [],
+            |row| row.get::<_, usize>(0),
+        )
+        .map(|object_count| object_count == 6)
+        .map_err(|error| error.to_string())
 }
 
 fn insert_audit(connection: &Connection, entry: AuditEntry<'_>) -> Result<(), String> {

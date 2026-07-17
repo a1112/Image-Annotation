@@ -91,7 +91,7 @@ impl RemoteSampleService {
     pub(super) fn list_projects(&self) -> Result<Vec<DatasetProject>, ServiceError> {
         self.ensure_configured_root()?;
         let active_ids = self.active_project_ids()?;
-        let mut projects = self.repository.dataset_projects();
+        let mut projects = self.repository.workspace_dataset_projects();
         projects.retain(|project| active_ids.contains(&project.id));
         for project in &mut projects {
             self.apply_description(project)?;
@@ -109,7 +109,7 @@ impl RemoteSampleService {
 
         let mut project = self
             .repository
-            .dataset_projects()
+            .workspace_dataset_projects()
             .into_iter()
             .find(|project| project.id == project_id)
             .ok_or(ServiceError::Storage)?;

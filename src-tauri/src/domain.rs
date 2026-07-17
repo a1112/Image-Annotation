@@ -301,10 +301,28 @@ impl SampleRepository {
     }
 
     pub fn dataset_projects(&self) -> Vec<DatasetProject> {
-        let mut projects: Vec<_> = project_fs::list_project_manifests()
+        self.dataset_projects_from(
+            project_fs::list_project_manifests(),
+            project_fs::project_paths,
+        )
+    }
+
+    pub fn workspace_dataset_projects(&self) -> Vec<DatasetProject> {
+        self.dataset_projects_from(
+            project_fs::list_workspace_project_manifests(),
+            project_fs::workspace_project_paths,
+        )
+    }
+
+    fn dataset_projects_from(
+        &self,
+        manifests: Vec<project_fs::ProjectManifest>,
+        project_paths: fn(&str) -> project_fs::ProjectPaths,
+    ) -> Vec<DatasetProject> {
+        let mut projects: Vec<_> = manifests
             .into_iter()
             .map(|manifest| {
-                let paths = project_fs::project_paths(&manifest.id);
+                let paths = project_paths(&manifest.id);
                 let indexed_manifest = storage::read_project_manifest(&paths.sqlite)
                     .ok()
                     .flatten()

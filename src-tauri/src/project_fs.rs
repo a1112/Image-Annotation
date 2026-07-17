@@ -210,8 +210,7 @@ pub fn write_manifest_to_path(manifest: &ProjectManifest, path: &Path) -> Result
 }
 
 pub fn list_project_manifests() -> Vec<ProjectManifest> {
-    let mut manifests = Vec::new();
-    manifests.extend(list_project_manifests_from(workspace_projects_dir()));
+    let mut manifests = list_workspace_project_manifests();
     for manifest in list_project_manifests_from(projects_dir()) {
         if !manifests
             .iter()
@@ -221,6 +220,10 @@ pub fn list_project_manifests() -> Vec<ProjectManifest> {
         }
     }
     manifests
+}
+
+pub fn list_workspace_project_manifests() -> Vec<ProjectManifest> {
+    list_project_manifests_from(workspace_projects_dir())
 }
 
 fn list_project_manifests_from(root: PathBuf) -> Vec<ProjectManifest> {

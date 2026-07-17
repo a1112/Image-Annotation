@@ -6,8 +6,9 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc, Barrier, OnceLock,
     },
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -20,9 +21,12 @@ use axum::{
 };
 use clap::CommandFactory;
 use http_body_util::BodyExt;
-use image_annotation_lib::remote_server::{
-    build_router, build_router_with_private_routes, shutdown_signal, with_upload_body_limit,
-    PrivateRouteGroups, Role, ServerConfig,
+use image_annotation_lib::{
+    project_fs::{self, ProjectManifest},
+    remote_server::{
+        build_router, build_router_with_private_routes, shutdown_signal, with_upload_body_limit,
+        PrivateRouteGroups, Role, ServerConfig,
+    },
 };
 use serde_json::Value;
 use tower::ServiceExt;
@@ -34,8 +38,17 @@ const SHARED_TOKEN: &str = "shared-token-0123456789abcdef0123456789abcdef";
 const HELP_READER_SECRET: &str = "help-reader-0123456789abcdef0123456789abcdef";
 const HELP_EDITOR_SECRET: &str = "help-editor-0123456789abcdef0123456789abcdef";
 const HELP_ADMIN_SECRET: &str = "help-admin-0123456789abcdef0123456789abcdef";
+const CONCURRENT_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_CONCURRENT_TEST_DATA_DIR";
 static PROJECT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static PROCESS_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+struct RemoveDirectoryOnDrop(PathBuf);
+
+impl Drop for RemoveDirectoryOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 fn process_data_root() -> PathBuf {
     PROCESS_DATA_ROOT
@@ -59,6 +72,19 @@ fn unique_project(prefix: &str) -> (String, String) {
     let name = format!("{prefix} {} {sequence}", std::process::id());
     let id = name.to_ascii_lowercase().replace(' ', "-");
     (name, id)
+}
+
+fn fixture_manifest(id: &str, name: &str, root: &std::path::Path) -> ProjectManifest {
+    ProjectManifest {
+        id: id.to_string(),
+        name: name.to_string(),
+        source_dataset_key: "remote-workspace-test".to_string(),
+        format: "yolo-detect".to_string(),
+        root_path: root.to_string_lossy().to_string(),
+        created_at: "fixture-created-at".to_string(),
+        class_count: 0,
+        image_count: 0,
+    }
 }
 
 fn test_config(bind_ip: Ipv4Addr) -> ServerConfig {
@@ -227,6 +253,76 @@ fn shutdown_signal_is_a_sendable_future() {
     }
 
     assert_shutdown_future(shutdown_signal());
+}
+
+#[test]
+fn concurrent_router_initialization_for_same_data_dir_succeeds() {
+    let data_dir = std::env::temp_dir().join(format!(
+        "image-annotation-concurrent-router-{}-{}",
+        std::process::id(),
+        PROJECT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "concurrent_router_initialization_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(CONCURRENT_DATA_DIR_ENV, &data_dir)
+        .output()
+        .unwrap();
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(data_dir);
+    assert!(output.status.success(), "{rendered}");
+}
+
+#[test]
+#[ignore]
+fn concurrent_router_initialization_child() {
+    const ROUNDS: usize = 12;
+    const WORKERS: usize = 64;
+    let data_dir = PathBuf::from(std::env::var_os(CONCURRENT_DATA_DIR_ENV).unwrap());
+    fs::create_dir_all(&data_dir).unwrap();
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.data_dir = data_dir.clone();
+
+    for round in 0..ROUNDS {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = fs::remove_file(data_dir.join(format!("server.sqlite{suffix}")));
+        }
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let handles = (0..WORKERS)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let config = config.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    build_router(config)
+                        .map(|_| ())
+                        .map_err(|error| error.code())
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .expect("router initialization thread panicked")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            results.iter().all(Result::is_ok),
+            "round {round} concurrent router initialization failures: {results:?}"
+        );
+    }
 }
 
 #[test]
@@ -866,6 +962,68 @@ async fn project_routes_reject_invalid_input_and_enforce_admin_mutations() {
     .await;
     assert_eq!(traversal_status, StatusCode::BAD_REQUEST, "{traversal}");
     assert_eq!(traversal["error"]["code"], "validation");
+}
+
+#[tokio::test]
+async fn remote_projects_never_fall_back_to_test_data_for_corrupt_workspace_manifest() {
+    let (workspace_name, project_id) = unique_project("Task3 workspace only");
+    let test_name = format!("{workspace_name} external test fixture");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    let workspace_dir = data_dir.join("projects").join(&project_id);
+    let workspace_manifest_path = workspace_dir.join("project.json");
+    let test_dir = project_fs::test_project_paths(&project_id).root;
+    let test_manifest_path = test_dir.join("project.json");
+    let _workspace_guard = RemoveDirectoryOnDrop(workspace_dir.clone());
+    let _test_guard = RemoveDirectoryOnDrop(test_dir.clone());
+    fs::create_dir_all(&workspace_dir).unwrap();
+    fs::create_dir_all(&test_dir).unwrap();
+    fs::write(
+        &workspace_manifest_path,
+        serde_json::to_vec_pretty(&fixture_manifest(
+            &project_id,
+            &workspace_name,
+            &workspace_dir,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &test_manifest_path,
+        serde_json::to_vec_pretty(&fixture_manifest(&project_id, &test_name, &test_dir)).unwrap(),
+    )
+    .unwrap();
+
+    let project_uri = format!("/api/v1/projects/{project_id}");
+    let (workspace_status, _, workspace_project) =
+        router_request(&app, Method::GET, &project_uri, READER_TOKEN, None).await;
+    assert_eq!(workspace_status, StatusCode::OK, "{workspace_project}");
+    assert_eq!(workspace_project["data"]["name"], workspace_name);
+
+    fs::write(&workspace_manifest_path, b"{ invalid workspace manifest").unwrap();
+
+    let (corrupt_status, _, corrupt_project) =
+        router_request(&app, Method::GET, &project_uri, READER_TOKEN, None).await;
+    assert_eq!(
+        corrupt_status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{corrupt_project}"
+    );
+    assert_eq!(corrupt_project["error"]["code"], "storage");
+    let corrupt_response = corrupt_project.to_string();
+    assert!(!corrupt_response.contains(&test_name));
+    assert!(!corrupt_response.contains(&test_dir.to_string_lossy().to_string()));
+
+    let (list_status, _, listed) =
+        router_request(&app, Method::GET, "/api/v1/projects", READER_TOKEN, None).await;
+    assert_eq!(list_status, StatusCode::OK, "{listed}");
+    assert!(!listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|project| project["id"] == project_id));
 }
 
 #[tokio::test]
