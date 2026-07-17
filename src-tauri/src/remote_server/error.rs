@@ -147,6 +147,23 @@ impl ApiError {
         )
     }
 
+    pub(crate) fn range_not_satisfiable(size: u64) -> Self {
+        Self {
+            status: StatusCode::RANGE_NOT_SATISFIABLE,
+            code: "range_not_satisfiable",
+            message: "the requested byte range cannot be satisfied",
+            details: serde_json::json!({ "size": size }),
+        }
+    }
+
+    fn unsupported_image_format() -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_image_format",
+            "the image format cannot be decoded for thumbnail generation",
+        )
+    }
+
     pub(crate) fn into_response(self, request_id: String) -> Response {
         let status = self.status;
         let envelope = ErrorEnvelope {
@@ -187,6 +204,7 @@ impl From<ServiceError> for ApiError {
             ServiceError::Validation => Self::validation(),
             ServiceError::NotFound => Self::not_found(),
             ServiceError::Conflict => Self::conflict(),
+            ServiceError::UnsupportedMedia => Self::unsupported_image_format(),
             ServiceError::Storage => Self::storage(),
         }
     }

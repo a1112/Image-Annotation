@@ -749,7 +749,7 @@ fn open_annotation_window(
 
     #[cfg(not(mobile))]
     {
-        return windows::open_annotation_window(&app, &project_id, first_image.as_deref());
+        windows::open_annotation_window(&app, &project_id, first_image.as_deref())
     }
 
     #[cfg(mobile)]

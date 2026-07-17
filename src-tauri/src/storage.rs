@@ -1,5 +1,8 @@
 use crate::project_fs::ProjectManifest;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{
+    params, params_from_iter, types::Value as SqlValue, Connection, OpenFlags, OptionalExtension,
+};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,6 +25,39 @@ pub struct StoredClass {
     pub id: u32,
     pub label: String,
     pub color: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSampleClass {
+    pub id: u32,
+    pub label: String,
+    pub object_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredSample {
+    pub image: StoredImage,
+    pub annotation_revision: Option<String>,
+    pub annotation_updated_at: Option<String>,
+    pub annotation_count: u32,
+    pub classes: Vec<StoredSampleClass>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredSampleFilter {
+    pub sample_id: Option<String>,
+    pub split: Option<String>,
+    pub status: Option<String>,
+    pub qa_status: Option<String>,
+    pub class_id: Option<u32>,
+    pub label: Option<String>,
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredSamplePage {
+    pub total: u64,
+    pub items: Vec<StoredSample>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -178,6 +214,14 @@ pub fn initialize_project_database(path: &Path) -> Result<(), String> {
                 object_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS sample_class_links (
+                image_id TEXT NOT NULL,
+                class_id INTEGER NOT NULL,
+                object_count INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (image_id, class_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sample_class_links_class
+                ON sample_class_links (class_id, image_id);
             CREATE TABLE IF NOT EXISTS annotation_versions (
                 id TEXT PRIMARY KEY,
                 image_id TEXT NOT NULL,
@@ -692,6 +736,358 @@ pub fn read_classes(path: &Path) -> Result<Vec<StoredClass>, String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| err.to_string())?;
     Ok(classes)
+}
+
+pub fn refresh_sample_class_links(
+    path: &Path,
+    classification_links: &[(String, u32)],
+) -> Result<(), String> {
+    initialize_project_database(path)?;
+    validate_project_database_artifacts(path)?;
+    let mut connection = open_project_database_writable(path)?;
+    validate_project_database_artifacts(path)?;
+    let transaction = connection.transaction().map_err(|err| err.to_string())?;
+    transaction
+        .execute("DELETE FROM sample_class_links", [])
+        .map_err(|err| err.to_string())?;
+    for (image_id, class_id) in classification_links {
+        transaction
+            .execute(
+                r#"
+                INSERT INTO sample_class_links (image_id, class_id, object_count)
+                VALUES (?1, ?2, 1)
+                ON CONFLICT(image_id, class_id) DO UPDATE SET
+                    object_count = MAX(sample_class_links.object_count, excluded.object_count)
+                "#,
+                params![image_id, class_id],
+            )
+            .map_err(|err| err.to_string())?;
+    }
+    validate_project_database_artifacts(path)?;
+    transaction.commit().map_err(|err| err.to_string())?;
+    validate_project_database_artifacts(path)
+}
+
+pub fn has_sample_class_links(path: &Path) -> Result<bool, String> {
+    validate_project_database_artifacts(path)?;
+    let connection = open_project_database_read_only(path)?;
+    let exists = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sample_class_links LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| err.to_string())?;
+    validate_project_database_artifacts(path)?;
+    Ok(exists)
+}
+
+pub fn query_samples(
+    path: &Path,
+    filter: &StoredSampleFilter,
+    offset: u32,
+    limit: u32,
+) -> Result<StoredSamplePage, String> {
+    if !path.exists() {
+        return Ok(StoredSamplePage {
+            total: 0,
+            items: Vec::new(),
+        });
+    }
+    validate_project_database_artifacts(path)?;
+    let connection = open_project_database_read_only(path)?;
+    validate_project_database_artifacts(path)?;
+    let (where_sql, values) = sample_filter_sql(filter);
+    let total_sql = format!("SELECT COUNT(*) FROM images AS i {where_sql}");
+    let total = connection
+        .query_row(&total_sql, params_from_iter(values.iter()), |row| {
+            row.get::<_, u64>(0)
+        })
+        .map_err(|err| err.to_string())?;
+
+    let mut page_values = values;
+    page_values.push(SqlValue::Integer(i64::from(limit)));
+    page_values.push(SqlValue::Integer(i64::from(offset)));
+    let row_sql = format!(
+        r#"
+        SELECT
+            i.id,
+            i.file_name,
+            i.width,
+            i.height,
+            i.split,
+            i.status,
+            i.qa_status,
+            i.review_note,
+            NULLIF(a.revision, ''),
+            a.updated_at,
+            CASE
+                WHEN a.object_json IS NOT NULL THEN json_array_length(a.object_json)
+                ELSE (
+                    SELECT COALESCE(SUM(links.object_count), 0)
+                    FROM sample_class_links AS links
+                    WHERE links.image_id = i.id
+                )
+            END
+        FROM images AS i
+        LEFT JOIN annotations AS a ON a.image_id = i.id
+        {where_sql}
+        ORDER BY i.file_name, i.id
+        LIMIT ? OFFSET ?
+        "#
+    );
+    let mut statement = connection
+        .prepare(&row_sql)
+        .map_err(|err| err.to_string())?;
+    let mut items = statement
+        .query_map(params_from_iter(page_values.iter()), |row| {
+            Ok(StoredSample {
+                image: stored_image_from_row(row)?,
+                annotation_revision: row.get(8)?,
+                annotation_updated_at: row.get(9)?,
+                annotation_count: row.get(10)?,
+                classes: Vec::new(),
+            })
+        })
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+
+    attach_sample_classes(&connection, &mut items)?;
+    validate_project_database_artifacts(path)?;
+    Ok(StoredSamplePage { total, items })
+}
+
+pub fn update_sample_metadata(
+    path: &Path,
+    image_id: &str,
+    split: Option<&str>,
+    status: Option<&str>,
+    qa_status: Option<&str>,
+    review_note: Option<&str>,
+) -> Result<bool, String> {
+    initialize_project_database(path)?;
+    validate_project_database_artifacts(path)?;
+    let mut connection = open_project_database_writable(path)?;
+    validate_project_database_artifacts(path)?;
+    let transaction = connection.transaction().map_err(|err| err.to_string())?;
+    let updated = transaction
+        .execute(
+            r#"
+            UPDATE images
+            SET
+                split = COALESCE(?2, split),
+                status = COALESCE(?3, status),
+                qa_status = COALESCE(?4, qa_status),
+                review_note = COALESCE(?5, review_note)
+            WHERE id = ?1
+            "#,
+            params![image_id, split, status, qa_status, review_note],
+        )
+        .map_err(|err| err.to_string())?;
+    if updated == 1 {
+        transaction
+            .execute(
+                "INSERT INTO audit_events (id, action, image_id, message, created_at)
+                 VALUES (?1, 'sample.update', ?2, '更新样本元数据', ?3)",
+                params![unique_id("audit"), image_id, now_unix_string()],
+            )
+            .map_err(|err| err.to_string())?;
+    }
+    validate_project_database_artifacts(path)?;
+    transaction.commit().map_err(|err| err.to_string())?;
+    validate_project_database_artifacts(path)?;
+    Ok(updated == 1)
+}
+
+fn open_project_database_read_only(path: &Path) -> Result<Connection, String> {
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn sample_filter_sql(filter: &StoredSampleFilter) -> (String, Vec<SqlValue>) {
+    let mut clauses = Vec::<String>::new();
+    let mut values = Vec::new();
+    if let Some(sample_id) = &filter.sample_id {
+        clauses.push("i.id = ?".to_string());
+        values.push(SqlValue::Text(sample_id.clone()));
+    }
+    if let Some(split) = &filter.split {
+        clauses.push("i.split = ?".to_string());
+        values.push(SqlValue::Text(split.clone()));
+    }
+    if let Some(status) = &filter.status {
+        clauses.push("i.status = ?".to_string());
+        values.push(SqlValue::Text(status.clone()));
+    }
+    if let Some(qa_status) = &filter.qa_status {
+        clauses.push("i.qa_status = ?".to_string());
+        values.push(SqlValue::Text(qa_status.clone()));
+    }
+    if filter.class_id.is_some() || filter.label.is_some() {
+        let mut link_clauses = vec!["links.image_id = i.id".to_string()];
+        let mut annotation_clauses = vec![
+            "annotations.image_id = i.id".to_string(),
+            "json_type(objects.value, '$.classId') = 'integer'".to_string(),
+        ];
+        if let Some(class_id) = filter.class_id {
+            link_clauses.push("links.class_id = ?".to_string());
+            values.push(SqlValue::Integer(i64::from(class_id)));
+        }
+        if let Some(label) = &filter.label {
+            link_clauses.push("LOWER(classes.label) = LOWER(?)".to_string());
+            values.push(SqlValue::Text(label.clone()));
+        }
+        if let Some(class_id) = filter.class_id {
+            annotation_clauses
+                .push("CAST(json_extract(objects.value, '$.classId') AS INTEGER) = ?".to_string());
+            values.push(SqlValue::Integer(i64::from(class_id)));
+        }
+        if let Some(label) = &filter.label {
+            annotation_clauses.push(
+                "LOWER(COALESCE(
+                    json_extract(objects.value, '$.label'),
+                    annotation_classes.label
+                )) = LOWER(?)"
+                    .to_string(),
+            );
+            values.push(SqlValue::Text(label.clone()));
+        }
+        clauses.push(format!(
+            "EXISTS (
+                SELECT 1
+                FROM sample_class_links AS links
+                JOIN classes ON classes.id = links.class_id
+                WHERE {}
+                UNION ALL
+                SELECT 1
+                FROM annotations
+                JOIN json_each(annotations.object_json) AS objects
+                LEFT JOIN classes AS annotation_classes
+                    ON annotation_classes.id =
+                        CAST(json_extract(objects.value, '$.classId') AS INTEGER)
+                WHERE {}
+            )",
+            link_clauses.join(" AND "),
+            annotation_clauses.join(" AND ")
+        ));
+    }
+    if let Some(query) = &filter.query {
+        clauses.push(
+            "(LOWER(i.id) LIKE ? ESCAPE '\\' OR LOWER(i.file_name) LIKE ? ESCAPE '\\')".into(),
+        );
+        let pattern = format!("%{}%", escape_like_pattern(&query.to_lowercase()));
+        values.push(SqlValue::Text(pattern.clone()));
+        values.push(SqlValue::Text(pattern));
+    }
+    if clauses.is_empty() {
+        (String::new(), values)
+    } else {
+        (format!("WHERE {}", clauses.join(" AND ")), values)
+    }
+}
+
+fn attach_sample_classes(
+    connection: &Connection,
+    items: &mut [StoredSample],
+) -> Result<(), String> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("?", items.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        SELECT
+            associations.image_id,
+            associations.class_id,
+            associations.label,
+            MAX(associations.object_count)
+        FROM (
+            SELECT
+                links.image_id,
+                classes.id AS class_id,
+                classes.label,
+                links.object_count
+            FROM sample_class_links AS links
+            JOIN classes ON classes.id = links.class_id
+            WHERE links.image_id IN ({placeholders})
+            UNION ALL
+            SELECT
+                annotations.image_id,
+                CAST(json_extract(objects.value, '$.classId') AS INTEGER) AS class_id,
+                COALESCE(
+                    json_extract(objects.value, '$.label'),
+                    annotation_classes.label
+                ) AS label,
+                COUNT(*) AS object_count
+            FROM annotations
+            JOIN json_each(annotations.object_json) AS objects
+            LEFT JOIN classes AS annotation_classes
+                ON annotation_classes.id =
+                    CAST(json_extract(objects.value, '$.classId') AS INTEGER)
+            WHERE annotations.image_id IN ({placeholders})
+                AND json_type(objects.value, '$.classId') = 'integer'
+            GROUP BY
+                annotations.image_id,
+                CAST(json_extract(objects.value, '$.classId') AS INTEGER),
+                COALESCE(
+                    json_extract(objects.value, '$.label'),
+                    annotation_classes.label
+                )
+        ) AS associations
+        GROUP BY
+            associations.image_id,
+            associations.class_id,
+            associations.label
+        ORDER BY associations.image_id, associations.class_id
+        "#
+    );
+    let mut ids = items
+        .iter()
+        .map(|item| SqlValue::Text(item.image.id.clone()))
+        .collect::<Vec<_>>();
+    ids.extend(
+        items
+            .iter()
+            .map(|item| SqlValue::Text(item.image.id.clone())),
+    );
+    let mut statement = connection.prepare(&sql).map_err(|err| err.to_string())?;
+    let rows = statement
+        .query_map(params_from_iter(ids.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                StoredSampleClass {
+                    id: row.get(1)?,
+                    label: row.get(2)?,
+                    object_count: row.get(3)?,
+                },
+            ))
+        })
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    let mut classes_by_image = BTreeMap::<String, Vec<StoredSampleClass>>::new();
+    for (image_id, class) in rows {
+        classes_by_image.entry(image_id).or_default().push(class);
+    }
+    for item in items {
+        item.classes = classes_by_image.remove(&item.image.id).unwrap_or_default();
+    }
+    Ok(())
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn stored_image_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredImage> {

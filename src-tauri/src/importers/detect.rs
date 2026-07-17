@@ -1,6 +1,9 @@
 use super::adapter::{has_extension, AnnotationFormatAdapter, DetectionResult, SourceSelection};
 use serde_json::Value;
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 pub fn detect_source(paths: &[PathBuf]) -> Result<DetectionResult, String> {
     let selection = SourceSelection::from_paths(paths)?;
@@ -223,7 +226,7 @@ fn read_json(path: &PathBuf) -> Option<Value> {
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
-fn is_yolo_label_candidate(path: &PathBuf) -> bool {
+fn is_yolo_label_candidate(path: &Path) -> bool {
     if !has_extension(path, "txt") {
         return false;
     }

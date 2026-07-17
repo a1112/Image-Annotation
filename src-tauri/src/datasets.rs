@@ -387,7 +387,7 @@ pub fn import_images_into_project(
     let target_dir = paths.raw.join("images").join("imported");
     fs::create_dir_all(&target_dir).map_err(|err| err.to_string())?;
     for entry in WalkDir::new(&source).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() || !domain::is_image_path(&entry.path().to_path_buf()) {
+        if !entry.file_type().is_file() || !domain::is_image_path(entry.path()) {
             continue;
         }
         let file_name = entry
@@ -880,7 +880,7 @@ fn write_demo_image(path: &Path, index: u32) -> Result<(), String> {
     let width = 640;
     let height = 420;
     let image = image::RgbaImage::from_fn(width, height, |x, y| {
-        let lane = if (x / 80 + y / 60 + index) % 2 == 0 {
+        let lane = if (x / 80 + y / 60 + index).is_multiple_of(2) {
             32
         } else {
             18
@@ -1029,9 +1029,7 @@ fn indexed_image_paths(raw_root: &Path) -> Vec<PathBuf> {
     WalkDir::new(raw_root)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_type().is_file() && domain::is_image_path(&entry.path().to_path_buf())
-        })
+        .filter(|entry| entry.file_type().is_file() && domain::is_image_path(entry.path()))
         .map(|entry| entry.path().to_path_buf())
         .collect()
 }

@@ -31,6 +31,7 @@ use image_annotation_lib::{
 };
 use rusqlite::OptionalExtension;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 const READER_TOKEN: &str = "reader-token-0123456789abcdef0123456789abcdef";
@@ -559,6 +560,31 @@ async fn router_request(
     (status, headers, json)
 }
 
+async fn router_raw_request(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    bearer: &str,
+    request_headers: &[(&str, &str)],
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+    for (name, value) in request_headers {
+        request = request.header(*name, *value);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, body.to_vec())
+}
+
 async fn create_empty_project(app: &Router, name: &str, project_id: &str) -> Value {
     let (status, _, project) = router_request(
         app,
@@ -574,6 +600,128 @@ async fn create_empty_project(app: &Router, name: &str, project_id: &str) -> Val
     assert_eq!(status, StatusCode::CREATED, "{project}");
     assert_eq!(project["data"]["id"], project_id);
     project
+}
+
+async fn create_demo_project(
+    app: &Router,
+    name: &str,
+    project_id: &str,
+    dataset_type: &str,
+    demo_template: &str,
+) -> Value {
+    let (status, _, project) = router_request(
+        app,
+        Method::POST,
+        "/api/v1/projects",
+        ADMIN_TOKEN,
+        Some(serde_json::json!({
+            "name": name,
+            "datasetType": dataset_type,
+            "demoTemplate": demo_template
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{project}");
+    assert_eq!(project["data"]["id"], project_id);
+    project
+}
+
+fn seed_remote_sample_fixture(data_dir: &Path, project_id: &str) {
+    let connection = rusqlite::Connection::open(
+        data_dir
+            .join("projects")
+            .join(project_id)
+            .join("project.sqlite"),
+    )
+    .unwrap();
+    connection
+        .execute(
+            "UPDATE images SET split = 'train', status = '已标注', qa_status = '待质检' WHERE id = 'demo_001'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE images SET split = 'val', status = '草稿', qa_status = '' WHERE id = 'demo_002'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE images SET split = 'train', status = '已标注', qa_status = '待质检' WHERE id = 'demo_003'",
+            [],
+        )
+        .unwrap();
+    for (image_id, objects) in [
+        (
+            "demo_001",
+            serde_json::json!([
+                {
+                    "id": "bbox-1",
+                    "classId": 0,
+                    "label": "object",
+                    "type": "bbox",
+                    "bbox": {"x": 10.0, "y": 12.0, "width": 30.0, "height": 24.0},
+                    "attributes": {}
+                },
+                {
+                    "id": "bbox-2",
+                    "classId": 1,
+                    "label": "region",
+                    "type": "bbox",
+                    "bbox": {"x": 20.0, "y": 22.0, "width": 40.0, "height": 34.0},
+                    "attributes": {}
+                }
+            ]),
+        ),
+        (
+            "demo_002",
+            serde_json::json!([
+                {
+                    "id": "bbox-3",
+                    "classId": 0,
+                    "label": "object",
+                    "type": "bbox",
+                    "bbox": {"x": 8.0, "y": 9.0, "width": 18.0, "height": 19.0},
+                    "attributes": {}
+                }
+            ]),
+        ),
+        (
+            "demo_003",
+            serde_json::json!([
+                {
+                    "id": "polygon-1",
+                    "classId": 1,
+                    "label": "region",
+                    "type": "polygon",
+                    "polygon": [
+                        {"x": 1.0, "y": 1.0},
+                        {"x": 11.0, "y": 1.0},
+                        {"x": 11.0, "y": 11.0}
+                    ],
+                    "attributes": {}
+                }
+            ]),
+        ),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO annotations (id, image_id, revision, object_json, updated_at)
+                 VALUES (?1, ?1, 'fixture-revision', ?2, 'fixture-updated-at')",
+                rusqlite::params![image_id, objects.to_string()],
+            )
+            .unwrap();
+    }
+}
+
+fn sha256_etag(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let encoded = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("\"sha256-{encoded}\"")
 }
 
 fn assert_request_id(headers: &axum::http::HeaderMap, body: &Value) {
@@ -3166,6 +3314,409 @@ async fn corrupt_workspace_manifest_never_falls_back_outside_the_configured_root
         .unwrap()
         .iter()
         .any(|project| project["id"] == project_id));
+}
+
+#[test]
+fn sample_list_combines_filters_with_accurate_total_and_pagination() {
+    run_ignored_test_in_subprocess(
+        "sample_list_combines_filters_with_accurate_total_and_pagination_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn sample_list_combines_filters_with_accurate_total_and_pagination_child() {
+    let (name, project_id) = unique_project("Task4 sample list");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    seed_remote_sample_fixture(&data_dir, &project_id);
+    rusqlite::Connection::open(
+        data_dir
+            .join("projects")
+            .join(&project_id)
+            .join("project.sqlite"),
+    )
+    .unwrap()
+    .execute("DROP TABLE sample_class_links", [])
+    .unwrap();
+
+    let uri = format!(
+        "/api/v1/projects/{project_id}/samples?offset=0&limit=1&split=train&status=%E5%B7%B2%E6%A0%87%E6%B3%A8&qaStatus=%E5%BE%85%E8%B4%A8%E6%A3%80&classId=1&label=region&q=demo_00"
+    );
+    let (status, _, response) = router_request(&app, Method::GET, &uri, READER_TOKEN, None).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["data"]["offset"], 0);
+    assert_eq!(response["data"]["limit"], 1);
+    assert_eq!(response["data"]["total"], 2);
+    assert_eq!(response["data"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(response["data"]["items"][0]["id"], "demo_001");
+    assert_eq!(response["data"]["items"][0]["annotationCount"], 2);
+    assert_eq!(response["data"]["items"][0]["classes"][1]["id"], 1);
+
+    let page_uri = format!("/api/v1/projects/{project_id}/samples?offset=1&limit=1");
+    let (page_status, _, page) =
+        router_request(&app, Method::GET, &page_uri, READER_TOKEN, None).await;
+    assert_eq!(page_status, StatusCode::OK, "{page}");
+    assert_eq!(page["data"]["total"], 3);
+    assert_eq!(page["data"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page["data"]["items"][0]["id"], "demo_002");
+}
+
+#[test]
+fn sample_list_filters_classification_samples_by_actual_class() {
+    run_ignored_test_in_subprocess(
+        "sample_list_filters_classification_samples_by_actual_class_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn sample_list_filters_classification_samples_by_actual_class_child() {
+    let (name, project_id) = unique_project("Task4 classification");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let app = build_router(config).unwrap();
+    create_demo_project(
+        &app,
+        &name,
+        &project_id,
+        "image-classification",
+        "demo-classification",
+    )
+    .await;
+
+    for query in ["classId=1", "label=region"] {
+        let uri = format!("/api/v1/projects/{project_id}/samples?{query}");
+        let (status, _, response) =
+            router_request(&app, Method::GET, &uri, READER_TOKEN, None).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["data"]["total"], 1);
+        assert_eq!(response["data"]["items"][0]["id"], "demo_002");
+        assert_eq!(response["data"]["items"][0]["classes"][0]["id"], 1);
+        assert_eq!(
+            response["data"]["items"][0]["classes"][0]["label"],
+            "region"
+        );
+    }
+}
+
+#[test]
+fn sample_detail_and_patch_validate_fields_and_roles() {
+    run_ignored_test_in_subprocess("sample_detail_and_patch_validate_fields_and_roles_child");
+}
+
+#[tokio::test]
+#[ignore]
+async fn sample_detail_and_patch_validate_fields_and_roles_child() {
+    let (name, project_id) = unique_project("Task4 sample patch");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    seed_remote_sample_fixture(&data_dir, &project_id);
+    let uri = format!("/api/v1/projects/{project_id}/samples/demo_001");
+
+    let (detail_status, _, detail) =
+        router_request(&app, Method::GET, &uri, READER_TOKEN, None).await;
+    assert_eq!(detail_status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["data"]["id"], "demo_001");
+    assert_eq!(detail["data"]["fileName"], "demo_001.png");
+    assert_eq!(detail["data"]["annotationRevision"], "fixture-revision");
+    assert_eq!(detail["data"]["classes"][0]["label"], "object");
+    assert!(!detail
+        .to_string()
+        .contains(&data_dir.to_string_lossy().to_string()));
+
+    let patch = serde_json::json!({
+        "split": "val",
+        "status": "草稿",
+        "qaStatus": "驳回",
+        "reviewNote": "needs another pass"
+    });
+    let (reader_status, _, reader_response) =
+        router_request(&app, Method::PATCH, &uri, READER_TOKEN, Some(patch.clone())).await;
+    assert_eq!(reader_status, StatusCode::FORBIDDEN, "{reader_response}");
+
+    let (editor_status, _, updated) =
+        router_request(&app, Method::PATCH, &uri, EDITOR_TOKEN, Some(patch)).await;
+    assert_eq!(editor_status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["data"]["split"], "val");
+    assert_eq!(updated["data"]["status"], "草稿");
+    assert_eq!(updated["data"]["qaStatus"], "驳回");
+    assert_eq!(updated["data"]["reviewNote"], "needs another pass");
+    assert_eq!(updated["data"]["annotationRevision"], "fixture-revision");
+
+    for invalid in [
+        serde_json::json!({"split": "production"}),
+        serde_json::json!({"status": "deleted"}),
+        serde_json::json!({"annotationRevision": "forbidden"}),
+        serde_json::json!({}),
+    ] {
+        let (status, _, response) =
+            router_request(&app, Method::PATCH, &uri, EDITOR_TOKEN, Some(invalid)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"]["code"], "validation");
+    }
+}
+
+#[test]
+fn sample_routes_report_unknown_resources_and_invalid_filters() {
+    run_ignored_test_in_subprocess(
+        "sample_routes_report_unknown_resources_and_invalid_filters_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn sample_routes_report_unknown_resources_and_invalid_filters_child() {
+    let (name, project_id) = unique_project("Task4 unknown samples");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let app = build_router(config).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+
+    for uri in [
+        "/api/v1/projects/missing-project/samples".to_string(),
+        format!("/api/v1/projects/{project_id}/samples/missing-sample"),
+        format!("/api/v1/projects/{project_id}/samples/missing-sample/content"),
+        format!("/api/v1/projects/{project_id}/samples/missing-sample/thumbnail"),
+    ] {
+        let (status, _, response) =
+            router_request(&app, Method::GET, &uri, READER_TOKEN, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+        assert_eq!(response["error"]["code"], "not_found");
+    }
+
+    for query in [
+        "split=production",
+        "status=deleted",
+        "qaStatus=unknown",
+        "classId=not-a-number",
+        "limit=0",
+        "limit=501",
+    ] {
+        let uri = format!("/api/v1/projects/{project_id}/samples?{query}");
+        let (status, _, response) =
+            router_request(&app, Method::GET, &uri, READER_TOKEN, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"]["code"], "validation");
+    }
+}
+
+#[test]
+fn sample_content_supports_etag_head_and_single_byte_ranges() {
+    run_ignored_test_in_subprocess(
+        "sample_content_supports_etag_head_and_single_byte_ranges_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn sample_content_supports_etag_head_and_single_byte_ranges_child() {
+    let (name, project_id) = unique_project("Task4 sample content");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let app = build_router(config).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let uri = format!("/api/v1/projects/{project_id}/samples/demo_001/content");
+
+    let (status, headers, bytes) =
+        router_raw_request(&app, Method::GET, &uri, READER_TOKEN, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CONTENT_TYPE], "image/png");
+    assert_eq!(headers[header::ACCEPT_RANGES], "bytes");
+    assert!(!bytes.is_empty());
+    let etag = headers[header::ETAG].to_str().unwrap().to_string();
+
+    let (cached_status, cached_headers, cached_body) = router_raw_request(
+        &app,
+        Method::GET,
+        &uri,
+        READER_TOKEN,
+        &[("if-none-match", &etag)],
+    )
+    .await;
+    assert_eq!(cached_status, StatusCode::NOT_MODIFIED);
+    assert_eq!(cached_headers[header::ETAG], etag);
+    assert!(cached_body.is_empty());
+
+    let (head_status, head_headers, head_body) =
+        router_raw_request(&app, Method::HEAD, &uri, READER_TOKEN, &[]).await;
+    assert_eq!(head_status, StatusCode::OK);
+    assert_eq!(head_headers[header::CONTENT_TYPE], "image/png");
+    assert_eq!(head_headers[header::ETAG], etag);
+    assert!(head_body.is_empty());
+
+    let (range_status, range_headers, range_body) = router_raw_request(
+        &app,
+        Method::GET,
+        &uri,
+        READER_TOKEN,
+        &[("range", "bytes=0-9")],
+    )
+    .await;
+    assert_eq!(range_status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(range_body, bytes[..10]);
+    assert_eq!(
+        range_headers[header::CONTENT_RANGE],
+        format!("bytes 0-9/{}", bytes.len())
+    );
+    assert_eq!(range_headers[header::ACCEPT_RANGES], "bytes");
+
+    for range in ["bytes=999999-", "bytes=0-1,4-5", "items=0-1"] {
+        let (range_status, range_headers, range_body) =
+            router_raw_request(&app, Method::GET, &uri, READER_TOKEN, &[("range", range)]).await;
+        assert_eq!(range_status, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            range_headers[header::CONTENT_RANGE],
+            format!("bytes */{}", bytes.len())
+        );
+        let error: Value = serde_json::from_slice(&range_body).unwrap();
+        assert_eq!(error["error"]["code"], "range_not_satisfiable");
+    }
+}
+
+#[test]
+fn thumbnail_is_generated_in_project_storage_with_sha256_etag() {
+    run_ignored_test_in_subprocess(
+        "thumbnail_is_generated_in_project_storage_with_sha256_etag_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn thumbnail_is_generated_in_project_storage_with_sha256_etag_child() {
+    let (name, project_id) = unique_project("Task4 thumbnail");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let thumbnail_dir = data_dir
+        .join("projects")
+        .join(&project_id)
+        .join("assets")
+        .join("thumbnails");
+    fs::remove_dir_all(&thumbnail_dir).unwrap();
+    fs::create_dir(&thumbnail_dir).unwrap();
+    let uri = format!("/api/v1/projects/{project_id}/samples/demo_001/thumbnail");
+
+    let (status, headers, bytes) =
+        router_raw_request(&app, Method::GET, &uri, READER_TOKEN, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CONTENT_TYPE], "image/jpeg");
+    assert_eq!(headers[header::ETAG], sha256_etag(&bytes));
+    let files = fs::read_dir(&thumbnail_dir)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(files.len(), 1);
+    let thumbnail_path = files[0].path();
+    assert_eq!(fs::read(&thumbnail_path).unwrap(), bytes);
+    let (width, height) = image::image_dimensions(&thumbnail_path).unwrap();
+    assert!(width <= 320 && height <= 320);
+
+    let etag = headers[header::ETAG].to_str().unwrap().to_string();
+    let (cached_status, _, cached_body) = router_raw_request(
+        &app,
+        Method::GET,
+        &uri,
+        READER_TOKEN,
+        &[("if-none-match", &etag)],
+    )
+    .await;
+    assert_eq!(cached_status, StatusCode::NOT_MODIFIED);
+    assert!(cached_body.is_empty());
+}
+
+#[test]
+fn sample_assets_reject_database_path_escape_and_file_links() {
+    run_ignored_test_in_subprocess(
+        "sample_assets_reject_database_path_escape_and_file_links_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn sample_assets_reject_database_path_escape_and_file_links_child() {
+    let (name, project_id) = unique_project("Task4 asset escape");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let sqlite = project_dir.join("project.sqlite");
+    let external_dir = unique_temp_root("task4-external-assets");
+    fs::create_dir_all(&external_dir).unwrap();
+    let _external_cleanup = RemoveDirectoryOnDrop(external_dir.clone());
+    let sentinel = external_dir.join("sentinel.png");
+    fs::write(&sentinel, b"external sentinel").unwrap();
+
+    rusqlite::Connection::open(&sqlite)
+        .unwrap()
+        .execute(
+            "UPDATE images SET file_name = ?1 WHERE id = 'demo_001'",
+            [sentinel.to_string_lossy().to_string()],
+        )
+        .unwrap();
+    let detail_uri = format!("/api/v1/projects/{project_id}/samples/demo_001");
+    let (detail_status, _, detail) =
+        router_request(&app, Method::GET, &detail_uri, READER_TOKEN, None).await;
+    assert_eq!(detail_status, StatusCode::INTERNAL_SERVER_ERROR, "{detail}");
+    assert_eq!(detail["error"]["code"], "storage");
+    assert!(!detail
+        .to_string()
+        .contains(&external_dir.to_string_lossy().to_string()));
+
+    let uri = format!("/api/v1/projects/{project_id}/samples/demo_001/content");
+    let (escape_status, _, escape_body) =
+        router_raw_request(&app, Method::GET, &uri, READER_TOKEN, &[]).await;
+    assert_eq!(escape_status, StatusCode::INTERNAL_SERVER_ERROR);
+    let escape_error: Value = serde_json::from_slice(&escape_body).unwrap();
+    assert_eq!(escape_error["error"]["code"], "storage");
+    assert_eq!(fs::read(&sentinel).unwrap(), b"external sentinel");
+
+    let link_path = project_dir
+        .join("assets")
+        .join("original")
+        .join("linked.png");
+    if create_file_link(&sentinel, &link_path).is_ok() {
+        rusqlite::Connection::open(&sqlite)
+            .unwrap()
+            .execute(
+                "UPDATE images SET file_name = 'linked.png' WHERE id = 'demo_001'",
+                [],
+            )
+            .unwrap();
+        let (link_status, _, link_body) =
+            router_raw_request(&app, Method::GET, &uri, READER_TOKEN, &[]).await;
+        assert_eq!(link_status, StatusCode::INTERNAL_SERVER_ERROR);
+        let link_error: Value = serde_json::from_slice(&link_body).unwrap();
+        assert_eq!(link_error["error"]["code"], "storage");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"external sentinel");
+        remove_directory_entry(&link_path);
+    }
+    rusqlite::Connection::open(&sqlite)
+        .unwrap()
+        .execute(
+            "UPDATE images SET file_name = 'demo_001.png' WHERE id = 'demo_001'",
+            [],
+        )
+        .unwrap();
 }
 
 #[tokio::test]

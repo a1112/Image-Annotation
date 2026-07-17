@@ -1,8 +1,8 @@
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::Write,
-    path::{Path, PathBuf},
+    io::{Cursor, Write},
+    path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock, Weak,
@@ -12,12 +12,16 @@ use std::{
 };
 
 use fs2::FileExt;
+use image::codecs::jpeg::JpegEncoder;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use walkdir::WalkDir;
 
 use crate::{
     datasets,
     domain::{DatasetProject, SampleRepository},
     project_fs,
+    storage::{self as project_storage, StoredSample, StoredSampleClass, StoredSampleFilter},
 };
 
 use super::{
@@ -31,6 +35,9 @@ use super::{
 
 const MAX_PROJECT_NAME_CHARS: usize = 128;
 const MAX_DESCRIPTION_CHARS: usize = 2_000;
+const MAX_SAMPLE_TEXT_CHARS: usize = 2_000;
+const MAX_SAMPLE_QUERY_CHARS: usize = 256;
+const THUMBNAIL_EDGE: u32 = 320;
 const CREATE_OWNERSHIP_FILE: &str = ".remote-create-owner";
 static PROJECT_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static DATA_ROOT_LEASES: OnceLock<Mutex<HashMap<PathBuf, Weak<DataRootLease>>>> = OnceLock::new();
@@ -103,6 +110,7 @@ pub(super) enum ServiceError {
     Validation,
     NotFound,
     Conflict,
+    UnsupportedMedia,
     Storage,
 }
 
@@ -117,6 +125,82 @@ impl ServiceError {
 pub(super) struct ProjectLifecycleResult {
     project_id: String,
     status: &'static str,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct SampleQueryOptions {
+    pub offset: u32,
+    pub limit: u32,
+    pub split: Option<String>,
+    pub status: Option<String>,
+    pub qa_status: Option<String>,
+    pub class_id: Option<u32>,
+    pub label: Option<String>,
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct SamplePatch {
+    pub split: Option<String>,
+    pub status: Option<String>,
+    pub qa_status: Option<String>,
+    pub review_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SampleClassView {
+    id: u32,
+    label: String,
+    object_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SampleView {
+    id: String,
+    file_name: String,
+    width: u32,
+    height: u32,
+    split: String,
+    status: String,
+    qa_status: String,
+    review_note: Option<String>,
+    annotation_revision: Option<String>,
+    annotation_updated_at: Option<String>,
+    annotation_count: u32,
+    classes: Vec<SampleClassView>,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SamplePage {
+    offset: u32,
+    limit: u32,
+    total: u64,
+    items: Vec<SampleView>,
+}
+
+#[derive(Debug)]
+pub(super) enum AssetSource {
+    Bytes(Vec<u8>),
+    File(File),
+}
+
+#[derive(Debug)]
+pub(super) struct AssetPayload {
+    pub source: AssetSource,
+    pub size: u64,
+    pub content_type: &'static str,
+    pub etag: String,
+}
+
+struct SampleProjectContext {
+    manifest: project_fs::ProjectManifest,
+    sqlite: PathBuf,
+    original_dir: PathBuf,
+    thumbnail_dir: PathBuf,
 }
 
 #[derive(Clone)]
@@ -209,6 +293,123 @@ impl RemoteSampleService {
         validate_project_id(project_id)?;
         let _mutation_guard = mutation_guard();
         self.get_project_locked(project_id)
+    }
+
+    pub(super) fn list_samples(
+        &self,
+        project_id: &str,
+        query: SampleQueryOptions,
+    ) -> Result<SamplePage, ServiceError> {
+        self.ensure_configured_root()?;
+        validate_project_id(project_id)?;
+        validate_sample_query(&query)?;
+        let _mutation_guard = mutation_guard();
+        self.query_samples_locked(project_id, query)
+    }
+
+    pub(super) fn get_sample(
+        &self,
+        project_id: &str,
+        sample_id: &str,
+    ) -> Result<SampleView, ServiceError> {
+        self.ensure_configured_root()?;
+        validate_project_id(project_id)?;
+        validate_sample_id(sample_id)?;
+        let _mutation_guard = mutation_guard();
+        self.get_sample_locked(project_id, sample_id)
+    }
+
+    pub(super) fn update_sample(
+        &self,
+        project_id: &str,
+        sample_id: &str,
+        patch: SamplePatch,
+    ) -> Result<SampleView, ServiceError> {
+        self.ensure_configured_root()?;
+        validate_project_id(project_id)?;
+        validate_sample_id(sample_id)?;
+        validate_sample_patch(&patch)?;
+        let _mutation_guard = mutation_guard();
+        let context = self.sample_project_context(project_id)?;
+        let updated = project_storage::update_sample_metadata(
+            &context.sqlite,
+            sample_id,
+            patch.split.as_deref(),
+            patch.status.as_deref(),
+            patch.qa_status.as_deref(),
+            patch.review_note.as_deref(),
+        )
+        .map_err(storage_failure)?;
+        if !updated {
+            return Err(ServiceError::NotFound);
+        }
+        self.get_sample_locked(project_id, sample_id)
+    }
+
+    pub(super) fn sample_content(
+        &self,
+        project_id: &str,
+        sample_id: &str,
+    ) -> Result<AssetPayload, ServiceError> {
+        self.ensure_configured_root()?;
+        validate_project_id(project_id)?;
+        validate_sample_id(sample_id)?;
+        let _mutation_guard = mutation_guard();
+        let context = self.sample_project_context(project_id)?;
+        let sample = self.stored_sample(&context, sample_id)?;
+        let path = self.resolve_sample_asset(&context, &sample.image.file_name)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(storage_failure)?;
+        let metadata = file.metadata().map_err(storage_failure)?;
+        Ok(AssetPayload {
+            content_type: image_content_type(&path)?,
+            etag: metadata_etag(&metadata),
+            size: metadata.len(),
+            source: AssetSource::File(file),
+        })
+    }
+
+    pub(super) fn sample_thumbnail(
+        &self,
+        project_id: &str,
+        sample_id: &str,
+    ) -> Result<AssetPayload, ServiceError> {
+        self.ensure_configured_root()?;
+        validate_project_id(project_id)?;
+        validate_sample_id(sample_id)?;
+        let _mutation_guard = mutation_guard();
+        let context = self.sample_project_context(project_id)?;
+        let sample = self.stored_sample(&context, sample_id)?;
+        let original_path = self.resolve_sample_asset(&context, &sample.image.file_name)?;
+        let cache_name = format!("{}.jpg", sha256_hex(sample_id.as_bytes()));
+        let cache_path = context.thumbnail_dir.join(cache_name);
+        let bytes = match fs::symlink_metadata(&cache_path) {
+            Ok(_) => {
+                self.validate_managed_asset_file(&context.thumbnail_dir, &cache_path)?;
+                fs::read(&cache_path).map_err(storage_failure)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let source = fs::read(&original_path).map_err(storage_failure)?;
+                let decoded =
+                    image::load_from_memory(&source).map_err(|_| ServiceError::UnsupportedMedia)?;
+                let thumbnail = decoded.thumbnail(THUMBNAIL_EDGE, THUMBNAIL_EDGE);
+                let mut bytes = Vec::new();
+                JpegEncoder::new_with_quality(Cursor::new(&mut bytes), 85)
+                    .encode_image(&thumbnail)
+                    .map_err(|_| ServiceError::UnsupportedMedia)?;
+                self.persist_thumbnail(&context.thumbnail_dir, &cache_path, &bytes)?;
+                bytes
+            }
+            Err(error) => return Err(storage_failure(error)),
+        };
+        Ok(AssetPayload {
+            etag: format!("\"sha256-{}\"", sha256_hex(&bytes)),
+            content_type: "image/jpeg",
+            size: bytes.len() as u64,
+            source: AssetSource::Bytes(bytes),
+        })
     }
 
     pub(super) fn create_project(
@@ -1174,6 +1375,251 @@ impl RemoteSampleService {
         Ok(())
     }
 
+    fn query_samples_locked(
+        &self,
+        project_id: &str,
+        query: SampleQueryOptions,
+    ) -> Result<SamplePage, ServiceError> {
+        let context = self.sample_project_context(project_id)?;
+        self.refresh_sample_classes(&context)?;
+        let filter = StoredSampleFilter {
+            sample_id: None,
+            split: query.split,
+            status: query.status,
+            qa_status: query.qa_status,
+            class_id: query.class_id,
+            label: query.label,
+            query: query.query,
+        };
+        let page =
+            project_storage::query_samples(&context.sqlite, &filter, query.offset, query.limit)
+                .map_err(storage_failure)?;
+        Ok(SamplePage {
+            offset: query.offset,
+            limit: query.limit,
+            total: page.total,
+            items: page
+                .items
+                .into_iter()
+                .map(sample_view)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
+    fn get_sample_locked(
+        &self,
+        project_id: &str,
+        sample_id: &str,
+    ) -> Result<SampleView, ServiceError> {
+        let context = self.sample_project_context(project_id)?;
+        self.refresh_sample_classes(&context)?;
+        sample_view(self.stored_sample(&context, sample_id)?)
+    }
+
+    fn stored_sample(
+        &self,
+        context: &SampleProjectContext,
+        sample_id: &str,
+    ) -> Result<StoredSample, ServiceError> {
+        let page = project_storage::query_samples(
+            &context.sqlite,
+            &StoredSampleFilter {
+                sample_id: Some(sample_id.to_string()),
+                ..StoredSampleFilter::default()
+            },
+            0,
+            1,
+        )
+        .map_err(storage_failure)?;
+        page.items.into_iter().next().ok_or(ServiceError::NotFound)
+    }
+
+    fn sample_project_context(
+        &self,
+        project_id: &str,
+    ) -> Result<SampleProjectContext, ServiceError> {
+        let project_dir = self
+            .existing_project_dir(self.projects_dir.as_ref(), project_id)?
+            .ok_or(ServiceError::NotFound)?;
+        let manifest = self.ensure_project_manifest(&project_dir, true)?;
+        let sqlite = project_dir.join("project.sqlite");
+        self.validate_project_database(&project_dir, &sqlite)?;
+        project_storage::initialize_project_database(&sqlite).map_err(storage_failure)?;
+        self.validate_project_database(&project_dir, &sqlite)?;
+        let original_dir = validate_managed_directory_chain(&project_dir, &["assets", "original"])?;
+        let thumbnail_dir =
+            validate_managed_directory_chain(&project_dir, &["assets", "thumbnails"])?;
+        Ok(SampleProjectContext {
+            manifest,
+            sqlite,
+            original_dir,
+            thumbnail_dir,
+        })
+    }
+
+    fn refresh_sample_classes(&self, context: &SampleProjectContext) -> Result<(), ServiceError> {
+        if context.manifest.format != "image-classification"
+            || project_storage::has_sample_class_links(&context.sqlite).map_err(storage_failure)?
+        {
+            return Ok(());
+        }
+        let classification_links = self.classification_links(context)?;
+        project_storage::refresh_sample_class_links(&context.sqlite, &classification_links)
+            .map_err(storage_failure)
+    }
+
+    fn classification_links(
+        &self,
+        context: &SampleProjectContext,
+    ) -> Result<Vec<(String, u32)>, ServiceError> {
+        let images =
+            project_storage::read_images(&context.sqlite, None).map_err(storage_failure)?;
+        let classes = project_storage::read_classes(&context.sqlite).map_err(storage_failure)?;
+        let exact_images = images
+            .iter()
+            .map(|image| (normalize_separator(&image.file_name), image.id.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut basename_images = HashMap::<String, Option<String>>::new();
+        for image in &images {
+            let Some(name) = Path::new(&image.file_name)
+                .file_name()
+                .and_then(|name| name.to_str())
+            else {
+                continue;
+            };
+            basename_images
+                .entry(name.to_string())
+                .and_modify(|entry| *entry = None)
+                .or_insert_with(|| Some(image.id.clone()));
+        }
+        let classes_by_label = classes
+            .into_iter()
+            .map(|class| (class.label, class.id))
+            .collect::<HashMap<_, _>>();
+        let mut links = Vec::new();
+        for entry in WalkDir::new(&context.original_dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+        {
+            let path = entry.path();
+            self.validate_managed_asset_file(&context.original_dir, path)?;
+            let relative = path
+                .strip_prefix(&context.original_dir)
+                .map_err(|_| ServiceError::Storage)?;
+            let relative_text = normalize_separator(&relative.to_string_lossy());
+            let image_id = exact_images.get(&relative_text).cloned().or_else(|| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| basename_images.get(name))
+                    .and_then(Clone::clone)
+            });
+            let Some(image_id) = image_id else {
+                continue;
+            };
+            let class_id = relative
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(value) => value.to_str(),
+                    _ => None,
+                })
+                .find_map(|component| classes_by_label.get(component).copied());
+            if let Some(class_id) = class_id {
+                links.push((image_id, class_id));
+            }
+        }
+        links.sort();
+        links.dedup();
+        Ok(links)
+    }
+
+    fn resolve_sample_asset(
+        &self,
+        context: &SampleProjectContext,
+        file_name: &str,
+    ) -> Result<PathBuf, ServiceError> {
+        let relative = validated_relative_asset_path(file_name)?;
+        let candidate = context.original_dir.join(&relative);
+        if fs::symlink_metadata(&candidate).is_ok() {
+            return self.validate_managed_asset_file(&context.original_dir, &candidate);
+        }
+        if relative.components().count() != 1 {
+            return Err(ServiceError::Storage);
+        }
+        let mut matches = WalkDir::new(&context.original_dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| entry.file_name() == relative.as_os_str())
+            .map(|entry| self.validate_managed_asset_file(&context.original_dir, entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        if matches.len() == 1 {
+            Ok(matches.remove(0))
+        } else {
+            Err(ServiceError::Storage)
+        }
+    }
+
+    fn validate_managed_asset_file(
+        &self,
+        root: &Path,
+        path: &Path,
+    ) -> Result<PathBuf, ServiceError> {
+        let relative = path.strip_prefix(root).map_err(|_| ServiceError::Storage)?;
+        let mut current = root.to_path_buf();
+        let components = relative.components().collect::<Vec<_>>();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            let Component::Normal(component) = component else {
+                return Err(ServiceError::Storage);
+            };
+            current.push(component);
+            let metadata = fs::symlink_metadata(&current).map_err(storage_failure)?;
+            if is_symlink_or_reparse(&metadata) || !metadata.is_dir() {
+                return Err(ServiceError::Storage);
+            }
+            let canonical = canonical_existing(&current).map_err(storage_failure)?;
+            if canonical.parent() != current.parent() || !canonical_path_is_within(root, &canonical)
+            {
+                return Err(ServiceError::Storage);
+            }
+            current = canonical;
+        }
+        validate_regular_file_within(root, path).map_err(storage_failure)
+    }
+
+    fn persist_thumbnail(
+        &self,
+        thumbnail_dir: &Path,
+        cache_path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), ServiceError> {
+        let temporary = thumbnail_dir.join(format!(
+            ".thumbnail-{}-{}.tmp",
+            std::process::id(),
+            CREATE_OWNERSHIP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+                .map_err(storage_failure)?;
+            file.write_all(bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(storage_failure)?;
+            self.validate_managed_asset_file(thumbnail_dir, &temporary)?;
+            fs::rename(&temporary, cache_path).map_err(storage_failure)?;
+            self.validate_managed_asset_file(thumbnail_dir, cache_path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
     fn get_project_locked(&self, project_id: &str) -> Result<DatasetProject, ServiceError> {
         let active_dir = self
             .existing_project_dir(self.projects_dir.as_ref(), project_id)?
@@ -1410,6 +1856,7 @@ fn acquire_data_root_lease(data_dir: &Path) -> Result<Arc<DataRootLease>, DataRo
     }
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
@@ -1541,6 +1988,199 @@ fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
     {
         false
     }
+}
+
+fn validate_managed_directory_chain(
+    root: &Path,
+    components: &[&str],
+) -> Result<PathBuf, ServiceError> {
+    let mut current = root.to_path_buf();
+    for component in components {
+        let candidate = current.join(component);
+        let metadata = fs::symlink_metadata(&candidate).map_err(storage_failure)?;
+        if is_symlink_or_reparse(&metadata) || !metadata.is_dir() {
+            return Err(ServiceError::Storage);
+        }
+        let canonical = canonical_existing(&candidate).map_err(storage_failure)?;
+        if canonical.parent() != Some(current.as_path())
+            || !canonical_path_is_within(root, &canonical)
+        {
+            return Err(ServiceError::Storage);
+        }
+        current = canonical;
+    }
+    Ok(current)
+}
+
+fn validated_relative_asset_path(value: &str) -> Result<PathBuf, ServiceError> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(ServiceError::Storage);
+    }
+    let normalized = value.replace('\\', "/");
+    let path = PathBuf::from(normalized);
+    let valid = !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+    if valid {
+        Ok(path)
+    } else {
+        Err(ServiceError::Storage)
+    }
+}
+
+fn validate_sample_id(sample_id: &str) -> Result<(), ServiceError> {
+    let valid = !sample_id.is_empty()
+        && sample_id.len() <= 256
+        && !sample_id.chars().any(char::is_control)
+        && !sample_id.contains('/')
+        && !sample_id.contains('\\');
+    if valid {
+        Ok(())
+    } else {
+        Err(ServiceError::Validation)
+    }
+}
+
+fn validate_sample_query(query: &SampleQueryOptions) -> Result<(), ServiceError> {
+    if query.limit == 0 || query.limit > 500 {
+        return Err(ServiceError::Validation);
+    }
+    if query
+        .split
+        .as_deref()
+        .is_some_and(|value| !valid_split(value))
+        || query
+            .status
+            .as_deref()
+            .is_some_and(|value| !valid_status(value))
+        || query
+            .qa_status
+            .as_deref()
+            .is_some_and(|value| !valid_qa_status(value))
+        || query.label.as_deref().is_some_and(|value| {
+            value.trim().is_empty()
+                || value.chars().count() > 128
+                || value.chars().any(char::is_control)
+        })
+        || query.query.as_deref().is_some_and(|value| {
+            value.trim().is_empty()
+                || value.chars().count() > MAX_SAMPLE_QUERY_CHARS
+                || value.chars().any(char::is_control)
+        })
+    {
+        return Err(ServiceError::Validation);
+    }
+    Ok(())
+}
+
+fn validate_sample_patch(patch: &SamplePatch) -> Result<(), ServiceError> {
+    if patch.split.is_none()
+        && patch.status.is_none()
+        && patch.qa_status.is_none()
+        && patch.review_note.is_none()
+    {
+        return Err(ServiceError::Validation);
+    }
+    if patch
+        .split
+        .as_deref()
+        .is_some_and(|value| !valid_split(value))
+        || patch
+            .status
+            .as_deref()
+            .is_some_and(|value| !valid_status(value))
+        || patch
+            .qa_status
+            .as_deref()
+            .is_some_and(|value| !valid_qa_status(value))
+        || patch.review_note.as_deref().is_some_and(|value| {
+            value.chars().count() > MAX_SAMPLE_TEXT_CHARS
+                || value.chars().any(|character| {
+                    character.is_control() && character != '\n' && character != '\t'
+                })
+        })
+    {
+        return Err(ServiceError::Validation);
+    }
+    Ok(())
+}
+
+fn valid_split(value: &str) -> bool {
+    matches!(value, "train" | "val" | "test" | "local")
+}
+
+fn valid_status(value: &str) -> bool {
+    matches!(value, "未标注" | "草稿" | "已标注" | "待质检" | "通过")
+}
+
+fn valid_qa_status(value: &str) -> bool {
+    matches!(value, "" | "待质检" | "通过" | "驳回")
+}
+
+fn sample_view(sample: StoredSample) -> Result<SampleView, ServiceError> {
+    let file_name = validated_relative_asset_path(&sample.image.file_name)?
+        .to_string_lossy()
+        .replace('\\', "/");
+    Ok(SampleView {
+        id: sample.image.id,
+        file_name,
+        width: sample.image.width,
+        height: sample.image.height,
+        split: sample.image.split.clone(),
+        status: sample.image.status,
+        qa_status: sample.image.qa_status,
+        review_note: sample.image.review_note,
+        annotation_revision: sample.annotation_revision,
+        annotation_updated_at: sample.annotation_updated_at,
+        annotation_count: sample.annotation_count,
+        classes: sample.classes.into_iter().map(sample_class_view).collect(),
+        tags: vec![format!("split={}", sample.image.split)],
+    })
+}
+
+fn sample_class_view(class: StoredSampleClass) -> SampleClassView {
+    SampleClassView {
+        id: class.id,
+        label: class.label,
+        object_count: class.object_count,
+    }
+}
+
+fn normalize_separator(value: &str) -> String {
+    value.replace('\\', "/")
+}
+
+fn image_content_type(path: &Path) -> Result<&'static str, ServiceError> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => Ok("image/jpeg"),
+        Some("png") => Ok("image/png"),
+        Some("bmp") => Ok("image/bmp"),
+        Some("webp") => Ok("image/webp"),
+        _ => Err(ServiceError::UnsupportedMedia),
+    }
+}
+
+fn metadata_etag(metadata: &fs::Metadata) -> String {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("\"meta-{:x}-{modified:x}\"", metadata.len())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn validate_project_id(project_id: &str) -> Result<(), ServiceError> {
@@ -1681,6 +2321,7 @@ fn failure_message(error: ServiceError) -> &'static str {
         ServiceError::Validation => "project mutation validation failed",
         ServiceError::NotFound => "project was not found",
         ServiceError::Conflict => "project mutation conflicted with existing state",
+        ServiceError::UnsupportedMedia => "project media format is not supported",
         ServiceError::Storage => "project storage operation failed",
     }
 }

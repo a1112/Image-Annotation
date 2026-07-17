@@ -27,7 +27,7 @@ pub fn open_annotation_window(
 
     if let Some(window) = app.get_webview_window(&label) {
         window
-            .eval(&annotation_navigation_script(&route))
+            .eval(annotation_navigation_script(&route))
             .map_err(|err| err.to_string())?;
         window.show().map_err(|err| err.to_string())?;
         window.set_focus().map_err(|err| err.to_string())?;

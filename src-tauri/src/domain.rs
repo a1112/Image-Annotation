@@ -601,9 +601,7 @@ impl SampleRepository {
         for entry in WalkDir::new(&asset_root)
             .into_iter()
             .filter_map(Result::ok)
-            .filter(|entry| {
-                entry.file_type().is_file() && is_image_path(&entry.path().to_path_buf())
-            })
+            .filter(|entry| entry.file_type().is_file() && is_image_path(entry.path()))
         {
             let path = entry.path().to_path_buf();
             let split = split_for_path(&path);
@@ -664,7 +662,7 @@ impl SampleRepository {
             .filter_map(Result::ok)
             .find(|entry| {
                 entry.file_type().is_file()
-                    && is_image_path(&entry.path().to_path_buf())
+                    && is_image_path(entry.path())
                     && image_id_matches(&asset_root, entry.path(), image_id)
             })
             .map(|entry| entry.path().to_path_buf())
@@ -1209,7 +1207,7 @@ impl SampleRepository {
     }
 }
 
-pub fn is_image_path(path: &PathBuf) -> bool {
+pub fn is_image_path(path: &Path) -> bool {
     path.extension()
         .map(|extension| {
             matches!(
@@ -1220,7 +1218,7 @@ pub fn is_image_path(path: &PathBuf) -> bool {
         .unwrap_or(false)
 }
 
-fn split_for_path(path: &PathBuf) -> String {
+fn split_for_path(path: &Path) -> String {
     let lower = path.to_string_lossy().to_ascii_lowercase();
     if lower.contains("val") {
         "val".to_string()
