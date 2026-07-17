@@ -28,6 +28,14 @@ pub struct StoredSampleMetadata {
     pub review_note: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleMutationEvidence {
+    None,
+    Committed,
+    Compensated,
+    Indeterminate,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredClass {
     pub id: u32,
@@ -936,6 +944,63 @@ pub fn read_sample_metadata(
         .map_err(|err| err.to_string())?;
     validate_project_database_artifacts(path)?;
     Ok(metadata)
+}
+
+pub fn sample_mutation_evidence(
+    path: &Path,
+    operation_id: &str,
+    image_id: &str,
+) -> Result<SampleMutationEvidence, String> {
+    validate_project_database_artifacts(path)?;
+    let connection = open_project_database_read_only(path)?;
+    let rollback_id = format!("{operation_id}:rollback");
+    let mut statement = connection
+        .prepare(
+            "SELECT id, action, image_id
+             FROM audit_events
+             WHERE id = ?1 OR id = ?2
+             ORDER BY id",
+        )
+        .map_err(|err| err.to_string())?;
+    let records = statement
+        .query_map(params![operation_id, rollback_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    validate_project_database_artifacts(path)?;
+
+    let mut committed = false;
+    let mut compensated = false;
+    for (id, action, recorded_image_id) in records {
+        let valid_image = recorded_image_id.as_deref() == Some(image_id);
+        if id == operation_id {
+            if action != "sample.update" || !valid_image {
+                return Ok(SampleMutationEvidence::Indeterminate);
+            }
+            committed = true;
+        } else if id == rollback_id {
+            if action != "sample.update.rollback" || !valid_image {
+                return Ok(SampleMutationEvidence::Indeterminate);
+            }
+            compensated = true;
+        } else {
+            return Ok(SampleMutationEvidence::Indeterminate);
+        }
+    }
+
+    if compensated {
+        Ok(SampleMutationEvidence::Compensated)
+    } else if committed {
+        Ok(SampleMutationEvidence::Committed)
+    } else {
+        Ok(SampleMutationEvidence::None)
+    }
 }
 
 pub fn restore_sample_metadata(

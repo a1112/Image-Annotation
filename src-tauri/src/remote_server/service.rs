@@ -22,8 +22,8 @@ use crate::{
     domain::{DatasetProject, SampleRepository},
     project_fs,
     storage::{
-        self as project_storage, StoredImage, StoredSample, StoredSampleClass, StoredSampleFilter,
-        StoredSampleMetadata,
+        self as project_storage, SampleMutationEvidence, StoredImage, StoredSample,
+        StoredSampleClass, StoredSampleFilter,
     },
 };
 
@@ -167,15 +167,6 @@ impl SampleMetadataSnapshot {
             status: image.status.clone(),
             qa_status: image.qa_status.clone(),
             review_note: image.review_note.clone(),
-        }
-    }
-
-    fn from_stored_metadata(metadata: StoredSampleMetadata) -> Self {
-        Self {
-            split: metadata.split,
-            status: metadata.status,
-            qa_status: metadata.qa_status,
-            review_note: metadata.review_note,
         }
     }
 
@@ -1231,49 +1222,47 @@ impl RemoteSampleService {
                     operation_id = %record.operation_id,
                     "failed to parse pending sample mutation payload"
                 );
-                self.fail_sample_reconciliation(
+                self.mark_sample_reconciliation_indeterminate(
                     &operation,
-                    "legacy or invalid sample mutation payload was not applied",
+                    "sample mutation evidence is indeterminate because its payload is invalid",
                 );
                 return;
             }
-        };
-        let Some(before) = payload.before else {
-            self.fail_sample_reconciliation(
-                &operation,
-                "legacy sample mutation has no trusted before state and was not applied",
-            );
-            return;
-        };
-        let Some(after) = payload.after else {
-            self.fail_sample_reconciliation(
-                &operation,
-                "legacy sample mutation has no trusted after state and was not applied",
-            );
-            return;
         };
         if record.project_id.as_deref() != Some(payload.project_id.as_str())
             || record.image_id.as_deref() != Some(payload.image_id.as_str())
             || validate_project_id(&payload.project_id).is_err()
             || validate_sample_id(&payload.image_id).is_err()
-            || validate_sample_patch(&payload.patch).is_err()
-            || validate_sample_metadata_snapshot(&before).is_err()
-            || validate_sample_metadata_snapshot(&after).is_err()
-            || before.apply_patch(&payload.patch) != after
         {
-            self.fail_sample_reconciliation(
+            self.mark_sample_reconciliation_indeterminate(
                 &operation,
-                "sample mutation audit identity or state validation failed",
+                "sample mutation evidence is indeterminate because its identity is inconsistent",
             );
             return;
         }
+        let trusted_payload = match (&payload.before, &payload.after) {
+            (Some(before), Some(after)) => {
+                validate_sample_patch(&payload.patch).is_ok()
+                    && validate_sample_metadata_snapshot(before).is_ok()
+                    && validate_sample_metadata_snapshot(after).is_ok()
+                    && before.apply_patch(&payload.patch) == *after
+            }
+            _ => false,
+        };
         let context = match self.sample_project_context(&payload.project_id) {
             Ok(context) => context,
             Err(ServiceError::NotFound) => {
-                self.fail_sample_reconciliation(
-                    &operation,
-                    "sample mutation project is missing and was not applied",
-                );
+                if trusted_payload {
+                    self.fail_sample_reconciliation(
+                        &operation,
+                        "sample metadata update was not committed to project storage",
+                    );
+                } else {
+                    self.mark_sample_reconciliation_indeterminate(
+                        &operation,
+                        "legacy sample mutation evidence is indeterminate",
+                    );
+                }
                 return;
             }
             Err(error) => {
@@ -1282,63 +1271,52 @@ impl RemoteSampleService {
                     operation_id = %record.operation_id,
                     "could not inspect pending sample mutation project"
                 );
-                self.note_pending_audit_best_effort(
+                self.mark_sample_reconciliation_indeterminate(
                     &operation,
-                    "sample mutation project could not be inspected during startup",
+                    "sample mutation project evidence is indeterminate",
                 );
                 return;
             }
         };
-        let current =
-            match project_storage::read_sample_metadata(&context.sqlite, &payload.image_id) {
-                Ok(Some(current)) => SampleMetadataSnapshot::from_stored_metadata(current),
-                Ok(None) => {
-                    self.fail_sample_reconciliation(
-                        &operation,
-                        "sample mutation target is missing and was not applied",
-                    );
-                    return;
-                }
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        operation_id = %record.operation_id,
-                        "could not inspect pending sample metadata"
-                    );
-                    self.note_pending_audit_best_effort(
-                        &operation,
-                        "sample metadata could not be inspected during startup",
-                    );
-                    return;
-                }
-            };
-        if current == after {
-            self.complete_sample_reconciliation(&operation, "sample metadata update reconciled");
-            return;
-        }
-        if current == before {
-            self.fail_sample_reconciliation(
-                &operation,
-                "sample metadata update was not applied before restart",
-            );
-            return;
-        }
-        match self.restore_sample_metadata(&context, &payload.image_id, &before, &operation) {
-            Ok(()) => self.fail_sample_reconciliation(
-                &operation,
-                "partial sample metadata update rolled back during startup",
-            ),
+        let evidence = match project_storage::sample_mutation_evidence(
+            &context.sqlite,
+            &record.operation_id,
+            &payload.image_id,
+        ) {
+            Ok(evidence) => evidence,
             Err(error) => {
                 tracing::error!(
-                    ?error,
+                    %error,
                     operation_id = %record.operation_id,
-                    "failed to roll back partial sample metadata update"
+                    "could not read pending sample mutation evidence"
                 );
-                self.note_pending_audit_best_effort(
+                self.mark_sample_reconciliation_indeterminate(
                     &operation,
-                    "partial sample metadata rollback failed during startup",
+                    "sample mutation project evidence is indeterminate",
                 );
+                return;
             }
+        };
+        match evidence {
+            SampleMutationEvidence::Committed => {
+                self.complete_sample_reconciliation(&operation, "sample metadata update reconciled")
+            }
+            SampleMutationEvidence::Compensated => self.fail_sample_reconciliation(
+                &operation,
+                "sample metadata update was compensated in project storage",
+            ),
+            SampleMutationEvidence::None if trusted_payload => self.fail_sample_reconciliation(
+                &operation,
+                "sample metadata update was not committed to project storage",
+            ),
+            SampleMutationEvidence::None => self.mark_sample_reconciliation_indeterminate(
+                &operation,
+                "legacy sample mutation evidence is indeterminate",
+            ),
+            SampleMutationEvidence::Indeterminate => self.mark_sample_reconciliation_indeterminate(
+                &operation,
+                "sample mutation project evidence is indeterminate",
+            ),
         }
     }
 
@@ -1366,6 +1344,20 @@ impl RemoteSampleService {
             self.note_pending_audit_best_effort(
                 operation,
                 "sample mutation reconciliation could not update the audit state",
+            );
+        }
+    }
+
+    fn mark_sample_reconciliation_indeterminate(&self, operation: &AuditOperation, message: &str) {
+        if let Err(error) = self.storage.mark_audit_indeterminate(operation, message) {
+            tracing::error!(
+                %error,
+                operation_id = %operation.operation_id,
+                "failed to mark sample audit indeterminate"
+            );
+            self.note_pending_audit_best_effort(
+                operation,
+                "sample mutation evidence could not be determined during startup",
             );
         }
     }

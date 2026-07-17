@@ -220,6 +220,15 @@ impl ServerStorage {
         update_operation(&connection, operation, "failed", message)
     }
 
+    pub(super) fn mark_audit_indeterminate(
+        &self,
+        operation: &AuditOperation,
+        message: &str,
+    ) -> Result<(), String> {
+        let connection = self.connection()?;
+        update_operation(&connection, operation, "indeterminate", message)
+    }
+
     pub(super) fn note_pending_audit(
         &self,
         operation: &AuditOperation,

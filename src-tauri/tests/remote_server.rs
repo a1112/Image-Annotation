@@ -1,16 +1,19 @@
 use std::{
-    ffi::c_int,
+    collections::HashMap,
     fs,
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
+    pin::Pin,
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Barrier, Mutex, OnceLock,
+        Arc, Barrier, Mutex, OnceLock, Weak,
     },
+    task::{Context, Poll},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -25,15 +28,17 @@ use http_body_util::BodyExt;
 use image_annotation_lib::{
     project_fs::ProjectManifest,
     remote_server::{
-        build_router, build_router_with_private_routes, shutdown_signal, with_upload_body_limit,
-        PrivateRouteGroups, Role, ServerConfig,
+        build_router as build_remote_router,
+        build_router_with_private_routes as build_remote_router_with_private_routes,
+        shutdown_signal, with_upload_body_limit, PrivateRouteGroups, Role, ServerBuildError,
+        ServerConfig,
     },
     storage::{self, StoredImage},
 };
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tower::ServiceExt;
+use tower::{Service, ServiceExt};
 
 const READER_TOKEN: &str = "reader-token-0123456789abcdef0123456789abcdef";
 const EDITOR_TOKEN: &str = "editor-token-0123456789abcdef0123456789abcdef";
@@ -45,14 +50,182 @@ const HELP_ADMIN_SECRET: &str = "help-admin-0123456789abcdef0123456789abcdef";
 const CONCURRENT_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_CONCURRENT_TEST_DATA_DIR";
 const ISOLATED_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_ISOLATED_TEST_DATA_DIR";
 const LEASE_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_LEASE_TEST_DATA_DIR";
-const CLEANUP_RESULT_PATH_ENV: &str = "IMAGE_ANNOTATION_CLEANUP_TEST_RESULT_PATH";
 static PROJECT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static TEST_DATA_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-static PROCESS_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
 static TEST_SCHEMA_MIGRATION: Mutex<()> = Mutex::new(());
+static TEST_DATA_ROOT_GUARDS: OnceLock<Mutex<HashMap<PathBuf, Weak<TestDataRoot>>>> =
+    OnceLock::new();
 
-extern "C" {
-    fn atexit(callback: extern "C" fn()) -> c_int;
+#[derive(Debug, Clone)]
+struct TestDataRootGuard(Arc<TestDataRoot>);
+
+#[derive(Debug)]
+struct TestDataRoot {
+    path: PathBuf,
+}
+
+impl Drop for TestDataRoot {
+    fn drop(&mut self) {
+        if let Err(error) = remove_test_data_root(&self.path) {
+            if thread::panicking() {
+                eprintln!("failed to remove test data root {:?}: {error}", self.path);
+            } else {
+                panic!("failed to remove test data root {:?}: {error}", self.path);
+            }
+        }
+    }
+}
+
+impl TestDataRootGuard {
+    fn new(path: PathBuf) -> Self {
+        assert!(path.is_absolute(), "test data root must be absolute");
+        fs::create_dir_all(&path).unwrap();
+        let registry = TEST_DATA_ROOT_GUARDS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut roots = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(root) = roots.get(&path).and_then(Weak::upgrade) {
+            return Self(root);
+        }
+        let root = Arc::new(TestDataRoot { path: path.clone() });
+        roots.insert(path, Arc::downgrade(&root));
+        Self(root)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0.path
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TestServerConfig {
+    config: ServerConfig,
+    data_root: TestDataRootGuard,
+}
+
+impl Deref for TestServerConfig {
+    type Target = ServerConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
+
+impl DerefMut for TestServerConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.config
+    }
+}
+
+struct TestRouter {
+    router: Option<Router>,
+    data_root: Option<TestDataRootGuard>,
+}
+
+impl Clone for TestRouter {
+    fn clone(&self) -> Self {
+        Self {
+            router: self.router.clone(),
+            data_root: self.data_root.clone(),
+        }
+    }
+}
+
+impl Deref for TestRouter {
+    type Target = Router;
+
+    fn deref(&self) -> &Self::Target {
+        self.router
+            .as_ref()
+            .expect("test router was already dropped")
+    }
+}
+
+impl Service<Request<Body>> for TestRouter {
+    type Response = <Router as Service<Request<Body>>>::Response;
+    type Error = <Router as Service<Request<Body>>>::Error;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        <Router as Service<Request<Body>>>::poll_ready(
+            self.router
+                .as_mut()
+                .expect("test router was already dropped"),
+            context,
+        )
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let future = <Router as Service<Request<Body>>>::call(
+            self.router
+                .as_mut()
+                .expect("test router was already dropped"),
+            request,
+        );
+        let data_root = self
+            .data_root
+            .as_ref()
+            .expect("test data root was already dropped")
+            .clone();
+        Box::pin(async move {
+            let response = future.await;
+            drop(data_root);
+            response
+        })
+    }
+}
+
+impl Drop for TestRouter {
+    fn drop(&mut self) {
+        drop(self.router.take());
+        drop(self.data_root.take());
+    }
+}
+
+#[derive(Debug)]
+struct TestServerBuildError {
+    error: ServerBuildError,
+    _data_root: TestDataRootGuard,
+}
+
+impl Deref for TestServerBuildError {
+    type Target = ServerBuildError;
+
+    fn deref(&self) -> &Self::Target {
+        &self.error
+    }
+}
+
+fn build_router(config: TestServerConfig) -> Result<TestRouter, TestServerBuildError> {
+    let TestServerConfig { config, data_root } = config;
+    match build_remote_router(config) {
+        Ok(router) => Ok(TestRouter {
+            router: Some(router),
+            data_root: Some(data_root),
+        }),
+        Err(error) => Err(TestServerBuildError {
+            error,
+            _data_root: data_root,
+        }),
+    }
+}
+
+fn build_router_with_private_routes(
+    config: TestServerConfig,
+    groups: PrivateRouteGroups,
+) -> Result<TestRouter, TestServerBuildError> {
+    let TestServerConfig { config, data_root } = config;
+    match build_remote_router_with_private_routes(config, groups) {
+        Ok(router) => Ok(TestRouter {
+            router: Some(router),
+            data_root: Some(data_root),
+        }),
+        Err(error) => Err(TestServerBuildError {
+            error,
+            _data_root: data_root,
+        }),
+    }
 }
 
 struct RemoveDirectoryOnDrop(PathBuf);
@@ -123,49 +296,7 @@ fn remove_directory_entry(path: &Path) {
     let _ = fs::remove_dir_all(path);
 }
 
-fn process_data_root() -> PathBuf {
-    PROCESS_DATA_ROOT
-        .get_or_init(|| {
-            let root = if let Some(root) = std::env::var_os(ISOLATED_DATA_DIR_ENV) {
-                let root = PathBuf::from(root);
-                fs::create_dir_all(&root).unwrap();
-                root
-            } else {
-                let nonce = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos();
-                let root = std::env::temp_dir().join(format!(
-                    "image-annotation-remote-server-{}-{nonce}",
-                    std::process::id()
-                ));
-                fs::create_dir_all(&root).unwrap();
-                root
-            };
-            let registered = unsafe { atexit(cleanup_process_data_root_at_exit) };
-            assert_eq!(registered, 0, "failed to register process root cleanup");
-            root
-        })
-        .clone()
-}
-
-extern "C" fn cleanup_process_data_root_at_exit() {
-    let Some(data_dir) = PROCESS_DATA_ROOT.get() else {
-        return;
-    };
-    if let Err(error) = remove_process_data_root(data_dir) {
-        eprintln!("failed to clean process test root: {error}");
-        std::process::abort();
-    }
-    if let Some(result_path) = std::env::var_os(CLEANUP_RESULT_PATH_ENV) {
-        if let Err(error) = fs::write(result_path, b"removed") {
-            eprintln!("failed to record process test root cleanup: {error}");
-            std::process::abort();
-        }
-    }
-}
-
-fn remove_process_data_root(data_dir: &Path) -> std::io::Result<()> {
+fn remove_test_data_root(data_dir: &Path) -> std::io::Result<()> {
     let started = Instant::now();
     loop {
         match fs::remove_dir_all(data_dir) {
@@ -196,21 +327,16 @@ fn run_ignored_test_in_subprocess(test_name: &str) {
 }
 
 #[test]
-fn process_data_root_is_removed_after_child_process_exits() {
-    let data_dir = unique_temp_root("image-annotation-process-root-cleanup");
-    let result_dir = unique_temp_root("image-annotation-process-root-cleanup-result");
-    fs::create_dir_all(&result_dir).unwrap();
-    let _result_cleanup = RemoveDirectoryOnDrop(result_dir.clone());
-    let result_path = result_dir.join("cleanup-result");
+fn representative_router_root_is_removed_before_child_returns() {
+    let data_dir = unique_temp_root("image-annotation-explicit-root-cleanup");
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "process_data_root_cleanup_producer_child",
+            "representative_router_root_cleanup_child",
             "--ignored",
             "--nocapture",
         ])
         .env(ISOLATED_DATA_DIR_ENV, &data_dir)
-        .env(CLEANUP_RESULT_PATH_ENV, &result_path)
         .output()
         .unwrap();
     let rendered = format!(
@@ -221,16 +347,49 @@ fn process_data_root_is_removed_after_child_process_exits() {
     assert!(output.status.success(), "{rendered}");
     assert!(
         !data_dir.exists(),
-        "cleanup must finish before the child process reports success: {data_dir:?}"
+        "child must remove its complete test root before returning: {data_dir:?}"
     );
-    assert_eq!(fs::read_to_string(result_path).unwrap(), "removed");
 }
 
-#[test]
+#[tokio::test]
 #[ignore]
-fn process_data_root_cleanup_producer_child() {
-    let data_dir = process_data_root();
-    fs::write(data_dir.join("cleanup-sentinel"), b"cleanup").unwrap();
+async fn representative_router_root_cleanup_child() {
+    let (name, project_id) = unique_project("Task4 explicit root cleanup");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let content_uri = format!("/api/v1/projects/{project_id}/samples/demo_001/content");
+    let thumbnail_uri = format!("/api/v1/projects/{project_id}/samples/demo_001/thumbnail");
+    let (content_status, _, content) =
+        router_raw_request(&app, Method::GET, &content_uri, READER_TOKEN, &[]).await;
+    assert_eq!(content_status, StatusCode::OK);
+    assert!(!content.is_empty());
+    let (thumbnail_status, _, thumbnail) =
+        router_raw_request(&app, Method::GET, &thumbnail_uri, READER_TOKEN, &[]).await;
+    assert_eq!(thumbnail_status, StatusCode::OK);
+    assert!(!thumbnail.is_empty());
+    let sqlite = rusqlite::Connection::open(
+        data_dir
+            .join("projects")
+            .join(&project_id)
+            .join("project.sqlite"),
+    )
+    .unwrap();
+    let image_count: u64 = sqlite
+        .query_row("SELECT COUNT(*) FROM images", [], |row| row.get(0))
+        .unwrap();
+    assert!(image_count > 0);
+
+    drop(sqlite);
+    drop(app);
+    drop(config);
+    assert!(
+        !data_dir.exists(),
+        "RAII guard must remove the root after Router and SQLite handles close"
+    );
 }
 
 fn unique_project(prefix: &str) -> (String, String) {
@@ -495,6 +654,47 @@ fn insert_project_sample_update_event(
     .unwrap();
 }
 
+fn insert_project_sample_rollback_event(
+    data_dir: &Path,
+    project_id: &str,
+    image_id: &str,
+    operation_id: &str,
+) {
+    rusqlite::Connection::open(
+        data_dir
+            .join("projects")
+            .join(project_id)
+            .join("project.sqlite"),
+    )
+    .unwrap()
+    .execute(
+        "INSERT INTO audit_events (id, action, image_id, message, created_at)
+         VALUES (?1, 'sample.update.rollback', ?2, 'fixture compensated sample update', 'fixture-created-at')",
+        rusqlite::params![format!("{operation_id}:rollback"), image_id],
+    )
+    .unwrap();
+}
+
+fn project_sample_operation_event_count(
+    data_dir: &Path,
+    project_id: &str,
+    operation_id: &str,
+) -> u64 {
+    rusqlite::Connection::open(
+        data_dir
+            .join("projects")
+            .join(project_id)
+            .join("project.sqlite"),
+    )
+    .unwrap()
+    .query_row(
+        "SELECT COUNT(*) FROM audit_events WHERE id IN (?1, ?2)",
+        rusqlite::params![operation_id, format!("{operation_id}:rollback")],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
 fn sample_operation_state(data_dir: &Path, operation_id: &str) -> (String, String) {
     rusqlite::Connection::open(data_dir.join("server.sqlite"))
         .unwrap()
@@ -645,24 +845,28 @@ fn create_file_link(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_file(target, link)
 }
 
-fn test_config(bind_ip: Ipv4Addr) -> ServerConfig {
-    let process_root = process_data_root();
-    let data_dir = if std::env::var_os(ISOLATED_DATA_DIR_ENV).is_some() {
-        process_root
+fn test_config(bind_ip: Ipv4Addr) -> TestServerConfig {
+    let data_dir = if let Some(data_dir) = std::env::var_os(ISOLATED_DATA_DIR_ENV) {
+        PathBuf::from(data_dir)
     } else {
         let sequence = TEST_DATA_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let data_dir = process_root.join(format!("test-{sequence}"));
-        fs::create_dir(&data_dir).unwrap();
-        data_dir
+        std::env::temp_dir().join(format!(
+            "image-annotation-remote-server-{}-{sequence}",
+            std::process::id()
+        ))
     };
-    ServerConfig {
-        bind: SocketAddr::new(IpAddr::V4(bind_ip), 17311),
-        data_dir,
-        reader_token: None,
-        editor_token: None,
-        admin_token: None,
-        allowed_origins: Vec::new(),
-        max_upload_bytes: 2 * 1024 * 1024 * 1024,
+    let data_root = TestDataRootGuard::new(data_dir.clone());
+    TestServerConfig {
+        config: ServerConfig {
+            bind: SocketAddr::new(IpAddr::V4(bind_ip), 17311),
+            data_dir,
+            reader_token: None,
+            editor_token: None,
+            admin_token: None,
+            allowed_origins: Vec::new(),
+            max_upload_bytes: 2 * 1024 * 1024 * 1024,
+        },
+        data_root,
     }
 }
 
@@ -671,18 +875,23 @@ fn ordinary_test_configs_use_distinct_data_roots_and_clones_share_one() {
     let first = test_config(Ipv4Addr::LOCALHOST);
     let first_clone = first.clone();
     let second = test_config(Ipv4Addr::LOCALHOST);
+    let first_root = first.data_dir.clone();
+    let second_root = second.data_dir.clone();
 
     assert_eq!(first.data_dir, first_clone.data_dir);
     assert_ne!(first.data_dir, second.data_dir);
-    assert_eq!(first.data_dir.parent(), Some(process_data_root().as_path()));
-    assert_eq!(
-        second.data_dir.parent(),
-        Some(process_data_root().as_path())
-    );
+    assert_eq!(first.data_root.path(), first.data_dir);
+    assert_eq!(second.data_root.path(), second.data_dir);
+    drop(first);
+    assert!(first_root.exists(), "clone must retain the shared root");
+    drop(first_clone);
+    assert!(!first_root.exists(), "last clone must remove the root");
+    drop(second);
+    assert!(!second_root.exists(), "independent root must be removed");
 }
 
 async fn request(
-    config: ServerConfig,
+    config: TestServerConfig,
     method: Method,
     uri: &str,
     bearer: Option<&str>,
@@ -706,7 +915,7 @@ async fn request(
 }
 
 async fn router_request(
-    app: &Router,
+    app: &TestRouter,
     method: Method,
     uri: &str,
     bearer: &str,
@@ -737,7 +946,7 @@ async fn router_request(
 }
 
 async fn router_raw_request(
-    app: &Router,
+    app: &TestRouter,
     method: Method,
     uri: &str,
     bearer: &str,
@@ -761,7 +970,7 @@ async fn router_raw_request(
     (status, headers, body.to_vec())
 }
 
-async fn create_empty_project(app: &Router, name: &str, project_id: &str) -> Value {
+async fn create_empty_project(app: &TestRouter, name: &str, project_id: &str) -> Value {
     let (status, _, project) = router_request(
         app,
         Method::POST,
@@ -779,7 +988,7 @@ async fn create_empty_project(app: &Router, name: &str, project_id: &str) -> Val
 }
 
 async fn create_demo_project(
-    app: &Router,
+    app: &TestRouter,
     name: &str,
     project_id: &str,
     dataset_type: &str,
@@ -954,7 +1163,7 @@ fn assert_request_id(headers: &axum::http::HeaderMap, body: &Value) {
 }
 
 async fn health_with_client_request_id(
-    app: Router,
+    app: TestRouter,
     client_request_id: &str,
 ) -> (axum::http::HeaderMap, Value) {
     let response = app
@@ -1536,7 +1745,7 @@ async fn reader_can_list() {
     let (status, headers, body) =
         request(config, Method::GET, "/api/v1/projects", Some(READER_TOKEN)).await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["data"].is_array());
     assert_request_id(&headers, &body);
 }
@@ -3882,7 +4091,82 @@ async fn pending_sample_mutation_before_project_update_fails_on_restart_child() 
     );
     let (state, message) = sample_operation_state(&data_dir, &operation_id);
     assert_eq!(state, "failed");
-    assert!(message.contains("not applied"), "{message}");
+    assert!(message.contains("not committed"), "{message}");
+}
+
+#[test]
+fn pending_samples_without_project_evidence_preserve_unrelated_current_metadata() {
+    run_ignored_test_in_subprocess(
+        "pending_samples_without_project_evidence_preserve_unrelated_current_metadata_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn pending_samples_without_project_evidence_preserve_unrelated_current_metadata_child() {
+    let (name, project_id) = unique_project("Task4 sample no project evidence");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let before_one = read_sample_metadata(&data_dir, &project_id, "demo_001");
+    let after_one = SampleMetadataFixture {
+        split: "val".to_string(),
+        status: "已标注".to_string(),
+        qa_status: "待质检".to_string(),
+        review_note: Some("coincidental target".to_string()),
+    };
+    let before_two = read_sample_metadata(&data_dir, &project_id, "demo_002");
+    let after_two = SampleMetadataFixture {
+        split: "test".to_string(),
+        status: "已标注".to_string(),
+        qa_status: "通过".to_string(),
+        review_note: Some("unused target".to_string()),
+    };
+    let unrelated_two = SampleMetadataFixture {
+        split: "val".to_string(),
+        status: before_two.status.clone(),
+        qa_status: "驳回".to_string(),
+        review_note: Some("later local edit".to_string()),
+    };
+    let server = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    let operation_one = insert_pending_sample_operation(
+        &server,
+        &project_id,
+        "demo_001",
+        &sample_mutation_payload(&project_id, "demo_001", &before_one, &after_one),
+    );
+    let operation_two = insert_pending_sample_operation(
+        &server,
+        &project_id,
+        "demo_002",
+        &sample_mutation_payload(&project_id, "demo_002", &before_two, &after_two),
+    );
+    drop(server);
+    write_sample_metadata(&data_dir, &project_id, "demo_001", &after_one);
+    write_sample_metadata(&data_dir, &project_id, "demo_002", &unrelated_two);
+    drop(app);
+
+    let _restarted = build_router(config).expect("missing project evidence must not block startup");
+
+    assert_eq!(
+        read_sample_metadata(&data_dir, &project_id, "demo_001"),
+        after_one
+    );
+    assert_eq!(
+        read_sample_metadata(&data_dir, &project_id, "demo_002"),
+        unrelated_two
+    );
+    for operation_id in [&operation_one, &operation_two] {
+        let (state, message) = sample_operation_state(&data_dir, operation_id);
+        assert_eq!(state, "failed", "{operation_id}: {message}");
+        assert!(message.contains("not committed"), "{message}");
+        assert_eq!(
+            project_sample_operation_event_count(&data_dir, &project_id, operation_id),
+            0
+        );
+    }
 }
 
 #[test]
@@ -3931,16 +4215,16 @@ async fn pending_sample_mutation_after_project_commit_completes_on_restart_child
 }
 
 #[test]
-fn partial_pending_sample_mutation_rolls_back_with_compensation_on_restart() {
+fn committed_sample_mutation_preserves_later_local_edit_on_restart() {
     run_ignored_test_in_subprocess(
-        "partial_pending_sample_mutation_rolls_back_with_compensation_on_restart_child",
+        "committed_sample_mutation_preserves_later_local_edit_on_restart_child",
     );
 }
 
 #[tokio::test]
 #[ignore]
-async fn partial_pending_sample_mutation_rolls_back_with_compensation_on_restart_child() {
-    let (name, project_id) = unique_project("Task4 pending sample partial");
+async fn committed_sample_mutation_preserves_later_local_edit_on_restart_child() {
+    let (name, project_id) = unique_project("Task4 committed sample later edit");
     let mut config = test_config(Ipv4Addr::LOCALHOST);
     config.admin_token = Some(ADMIN_TOKEN.to_string());
     let data_dir = config.data_dir.clone();
@@ -3953,11 +4237,11 @@ async fn partial_pending_sample_mutation_rolls_back_with_compensation_on_restart
         qa_status: "待质检".to_string(),
         review_note: Some("full target".to_string()),
     };
-    let partial = SampleMetadataFixture {
-        split: after.split.clone(),
-        status: before.status.clone(),
-        qa_status: before.qa_status.clone(),
-        review_note: before.review_note.clone(),
+    let later_edit = SampleMetadataFixture {
+        split: "test".to_string(),
+        status: "草稿".to_string(),
+        qa_status: "驳回".to_string(),
+        review_note: Some("local edit after remote commit".to_string()),
     };
     let payload = sample_mutation_payload(&project_id, "demo_001", &before, &after);
     let operation_id = insert_pending_sample_operation(
@@ -3966,102 +4250,138 @@ async fn partial_pending_sample_mutation_rolls_back_with_compensation_on_restart
         "demo_001",
         &payload,
     );
-    write_sample_metadata(&data_dir, &project_id, "demo_001", &partial);
     insert_project_sample_update_event(&data_dir, &project_id, "demo_001", &operation_id);
+    write_sample_metadata(&data_dir, &project_id, "demo_001", &later_edit);
     drop(app);
 
-    let _restarted = build_router(config).expect("partial pending must not block startup");
+    let _restarted = build_router(config).expect("committed pending must not block startup");
 
     assert_eq!(
         read_sample_metadata(&data_dir, &project_id, "demo_001"),
-        before
+        later_edit
     );
     let (state, message) = sample_operation_state(&data_dir, &operation_id);
-    assert_eq!(state, "failed");
-    assert!(message.contains("rolled back"), "{message}");
-    let rollback: (String, String) = rusqlite::Connection::open(
-        data_dir
-            .join("projects")
-            .join(&project_id)
-            .join("project.sqlite"),
-    )
-    .unwrap()
-    .query_row(
-        "SELECT action, image_id FROM audit_events WHERE id = ?1",
-        [format!("{operation_id}:rollback")],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
-    .unwrap();
-    assert_eq!(rollback.0, "sample.update.rollback");
-    assert_eq!(rollback.1, "demo_001");
+    assert_eq!(state, "completed");
+    assert!(message.contains("reconciled"), "{message}");
+    assert_eq!(
+        project_sample_operation_event_count(&data_dir, &project_id, &operation_id),
+        1
+    );
 }
 
 #[test]
-fn legacy_mismatched_and_missing_pending_samples_fail_without_blocking_startup() {
+fn compensated_sample_mutation_preserves_current_metadata_on_restart() {
     run_ignored_test_in_subprocess(
-        "legacy_mismatched_and_missing_pending_samples_fail_without_blocking_startup_child",
+        "compensated_sample_mutation_preserves_current_metadata_on_restart_child",
     );
 }
 
 #[tokio::test]
 #[ignore]
-async fn legacy_mismatched_and_missing_pending_samples_fail_without_blocking_startup_child() {
-    let (name, project_id) = unique_project("Task4 pending sample conservative");
+async fn compensated_sample_mutation_preserves_current_metadata_on_restart_child() {
+    let (name, project_id) = unique_project("Task4 compensated sample");
     let mut config = test_config(Ipv4Addr::LOCALHOST);
     config.admin_token = Some(ADMIN_TOKEN.to_string());
     let data_dir = config.data_dir.clone();
     let app = build_router(config.clone()).unwrap();
     create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
     let before = read_sample_metadata(&data_dir, &project_id, "demo_001");
-    let after = SampleMetadataFixture {
+    let target = SampleMetadataFixture {
+        split: "val".to_string(),
+        status: "已标注".to_string(),
+        qa_status: "待质检".to_string(),
+        review_note: Some("compensated target".to_string()),
+    };
+    let current = SampleMetadataFixture {
+        split: "test".to_string(),
+        status: "草稿".to_string(),
+        qa_status: "驳回".to_string(),
+        review_note: Some("local state after compensation".to_string()),
+    };
+    let operation_id = insert_pending_sample_operation(
+        &rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap(),
+        &project_id,
+        "demo_001",
+        &sample_mutation_payload(&project_id, "demo_001", &before, &target),
+    );
+    insert_project_sample_update_event(&data_dir, &project_id, "demo_001", &operation_id);
+    insert_project_sample_rollback_event(&data_dir, &project_id, "demo_001", &operation_id);
+    write_sample_metadata(&data_dir, &project_id, "demo_001", &current);
+    drop(app);
+
+    let _restarted = build_router(config).expect("compensated pending must not block startup");
+
+    assert_eq!(
+        read_sample_metadata(&data_dir, &project_id, "demo_001"),
+        current
+    );
+    let (state, message) = sample_operation_state(&data_dir, &operation_id);
+    assert_eq!(state, "failed");
+    assert!(message.contains("compensated"), "{message}");
+    assert_eq!(
+        project_sample_operation_event_count(&data_dir, &project_id, &operation_id),
+        2
+    );
+}
+
+#[test]
+fn legacy_applied_sample_without_bound_evidence_becomes_indeterminate() {
+    run_ignored_test_in_subprocess(
+        "legacy_applied_sample_without_bound_evidence_becomes_indeterminate_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn legacy_applied_sample_without_bound_evidence_becomes_indeterminate_child() {
+    let (name, project_id) = unique_project("Task4 legacy sample evidence");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let applied = SampleMetadataFixture {
         split: "val".to_string(),
         status: "草稿".to_string(),
         qa_status: String::new(),
-        review_note: None,
+        review_note: Some("legacy applied metadata".to_string()),
     };
-    let server = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
-    let legacy = insert_pending_sample_operation(
-        &server,
+    let operation_id = insert_pending_sample_operation(
+        &rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap(),
         &project_id,
         "demo_001",
         &serde_json::json!({
             "projectId": project_id,
             "imageId": "demo_001",
-            "patch": {"split": "val"}
+            "patch": {
+                "split": applied.split,
+                "status": applied.status,
+                "reviewNote": applied.review_note
+            }
         }),
     );
-    let mismatch = insert_pending_sample_operation(
-        &server,
-        &project_id,
-        "demo_002",
-        &sample_mutation_payload(&project_id, "demo_001", &before, &after),
-    );
-    let missing_project = insert_pending_sample_operation(
-        &server,
-        "missing-sample-project",
-        "demo_001",
-        &sample_mutation_payload("missing-sample-project", "demo_001", &before, &after),
-    );
-    let missing_sample = insert_pending_sample_operation(
-        &server,
-        &project_id,
-        "missing-sample",
-        &sample_mutation_payload(&project_id, "missing-sample", &before, &after),
-    );
-    drop(server);
+    write_sample_metadata(&data_dir, &project_id, "demo_001", &applied);
     drop(app);
 
-    let _restarted =
-        build_router(config).expect("conservative sample failures must not block startup");
-
+    let restarted = build_router(config.clone()).expect("legacy pending must not block startup");
     assert_eq!(
         read_sample_metadata(&data_dir, &project_id, "demo_001"),
-        before
+        applied
     );
-    for operation_id in [legacy, mismatch, missing_project, missing_sample] {
-        let (state, _) = sample_operation_state(&data_dir, &operation_id);
-        assert_eq!(state, "failed", "{operation_id}");
-    }
+    let (state, message) = sample_operation_state(&data_dir, &operation_id);
+    assert_eq!(state, "indeterminate");
+    assert!(message.contains("indeterminate"), "{message}");
+    assert!(!message.contains("not applied"), "{message}");
+    assert_eq!(
+        project_sample_operation_event_count(&data_dir, &project_id, &operation_id),
+        0
+    );
+    drop(restarted);
+
+    let _second_restart = build_router(config).expect("indeterminate must not be reprocessed");
+    let (second_state, second_message) = sample_operation_state(&data_dir, &operation_id);
+    assert_eq!(second_state, "indeterminate");
+    assert_eq!(second_message, message);
 }
 
 #[test]
