@@ -4,16 +4,16 @@ mod error;
 
 use std::sync::Arc;
 
-use auth::{Authorization, TokenAuthenticator};
+use auth::TokenAuthenticator;
 use axum::{
-    extract::{Request, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::Response,
     routing::{get, post},
     Router,
 };
-use error::{request_id, success, ApiError, RequestIdGenerator};
+use error::{is_error_envelope, request_id, success, ApiError, RequestIdGenerator};
 use serde_json::json;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
@@ -26,29 +26,31 @@ pub use auth::Role;
 pub use config::{ConfigError, ServerConfig};
 
 pub fn build_router(config: ServerConfig) -> Result<Router, ConfigError> {
+    build_router_with_private_routes(config, Router::new())
+}
+
+pub fn build_router_with_private_routes(
+    config: ServerConfig,
+    additional_private_routes: Router,
+) -> Result<Router, ConfigError> {
     config.validate()?;
 
     let authenticator = Arc::new(TokenAuthenticator::from_config(&config));
-    let reader_routes = with_body_limit(
-        Router::new().route("/api/v1/projects", get(list_projects)),
-        config.max_upload_bytes,
-    )
-    .route_layer(middleware::from_fn_with_state(
-        authenticator.clone(),
-        require_reader,
-    ));
-    let admin_routes = with_body_limit(
-        Router::new().route("/api/v1/projects", post(create_project)),
-        config.max_upload_bytes,
-    )
-    .route_layer(middleware::from_fn_with_state(authenticator, require_admin));
-
-    Ok(Router::new()
+    let admin_routes = Router::new()
+        .route("/api/v1/projects", post(create_project))
+        .route_layer(middleware::from_fn(require_admin));
+    let routes = Router::new()
         .route("/api/v1/health", get(health))
-        .merge(reader_routes)
+        .route("/api/v1/projects", get(list_projects))
         .merge(admin_routes)
+        .nest("/api/v1", additional_private_routes)
         .fallback(not_found)
-        .method_not_allowed_fallback(method_not_allowed)
+        .method_not_allowed_fallback(method_not_allowed);
+    let routes = with_body_limit(routes, config.max_upload_bytes).layer(
+        middleware::from_fn_with_state(authenticator, authenticate_private_api),
+    );
+
+    Ok(routes
         .layer(cors_layer(&config.allowed_origins))
         .layer(TraceLayer::new_for_http())
         .layer(PropagateRequestIdLayer::x_request_id())
@@ -58,7 +60,9 @@ pub fn build_router(config: ServerConfig) -> Result<Router, ConfigError> {
 
 fn with_body_limit(router: Router, max_upload_bytes: usize) -> Router {
     router
+        .layer(DefaultBodyLimit::max(max_upload_bytes))
         .layer(RequestBodyLimitLayer::new(max_upload_bytes))
+        .layer(middleware::from_fn(envelope_body_limit_rejections))
         .layer(middleware::from_fn_with_state(
             max_upload_bytes,
             enforce_declared_body_limit,
@@ -95,36 +99,32 @@ async fn create_project(request: Request) -> Response {
     ApiError::not_implemented().into_response(request_id(request.extensions()))
 }
 
-async fn require_reader(
+async fn authenticate_private_api(
     State(authenticator): State<Arc<TokenAuthenticator>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    authorize(authenticator, Role::Reader, request, next).await
+    let path = request.uri().path();
+    let is_api_v1 = path == "/api/v1" || path.starts_with("/api/v1/");
+    let is_public_health = request.method() == Method::GET && path == "/api/v1/health";
+    if !is_api_v1 || is_public_health {
+        return next.run(request).await;
+    }
+
+    match authenticator.authenticate(request.headers()) {
+        Some(role) => {
+            request.extensions_mut().insert(role);
+            next.run(request).await
+        }
+        None => ApiError::unauthorized().into_response(request_id(request.extensions())),
+    }
 }
 
-async fn require_admin(
-    State(authenticator): State<Arc<TokenAuthenticator>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    authorize(authenticator, Role::Admin, request, next).await
-}
-
-async fn authorize(
-    authenticator: Arc<TokenAuthenticator>,
-    required: Role,
-    request: Request,
-    next: Next,
-) -> Response {
-    match authenticator.authorize(request.headers(), required) {
-        Authorization::Authorized => next.run(request).await,
-        Authorization::Unauthorized => {
-            ApiError::unauthorized().into_response(request_id(request.extensions()))
-        }
-        Authorization::Forbidden => {
-            ApiError::forbidden().into_response(request_id(request.extensions()))
-        }
+async fn require_admin(request: Request, next: Next) -> Response {
+    match request.extensions().get::<Role>().copied() {
+        Some(role) if role.allows(Role::Admin) => next.run(request).await,
+        Some(_) => ApiError::forbidden().into_response(request_id(request.extensions())),
+        None => ApiError::unauthorized().into_response(request_id(request.extensions())),
     }
 }
 
@@ -164,6 +164,17 @@ async fn enforce_declared_body_limit(
     }
 
     next.run(request).await
+}
+
+async fn envelope_body_limit_rejections(request: Request, next: Next) -> Response {
+    let response_request_id = request_id(request.extensions());
+    let response = next.run(request).await;
+
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE && !is_error_envelope(&response) {
+        ApiError::payload_too_large().into_response(response_request_id)
+    } else {
+        response
+    }
 }
 
 fn cors_layer(origins: &[String]) -> CorsLayer {

@@ -82,7 +82,9 @@ impl ApiError {
             request_id,
         };
 
-        (status, Json(envelope)).into_response()
+        let mut response = (status, Json(envelope)).into_response();
+        response.extensions_mut().insert(ErrorEnvelopeMarker);
+        response
     }
 
     fn new(status: StatusCode, code: &'static str, message: &'static str) -> Self {
@@ -94,6 +96,9 @@ impl ApiError {
         }
     }
 }
+
+#[derive(Clone, Copy)]
+struct ErrorEnvelopeMarker;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -121,6 +126,10 @@ where
     T: Serialize,
 {
     (status, Json(SuccessEnvelope { data, request_id })).into_response()
+}
+
+pub(crate) fn is_error_envelope(response: &Response) -> bool {
+    response.extensions().get::<ErrorEnvelopeMarker>().is_some()
 }
 
 pub(crate) fn request_id(extensions: &Extensions) -> String {

@@ -47,10 +47,8 @@ impl TokenAuthenticator {
         Self { credentials }
     }
 
-    pub(crate) fn authorize(&self, headers: &HeaderMap, required: Role) -> Authorization {
-        let Some(token) = bearer_token(headers) else {
-            return Authorization::Unauthorized;
-        };
+    pub(crate) fn authenticate(&self, headers: &HeaderMap) -> Option<Role> {
+        let token = bearer_token(headers)?;
         let candidate = digest_token(token);
         let mut matched_role = None;
 
@@ -60,18 +58,8 @@ impl TokenAuthenticator {
             }
         }
 
-        match matched_role {
-            Some(role) if role.allows(required) => Authorization::Authorized,
-            Some(_) => Authorization::Forbidden,
-            None => Authorization::Unauthorized,
-        }
+        matched_role
     }
-}
-
-pub(crate) enum Authorization {
-    Authorized,
-    Unauthorized,
-    Forbidden,
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
