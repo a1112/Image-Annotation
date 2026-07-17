@@ -6,11 +6,14 @@ use image_annotation_lib::{
         annotations_to_yolo_lines, annotations_to_yolo_polygon_lines, parse_yolo_bbox_line,
         parse_yolo_polygon_line,
     },
-    project_fs::{safe_extract_path, test_data_root, workspace_data_root},
+    project_fs::{
+        configure_workspace_data_root, safe_extract_path, test_data_root, workspace_data_root,
+        workspace_data_root_from,
+    },
     windows::{annotation_route, backend_tasks_route},
 };
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn test_data_root_is_project_local_data_test_data() {
@@ -24,6 +27,29 @@ fn workspace_data_root_is_project_local_default_workspace() {
     let root = workspace_data_root();
 
     assert!(root.ends_with(Path::new("data").join("workspaces").join("default")));
+}
+
+#[test]
+fn configured_workspace_root_is_independent_of_source_checkout() {
+    let root = PathBuf::from("D:/sample-server-data");
+
+    assert_eq!(
+        workspace_data_root_from(Some(root.clone()), Path::new("F:/source")),
+        root
+    );
+}
+
+#[test]
+fn default_workspace_root_preserves_desktop_layout() {
+    assert_eq!(
+        workspace_data_root_from(None, Path::new("F:/source")),
+        Path::new("F:/source/data/workspaces/default")
+    );
+}
+
+#[test]
+fn configured_workspace_root_rejects_an_empty_path() {
+    assert!(configure_workspace_data_root(PathBuf::new()).is_err());
 }
 
 #[test]

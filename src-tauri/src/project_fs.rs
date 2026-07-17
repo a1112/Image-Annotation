@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Component, Path, PathBuf},
+    sync::OnceLock,
 };
+
+static WORKSPACE_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,11 +44,33 @@ pub fn test_data_root() -> PathBuf {
     workspace_root().join("data").join("test_data")
 }
 
+pub fn workspace_data_root_from(configured: Option<PathBuf>, checkout_root: &Path) -> PathBuf {
+    configured.unwrap_or_else(|| {
+        checkout_root
+            .join("data")
+            .join("workspaces")
+            .join("default")
+    })
+}
+
+pub fn configure_workspace_data_root(path: PathBuf) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("workspace data root must not be empty".to_string());
+    }
+
+    WORKSPACE_DATA_ROOT
+        .set(path)
+        .map_err(|_| "workspace data root is already configured".to_string())
+}
+
 pub fn workspace_data_root() -> PathBuf {
-    workspace_root()
-        .join("data")
-        .join("workspaces")
-        .join("default")
+    let configured = WORKSPACE_DATA_ROOT.get().cloned().or_else(|| {
+        std::env::var_os("IMAGE_ANNOTATION_DATA_DIR")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+    });
+
+    workspace_data_root_from(configured, &workspace_root())
 }
 
 pub fn downloads_dir() -> PathBuf {
