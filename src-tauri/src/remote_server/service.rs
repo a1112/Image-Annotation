@@ -48,7 +48,8 @@ struct CreateOperationPayload {
     name: String,
     dataset_type: String,
     demo_template: String,
-    ownership_marker: String,
+    #[serde(default)]
+    ownership_marker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -231,7 +232,7 @@ impl RemoteSampleService {
             name: name.to_string(),
             dataset_type: dataset_type.to_string(),
             demo_template: demo_template.to_string(),
-            ownership_marker: ownership_marker.clone(),
+            ownership_marker: Some(ownership_marker.clone()),
         })
         .map_err(storage_failure)?;
         let operation = self
@@ -769,6 +770,18 @@ impl RemoteSampleService {
         {
             return Err(ServiceError::Storage);
         }
+        let operation = AuditOperation {
+            operation_id: record.operation_id.clone(),
+        };
+        let Some(ownership_marker) = payload.ownership_marker.as_deref() else {
+            return self
+                .storage
+                .fail_audit(
+                    &operation,
+                    "legacy create ownership is unknown; operation was not applied",
+                )
+                .map_err(storage_failure);
+        };
         let active_dir =
             self.existing_project_dir(self.projects_dir.as_ref(), &payload.project_id)?;
         let trash_dir =
@@ -776,13 +789,10 @@ impl RemoteSampleService {
         if active_dir.is_some() && trash_dir.is_some() {
             return Err(ServiceError::Conflict);
         }
-        let operation = AuditOperation {
-            operation_id: record.operation_id.clone(),
-        };
         match (active_dir, trash_dir) {
             (Some(active_dir), None) => {
                 if self.read_create_ownership_marker(&active_dir)?.as_deref()
-                    != Some(payload.ownership_marker.as_str())
+                    != Some(ownership_marker)
                 {
                     return self
                         .storage

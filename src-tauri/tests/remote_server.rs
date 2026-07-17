@@ -1,9 +1,10 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    ffi::c_int,
+    fs,
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Barrier, Mutex, OnceLock,
@@ -20,7 +21,6 @@ use axum::{
     Router,
 };
 use clap::CommandFactory;
-use fs2::FileExt;
 use http_body_util::BodyExt;
 use image_annotation_lib::{
     project_fs::ProjectManifest,
@@ -43,16 +43,13 @@ const HELP_ADMIN_SECRET: &str = "help-admin-0123456789abcdef0123456789abcdef";
 const CONCURRENT_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_CONCURRENT_TEST_DATA_DIR";
 const ISOLATED_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_ISOLATED_TEST_DATA_DIR";
 const LEASE_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_LEASE_TEST_DATA_DIR";
-const CLEANUP_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_CLEANUP_TEST_DATA_DIR";
-const CLEANUP_LOCK_PATH_ENV: &str = "IMAGE_ANNOTATION_CLEANUP_TEST_LOCK_PATH";
-const PROCESS_ROOT_LOCK_FILE: &str = ".image-annotation-test-process.lock";
+const CLEANUP_RESULT_PATH_ENV: &str = "IMAGE_ANNOTATION_CLEANUP_TEST_RESULT_PATH";
 static PROJECT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-static PROCESS_DATA_ROOT: OnceLock<ProcessDataRoot> = OnceLock::new();
+static PROCESS_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
 static TEST_SCHEMA_MIGRATION: Mutex<()> = Mutex::new(());
 
-struct ProcessDataRoot {
-    path: PathBuf,
-    _lease: File,
+extern "C" {
+    fn atexit(callback: extern "C" fn()) -> c_int;
 }
 
 struct RemoveDirectoryOnDrop(PathBuf);
@@ -142,35 +139,41 @@ fn process_data_root() -> PathBuf {
                 fs::create_dir_all(&root).unwrap();
                 root
             };
-            let lock_path = root.join(format!("{PROCESS_ROOT_LOCK_FILE}-{}", std::process::id()));
-            let lease = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .open(&lock_path)
-                .unwrap();
-            lease.lock_exclusive().unwrap();
-            Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "process_data_root_cleanup_watcher_child",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env(CLEANUP_DATA_DIR_ENV, &root)
-                .env(CLEANUP_LOCK_PATH_ENV, lock_path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap();
-            ProcessDataRoot {
-                path: root,
-                _lease: lease,
-            }
+            let registered = unsafe { atexit(cleanup_process_data_root_at_exit) };
+            assert_eq!(registered, 0, "failed to register process root cleanup");
+            root
         })
-        .path
         .clone()
+}
+
+extern "C" fn cleanup_process_data_root_at_exit() {
+    let Some(data_dir) = PROCESS_DATA_ROOT.get() else {
+        return;
+    };
+    if let Err(error) = remove_process_data_root(data_dir) {
+        eprintln!("failed to clean process test root: {error}");
+        std::process::abort();
+    }
+    if let Some(result_path) = std::env::var_os(CLEANUP_RESULT_PATH_ENV) {
+        if let Err(error) = fs::write(result_path, b"removed") {
+            eprintln!("failed to record process test root cleanup: {error}");
+            std::process::abort();
+        }
+    }
+}
+
+fn remove_process_data_root(data_dir: &Path) -> std::io::Result<()> {
+    let started = Instant::now();
+    loop {
+        match fs::remove_dir_all(data_dir) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) if started.elapsed() < Duration::from_secs(3) => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn run_ignored_test_in_subprocess(test_name: &str) {
@@ -192,6 +195,10 @@ fn run_ignored_test_in_subprocess(test_name: &str) {
 #[test]
 fn process_data_root_is_removed_after_child_process_exits() {
     let data_dir = unique_temp_root("image-annotation-process-root-cleanup");
+    let result_dir = unique_temp_root("image-annotation-process-root-cleanup-result");
+    fs::create_dir_all(&result_dir).unwrap();
+    let _result_cleanup = RemoveDirectoryOnDrop(result_dir.clone());
+    let result_path = result_dir.join("cleanup-result");
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -200,6 +207,7 @@ fn process_data_root_is_removed_after_child_process_exits() {
             "--nocapture",
         ])
         .env(ISOLATED_DATA_DIR_ENV, &data_dir)
+        .env(CLEANUP_RESULT_PATH_ENV, &result_path)
         .output()
         .unwrap();
     let rendered = format!(
@@ -208,13 +216,11 @@ fn process_data_root_is_removed_after_child_process_exits() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.status.success(), "{rendered}");
-    let started = Instant::now();
-    while data_dir.exists() && started.elapsed() < Duration::from_secs(3) {
-        thread::sleep(Duration::from_millis(10));
-    }
-    let removed = !data_dir.exists();
-    let _ = fs::remove_dir_all(&data_dir);
-    assert!(removed, "child process left data root at {data_dir:?}");
+    assert!(
+        !data_dir.exists(),
+        "cleanup must finish before the child process reports success: {data_dir:?}"
+    );
+    assert_eq!(fs::read_to_string(result_path).unwrap(), "removed");
 }
 
 #[test]
@@ -222,40 +228,6 @@ fn process_data_root_is_removed_after_child_process_exits() {
 fn process_data_root_cleanup_producer_child() {
     let data_dir = process_data_root();
     fs::write(data_dir.join("cleanup-sentinel"), b"cleanup").unwrap();
-}
-
-#[test]
-#[ignore]
-fn process_data_root_cleanup_watcher_child() {
-    let data_dir = PathBuf::from(std::env::var_os(CLEANUP_DATA_DIR_ENV).unwrap());
-    let lock_path = PathBuf::from(std::env::var_os(CLEANUP_LOCK_PATH_ENV).unwrap());
-    let lease = loop {
-        match OpenOptions::new().read(true).write(true).open(&lock_path) {
-            Ok(file) => break file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if !data_dir.exists() {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("failed to open process root cleanup lock: {error}"),
-        }
-    };
-    lease.lock_exclusive().unwrap();
-    drop(lease);
-
-    let started = Instant::now();
-    loop {
-        match fs::remove_dir_all(&data_dir) {
-            Ok(()) => return,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(error) if started.elapsed() < Duration::from_secs(3) => {
-                let _ = error;
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("failed to remove process test root: {error}"),
-        }
-    }
 }
 
 fn unique_project(prefix: &str) -> (String, String) {
@@ -373,6 +345,47 @@ fn insert_pending_operation(
                 operation_id,
                 format!("fixture-request-{project_id}"),
                 action,
+                project_id,
+                payload
+            ],
+        )
+        .unwrap();
+    operation_id
+}
+
+fn insert_legacy_pending_create_operation(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    name: &str,
+) -> String {
+    ensure_lifecycle_test_columns(connection);
+    let operation_id = format!(
+        "legacy-create-operation-{}-{project_id}",
+        PROJECT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let payload = serde_json::json!({
+        "projectId": project_id,
+        "name": name,
+        "datasetType": "yolo-detect",
+        "demoTemplate": "empty"
+    })
+    .to_string();
+    connection
+        .execute(
+            r#"
+            INSERT INTO service_audit (
+                operation_id, request_id, role, action, project_id, image_id,
+                message, status, state, payload, created_at, updated_at
+            )
+            VALUES (
+                ?1, ?2, 'admin', 'create_project', ?3, NULL,
+                'legacy pending create operation', 'pending', 'pending', ?4,
+                'legacy-created-at', 'legacy-created-at'
+            )
+            "#,
+            rusqlite::params![
+                operation_id,
+                format!("legacy-create-request-{project_id}"),
                 project_id,
                 payload
             ],
@@ -1942,6 +1955,88 @@ fn pending_create_completion_is_reconciled_on_startup() {
 #[test]
 fn pending_create_rejects_a_different_valid_project() {
     run_ignored_test_in_subprocess("pending_create_rejects_a_different_valid_project_child");
+}
+
+#[test]
+fn markerless_pending_create_operations_fail_without_claiming_projects() {
+    run_ignored_test_in_subprocess(
+        "markerless_pending_create_operations_fail_without_claiming_projects_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn markerless_pending_create_operations_fail_without_claiming_projects_child() {
+    let (existing_name, existing_id) = unique_project("Task3 legacy existing create");
+    let (absent_name, absent_id) = unique_project("Task3 legacy absent create");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    let _existing_cleanup = RemoteProjectCleanup::new(&data_dir, &existing_id);
+    let _absent_cleanup = RemoteProjectCleanup::new(&data_dir, &absent_id);
+    create_empty_project(&app, &existing_name, &existing_id).await;
+    let existing_project_dir = data_dir.join("projects").join(&existing_id);
+    let original_manifest = fs::read(existing_project_dir.join("project.json")).unwrap();
+
+    let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    let existing_operation =
+        insert_legacy_pending_create_operation(&connection, &existing_id, &existing_name);
+    let absent_operation =
+        insert_legacy_pending_create_operation(&connection, &absent_id, &absent_name);
+    drop(connection);
+    drop(app);
+
+    let _restarted = build_router(config).unwrap_or_else(|error| {
+        let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+        let states = [&existing_operation, &absent_operation].map(|operation_id| {
+            connection
+                .query_row(
+                    "SELECT state, message FROM service_audit WHERE operation_id = ?1",
+                    [operation_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap()
+        });
+        panic!("restart failed: {error:?}; operation states: {states:?}");
+    });
+    assert_eq!(
+        operation_state(&data_dir, &existing_operation).as_deref(),
+        Some("failed")
+    );
+    assert_eq!(
+        operation_state(&data_dir, &absent_operation).as_deref(),
+        Some("failed")
+    );
+    let connection = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    for operation_id in [&existing_operation, &absent_operation] {
+        let message: String = connection
+            .query_row(
+                "SELECT message FROM service_audit WHERE operation_id = ?1",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(message.contains("legacy create ownership is unknown"));
+    }
+    drop(connection);
+    assert_eq!(
+        fs::read(existing_project_dir.join("project.json")).unwrap(),
+        original_manifest
+    );
+    let stored_name: String = rusqlite::Connection::open_with_flags(
+        existing_project_dir.join("project.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT name FROM projects WHERE id = ?1",
+        [&existing_id],
+        |row| row.get(0),
+    )
+    .unwrap();
+    assert_eq!(stored_name, existing_name);
+    assert!(!data_dir.join("projects").join(absent_id).exists());
 }
 
 #[test]
