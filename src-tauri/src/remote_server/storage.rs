@@ -44,6 +44,7 @@ pub(super) struct OperationRecord {
     pub operation_id: String,
     pub action: String,
     pub project_id: Option<String>,
+    pub image_id: Option<String>,
     pub state: String,
     pub payload: String,
 }
@@ -171,7 +172,7 @@ impl ServerStorage {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT operation_id, action, project_id, state, payload
+                "SELECT operation_id, action, project_id, image_id, state, payload
                  FROM service_audit
                  WHERE state = 'pending'
                  ORDER BY id",
@@ -217,6 +218,27 @@ impl ServerStorage {
     ) -> Result<(), String> {
         let connection = self.connection()?;
         update_operation(&connection, operation, "failed", message)
+    }
+
+    pub(super) fn note_pending_audit(
+        &self,
+        operation: &AuditOperation,
+        message: &str,
+    ) -> Result<(), String> {
+        let connection = self.connection()?;
+        let updated = connection
+            .execute(
+                "UPDATE service_audit
+                 SET message = ?1, updated_at = ?2
+                 WHERE operation_id = ?3 AND state = 'pending'",
+                params![message, now_unix_string(), operation.operation_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err("audit operation state did not match pending".to_string())
+        }
     }
 
     pub(super) fn complete_metadata_and_audit(
@@ -812,7 +834,7 @@ fn read_operation(
 ) -> Result<Option<OperationRecord>, String> {
     connection
         .query_row(
-            "SELECT operation_id, action, project_id, state, payload
+            "SELECT operation_id, action, project_id, image_id, state, payload
              FROM service_audit WHERE operation_id = ?1",
             [operation_id],
             operation_from_row,
@@ -826,8 +848,9 @@ fn operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationReco
         operation_id: row.get(0)?,
         action: row.get(1)?,
         project_id: row.get(2)?,
-        state: row.get(3)?,
-        payload: row.get(4)?,
+        image_id: row.get(3)?,
+        state: row.get(4)?,
+        payload: row.get(5)?,
     })
 }
 

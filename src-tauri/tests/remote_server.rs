@@ -28,6 +28,7 @@ use image_annotation_lib::{
         build_router, build_router_with_private_routes, shutdown_signal, with_upload_body_limit,
         PrivateRouteGroups, Role, ServerConfig,
     },
+    storage::{self, StoredImage},
 };
 use rusqlite::OptionalExtension;
 use serde_json::Value;
@@ -46,6 +47,7 @@ const ISOLATED_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_ISOLATED_TEST_DATA_DIR";
 const LEASE_DATA_DIR_ENV: &str = "IMAGE_ANNOTATION_LEASE_TEST_DATA_DIR";
 const CLEANUP_RESULT_PATH_ENV: &str = "IMAGE_ANNOTATION_CLEANUP_TEST_RESULT_PATH";
 static PROJECT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static TEST_DATA_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static PROCESS_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
 static TEST_SCHEMA_MIGRATION: Mutex<()> = Mutex::new(());
 
@@ -354,6 +356,156 @@ fn insert_pending_operation(
     operation_id
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SampleMetadataFixture {
+    split: String,
+    status: String,
+    qa_status: String,
+    review_note: Option<String>,
+}
+
+fn read_sample_metadata(
+    data_dir: &Path,
+    project_id: &str,
+    image_id: &str,
+) -> SampleMetadataFixture {
+    rusqlite::Connection::open(
+        data_dir
+            .join("projects")
+            .join(project_id)
+            .join("project.sqlite"),
+    )
+    .unwrap()
+    .query_row(
+        "SELECT split, status, qa_status, review_note FROM images WHERE id = ?1",
+        [image_id],
+        |row| {
+            Ok(SampleMetadataFixture {
+                split: row.get(0)?,
+                status: row.get(1)?,
+                qa_status: row.get(2)?,
+                review_note: row.get(3)?,
+            })
+        },
+    )
+    .unwrap()
+}
+
+fn write_sample_metadata(
+    data_dir: &Path,
+    project_id: &str,
+    image_id: &str,
+    metadata: &SampleMetadataFixture,
+) {
+    rusqlite::Connection::open(
+        data_dir
+            .join("projects")
+            .join(project_id)
+            .join("project.sqlite"),
+    )
+    .unwrap()
+    .execute(
+        "UPDATE images
+         SET split = ?2, status = ?3, qa_status = ?4, review_note = ?5
+         WHERE id = ?1",
+        rusqlite::params![
+            image_id,
+            metadata.split,
+            metadata.status,
+            metadata.qa_status,
+            metadata.review_note,
+        ],
+    )
+    .unwrap();
+}
+
+fn sample_mutation_payload(
+    project_id: &str,
+    image_id: &str,
+    before: &SampleMetadataFixture,
+    after: &SampleMetadataFixture,
+) -> Value {
+    serde_json::json!({
+        "projectId": project_id,
+        "imageId": image_id,
+        "before": before,
+        "patch": {
+            "split": after.split,
+            "status": after.status,
+            "qaStatus": after.qa_status,
+            "reviewNote": after.review_note,
+        },
+        "after": after,
+    })
+}
+
+fn insert_pending_sample_operation(
+    connection: &rusqlite::Connection,
+    record_project_id: &str,
+    record_image_id: &str,
+    payload: &Value,
+) -> String {
+    ensure_lifecycle_test_columns(connection);
+    let sequence = PROJECT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let operation_id = format!("fixture-sample-operation-{sequence}");
+    connection
+        .execute(
+            r#"
+            INSERT INTO service_audit (
+                operation_id, request_id, role, action, project_id, image_id,
+                message, status, state, payload, created_at, updated_at
+            )
+            VALUES (
+                ?1, ?2, 'editor', 'update_sample_metadata', ?3, ?4,
+                'fixture pending sample mutation', 'pending', 'pending', ?5,
+                'fixture-created-at', 'fixture-created-at'
+            )
+            "#,
+            rusqlite::params![
+                operation_id,
+                format!("fixture-sample-request-{sequence}"),
+                record_project_id,
+                record_image_id,
+                payload.to_string(),
+            ],
+        )
+        .unwrap();
+    operation_id
+}
+
+fn insert_project_sample_update_event(
+    data_dir: &Path,
+    project_id: &str,
+    image_id: &str,
+    operation_id: &str,
+) {
+    rusqlite::Connection::open(
+        data_dir
+            .join("projects")
+            .join(project_id)
+            .join("project.sqlite"),
+    )
+    .unwrap()
+    .execute(
+        "INSERT INTO audit_events (id, action, image_id, message, created_at)
+         VALUES (?1, 'sample.update', ?2, 'fixture committed sample update', 'fixture-created-at')",
+        rusqlite::params![operation_id, image_id],
+    )
+    .unwrap();
+}
+
+fn sample_operation_state(data_dir: &Path, operation_id: &str) -> (String, String) {
+    rusqlite::Connection::open(data_dir.join("server.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT state, message FROM service_audit WHERE operation_id = ?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
 fn insert_legacy_pending_create_operation(
     connection: &rusqlite::Connection,
     project_id: &str,
@@ -494,15 +646,39 @@ fn create_file_link(target: &Path, link: &Path) -> std::io::Result<()> {
 }
 
 fn test_config(bind_ip: Ipv4Addr) -> ServerConfig {
+    let process_root = process_data_root();
+    let data_dir = if std::env::var_os(ISOLATED_DATA_DIR_ENV).is_some() {
+        process_root
+    } else {
+        let sequence = TEST_DATA_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let data_dir = process_root.join(format!("test-{sequence}"));
+        fs::create_dir(&data_dir).unwrap();
+        data_dir
+    };
     ServerConfig {
         bind: SocketAddr::new(IpAddr::V4(bind_ip), 17311),
-        data_dir: process_data_root(),
+        data_dir,
         reader_token: None,
         editor_token: None,
         admin_token: None,
         allowed_origins: Vec::new(),
         max_upload_bytes: 2 * 1024 * 1024 * 1024,
     }
+}
+
+#[test]
+fn ordinary_test_configs_use_distinct_data_roots_and_clones_share_one() {
+    let first = test_config(Ipv4Addr::LOCALHOST);
+    let first_clone = first.clone();
+    let second = test_config(Ipv4Addr::LOCALHOST);
+
+    assert_eq!(first.data_dir, first_clone.data_dir);
+    assert_ne!(first.data_dir, second.data_dir);
+    assert_eq!(first.data_dir.parent(), Some(process_data_root().as_path()));
+    assert_eq!(
+        second.data_dir.parent(),
+        Some(process_data_root().as_path())
+    );
 }
 
 async fn request(
@@ -750,6 +926,15 @@ fn webp_fixture_bytes() -> Vec<u8> {
     let mut output = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgb8(pixels)
         .write_to(&mut output, image::ImageFormat::WebP)
+        .unwrap();
+    output.into_inner()
+}
+
+fn png_fixture_bytes(color: [u8; 3]) -> Vec<u8> {
+    let pixels = image::RgbImage::from_pixel(8, 8, image::Rgb(color));
+    let mut output = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(pixels)
+        .write_to(&mut output, image::ImageFormat::Png)
         .unwrap();
     output.into_inner()
 }
@@ -3436,6 +3621,106 @@ async fn sample_list_filters_classification_samples_by_actual_class_child() {
 }
 
 #[test]
+fn classification_links_rebuild_after_project_index_upsert() {
+    run_ignored_test_in_subprocess("classification_links_rebuild_after_project_index_upsert_child");
+}
+
+#[tokio::test]
+#[ignore]
+async fn classification_links_rebuild_after_project_index_upsert_child() {
+    let (name, project_id) = unique_project("Task4 classification reindex");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_demo_project(
+        &app,
+        &name,
+        &project_id,
+        "image-classification",
+        "demo-classification",
+    )
+    .await;
+    let initial_uri = format!("/api/v1/projects/{project_id}/samples?classId=0");
+    let (initial_status, _, initial) =
+        router_request(&app, Method::GET, &initial_uri, READER_TOKEN, None).await;
+    assert_eq!(initial_status, StatusCode::OK, "{initial}");
+    assert!(initial["data"]["total"].as_u64().unwrap() > 0);
+
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let original_dir = project_dir.join("assets").join("original");
+    let region_dir = original_dir.join("images").join("train").join("region");
+    fs::copy(
+        original_dir
+            .join("images")
+            .join("train")
+            .join("object")
+            .join("demo_001.png"),
+        region_dir.join("moved.png"),
+    )
+    .unwrap();
+    fs::copy(
+        region_dir.join("demo_002.png"),
+        region_dir.join("fresh.png"),
+    )
+    .unwrap();
+    let mut manifest: ProjectManifest =
+        serde_json::from_slice(&fs::read(project_dir.join("project.json")).unwrap()).unwrap();
+    manifest.image_count = 2;
+    let sqlite = project_dir.join("project.sqlite");
+    let classes = storage::read_classes(&sqlite).unwrap();
+    storage::upsert_project_index(
+        &sqlite,
+        &manifest,
+        &[
+            StoredImage {
+                id: "demo_001".to_string(),
+                file_name: "images/train/region/moved.png".to_string(),
+                width: 640,
+                height: 480,
+                split: "train".to_string(),
+                status: "未标注".to_string(),
+                qa_status: String::new(),
+                review_note: None,
+            },
+            StoredImage {
+                id: "fresh-region".to_string(),
+                file_name: "images/train/region/fresh.png".to_string(),
+                width: 640,
+                height: 480,
+                split: "train".to_string(),
+                status: "未标注".to_string(),
+                qa_status: String::new(),
+                review_note: None,
+            },
+        ],
+        &classes,
+    )
+    .unwrap();
+
+    let region_uri = format!("/api/v1/projects/{project_id}/samples?classId=1");
+    let (region_status, _, region) =
+        router_request(&app, Method::GET, &region_uri, READER_TOKEN, None).await;
+    assert_eq!(region_status, StatusCode::OK, "{region}");
+    assert_eq!(region["data"]["total"], 2);
+    let ids = region["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&"demo_001"));
+    assert!(ids.contains(&"fresh-region"));
+
+    let object_uri = format!("/api/v1/projects/{project_id}/samples?classId=0");
+    let (object_status, _, object) =
+        router_request(&app, Method::GET, &object_uri, READER_TOKEN, None).await;
+    assert_eq!(object_status, StatusCode::OK, "{object}");
+    assert_eq!(object["data"]["total"], 0);
+}
+
+#[test]
 fn sample_detail_and_patch_validate_fields_and_roles() {
     run_ignored_test_in_subprocess("sample_detail_and_patch_validate_fields_and_roles_child");
 }
@@ -3555,6 +3840,320 @@ async fn sample_detail_and_patch_validate_fields_and_roles_child() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
         assert_eq!(response["error"]["code"], "validation");
     }
+}
+
+#[test]
+fn pending_sample_mutation_before_project_update_fails_on_restart() {
+    run_ignored_test_in_subprocess(
+        "pending_sample_mutation_before_project_update_fails_on_restart_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn pending_sample_mutation_before_project_update_fails_on_restart_child() {
+    let (name, project_id) = unique_project("Task4 pending sample before");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let before = read_sample_metadata(&data_dir, &project_id, "demo_001");
+    let after = SampleMetadataFixture {
+        split: "val".to_string(),
+        status: "草稿".to_string(),
+        qa_status: "驳回".to_string(),
+        review_note: Some("pending target".to_string()),
+    };
+    let payload = sample_mutation_payload(&project_id, "demo_001", &before, &after);
+    let operation_id = insert_pending_sample_operation(
+        &rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap(),
+        &project_id,
+        "demo_001",
+        &payload,
+    );
+    drop(app);
+
+    let _restarted = build_router(config).expect("before-update pending must not block startup");
+
+    assert_eq!(
+        read_sample_metadata(&data_dir, &project_id, "demo_001"),
+        before
+    );
+    let (state, message) = sample_operation_state(&data_dir, &operation_id);
+    assert_eq!(state, "failed");
+    assert!(message.contains("not applied"), "{message}");
+}
+
+#[test]
+fn pending_sample_mutation_after_project_commit_completes_on_restart() {
+    run_ignored_test_in_subprocess(
+        "pending_sample_mutation_after_project_commit_completes_on_restart_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn pending_sample_mutation_after_project_commit_completes_on_restart_child() {
+    let (name, project_id) = unique_project("Task4 pending sample applied");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let before = read_sample_metadata(&data_dir, &project_id, "demo_001");
+    let after = SampleMetadataFixture {
+        split: "test".to_string(),
+        status: "已标注".to_string(),
+        qa_status: "待质检".to_string(),
+        review_note: Some("committed target".to_string()),
+    };
+    let payload = sample_mutation_payload(&project_id, "demo_001", &before, &after);
+    let operation_id = insert_pending_sample_operation(
+        &rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap(),
+        &project_id,
+        "demo_001",
+        &payload,
+    );
+    write_sample_metadata(&data_dir, &project_id, "demo_001", &after);
+    insert_project_sample_update_event(&data_dir, &project_id, "demo_001", &operation_id);
+    drop(app);
+
+    let _restarted = build_router(config).expect("applied pending must not block startup");
+
+    assert_eq!(
+        read_sample_metadata(&data_dir, &project_id, "demo_001"),
+        after
+    );
+    let (state, message) = sample_operation_state(&data_dir, &operation_id);
+    assert_eq!(state, "completed");
+    assert!(message.contains("reconciled"), "{message}");
+}
+
+#[test]
+fn partial_pending_sample_mutation_rolls_back_with_compensation_on_restart() {
+    run_ignored_test_in_subprocess(
+        "partial_pending_sample_mutation_rolls_back_with_compensation_on_restart_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn partial_pending_sample_mutation_rolls_back_with_compensation_on_restart_child() {
+    let (name, project_id) = unique_project("Task4 pending sample partial");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let before = read_sample_metadata(&data_dir, &project_id, "demo_001");
+    let after = SampleMetadataFixture {
+        split: "val".to_string(),
+        status: "已标注".to_string(),
+        qa_status: "待质检".to_string(),
+        review_note: Some("full target".to_string()),
+    };
+    let partial = SampleMetadataFixture {
+        split: after.split.clone(),
+        status: before.status.clone(),
+        qa_status: before.qa_status.clone(),
+        review_note: before.review_note.clone(),
+    };
+    let payload = sample_mutation_payload(&project_id, "demo_001", &before, &after);
+    let operation_id = insert_pending_sample_operation(
+        &rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap(),
+        &project_id,
+        "demo_001",
+        &payload,
+    );
+    write_sample_metadata(&data_dir, &project_id, "demo_001", &partial);
+    insert_project_sample_update_event(&data_dir, &project_id, "demo_001", &operation_id);
+    drop(app);
+
+    let _restarted = build_router(config).expect("partial pending must not block startup");
+
+    assert_eq!(
+        read_sample_metadata(&data_dir, &project_id, "demo_001"),
+        before
+    );
+    let (state, message) = sample_operation_state(&data_dir, &operation_id);
+    assert_eq!(state, "failed");
+    assert!(message.contains("rolled back"), "{message}");
+    let rollback: (String, String) = rusqlite::Connection::open(
+        data_dir
+            .join("projects")
+            .join(&project_id)
+            .join("project.sqlite"),
+    )
+    .unwrap()
+    .query_row(
+        "SELECT action, image_id FROM audit_events WHERE id = ?1",
+        [format!("{operation_id}:rollback")],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap();
+    assert_eq!(rollback.0, "sample.update.rollback");
+    assert_eq!(rollback.1, "demo_001");
+}
+
+#[test]
+fn legacy_mismatched_and_missing_pending_samples_fail_without_blocking_startup() {
+    run_ignored_test_in_subprocess(
+        "legacy_mismatched_and_missing_pending_samples_fail_without_blocking_startup_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn legacy_mismatched_and_missing_pending_samples_fail_without_blocking_startup_child() {
+    let (name, project_id) = unique_project("Task4 pending sample conservative");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let before = read_sample_metadata(&data_dir, &project_id, "demo_001");
+    let after = SampleMetadataFixture {
+        split: "val".to_string(),
+        status: "草稿".to_string(),
+        qa_status: String::new(),
+        review_note: None,
+    };
+    let server = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    let legacy = insert_pending_sample_operation(
+        &server,
+        &project_id,
+        "demo_001",
+        &serde_json::json!({
+            "projectId": project_id,
+            "imageId": "demo_001",
+            "patch": {"split": "val"}
+        }),
+    );
+    let mismatch = insert_pending_sample_operation(
+        &server,
+        &project_id,
+        "demo_002",
+        &sample_mutation_payload(&project_id, "demo_001", &before, &after),
+    );
+    let missing_project = insert_pending_sample_operation(
+        &server,
+        "missing-sample-project",
+        "demo_001",
+        &sample_mutation_payload("missing-sample-project", "demo_001", &before, &after),
+    );
+    let missing_sample = insert_pending_sample_operation(
+        &server,
+        &project_id,
+        "missing-sample",
+        &sample_mutation_payload(&project_id, "missing-sample", &before, &after),
+    );
+    drop(server);
+    drop(app);
+
+    let _restarted =
+        build_router(config).expect("conservative sample failures must not block startup");
+
+    assert_eq!(
+        read_sample_metadata(&data_dir, &project_id, "demo_001"),
+        before
+    );
+    for operation_id in [legacy, mismatch, missing_project, missing_sample] {
+        let (state, _) = sample_operation_state(&data_dir, &operation_id);
+        assert_eq!(state, "failed", "{operation_id}");
+    }
+}
+
+#[test]
+fn sample_patch_stays_applied_when_global_completion_temporarily_fails() {
+    run_ignored_test_in_subprocess(
+        "sample_patch_stays_applied_when_global_completion_temporarily_fails_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn sample_patch_stays_applied_when_global_completion_temporarily_fails_child() {
+    let (name, project_id) = unique_project("Task4 sample audit completion");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let server = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    server
+        .execute_batch(
+            r#"
+            CREATE TRIGGER fail_sample_audit_completion
+            BEFORE UPDATE OF state ON service_audit
+            WHEN OLD.action = 'update_sample_metadata'
+             AND OLD.state = 'pending'
+             AND NEW.state = 'completed'
+            BEGIN
+                SELECT RAISE(FAIL, 'forced sample completion failure');
+            END;
+            "#,
+        )
+        .unwrap();
+    let uri = format!("/api/v1/projects/{project_id}/samples/demo_001");
+    let (status, _, response) = router_request(
+        &app,
+        Method::PATCH,
+        &uri,
+        EDITOR_TOKEN,
+        Some(serde_json::json!({
+            "split": "test",
+            "status": "已标注",
+            "qaStatus": "待质检",
+            "reviewNote": "completion retry"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let request_id = response["requestId"].as_str().unwrap();
+    let (operation_id, state): (String, String) = server
+        .query_row(
+            "SELECT operation_id, state FROM service_audit WHERE request_id = ?1",
+            [request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "pending");
+    let project_event: (String, String) = rusqlite::Connection::open(
+        data_dir
+            .join("projects")
+            .join(&project_id)
+            .join("project.sqlite"),
+    )
+    .unwrap()
+    .query_row(
+        "SELECT action, image_id FROM audit_events WHERE id = ?1",
+        [&operation_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap();
+    assert_eq!(project_event.0, "sample.update");
+    assert_eq!(project_event.1, "demo_001");
+    assert_eq!(
+        read_sample_metadata(&data_dir, &project_id, "demo_001"),
+        SampleMetadataFixture {
+            split: "test".to_string(),
+            status: "已标注".to_string(),
+            qa_status: "待质检".to_string(),
+            review_note: Some("completion retry".to_string()),
+        }
+    );
+
+    server
+        .execute("DROP TRIGGER fail_sample_audit_completion", [])
+        .unwrap();
+    drop(server);
+    drop(app);
+    let _restarted = build_router(config).expect("pending applied sample must reconcile");
+    let (state, message) = sample_operation_state(&data_dir, &operation_id);
+    assert_eq!(state, "completed");
+    assert!(message.contains("reconciled"), "{message}");
 }
 
 #[test]
@@ -3781,6 +4380,102 @@ async fn thumbnail_is_generated_in_project_storage_with_sha256_etag_child() {
         headers[header::CONTENT_DISPOSITION]
     );
     assert!(cached_body.is_empty());
+}
+
+#[test]
+fn thumbnail_cache_changes_when_source_bytes_change() {
+    run_ignored_test_in_subprocess("thumbnail_cache_changes_when_source_bytes_change_child");
+}
+
+#[tokio::test]
+#[ignore]
+async fn thumbnail_cache_changes_when_source_bytes_change_child() {
+    let (name, project_id) = unique_project("Task4 thumbnail source fingerprint");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let thumbnail_dir = project_dir.join("assets").join("thumbnails");
+    let source_path = project_dir
+        .join("assets")
+        .join("original")
+        .join("images")
+        .join("train")
+        .join("demo_001.png");
+    let uri = format!("/api/v1/projects/{project_id}/samples/demo_001/thumbnail");
+
+    let (first_status, first_headers, first_bytes) =
+        router_raw_request(&app, Method::GET, &uri, READER_TOKEN, &[]).await;
+    assert_eq!(first_status, StatusCode::OK);
+    let first_etag = first_headers[header::ETAG].to_str().unwrap().to_string();
+
+    fs::write(&source_path, png_fixture_bytes([0, 220, 30])).unwrap();
+    let (second_status, second_headers, second_bytes) =
+        router_raw_request(&app, Method::GET, &uri, READER_TOKEN, &[]).await;
+    assert_eq!(second_status, StatusCode::OK);
+    let second_etag = second_headers[header::ETAG].to_str().unwrap();
+    assert_ne!(second_bytes, first_bytes);
+    assert_ne!(second_etag, first_etag);
+    let cached_jpegs = fs::read_dir(thumbnail_dir)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.path().extension().is_some_and(|value| value == "jpg"))
+        .count();
+    assert_eq!(cached_jpegs, 1);
+}
+
+#[test]
+fn thumbnail_context_cleans_only_regular_controlled_temp_files() {
+    run_ignored_test_in_subprocess(
+        "thumbnail_context_cleans_only_regular_controlled_temp_files_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn thumbnail_context_cleans_only_regular_controlled_temp_files_child() {
+    let (name, project_id) = unique_project("Task4 thumbnail temp cleanup");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let thumbnail_dir = data_dir
+        .join("projects")
+        .join(&project_id)
+        .join("assets")
+        .join("thumbnails");
+    let stale_temp = thumbnail_dir.join(".thumbnail-stale.tmp");
+    let neighboring_file = thumbnail_dir.join("neighbor.tmp");
+    fs::write(&stale_temp, b"stale thumbnail temp").unwrap();
+    fs::write(&neighboring_file, b"keep neighboring file").unwrap();
+    let external_dir = unique_temp_root("task4-thumbnail-temp-external");
+    fs::create_dir_all(&external_dir).unwrap();
+    let _external_cleanup = RemoveDirectoryOnDrop(external_dir.clone());
+    let external_target = external_dir.join("sentinel");
+    fs::write(&external_target, b"external target").unwrap();
+    let linked_temp = thumbnail_dir.join(".thumbnail-linked.tmp");
+    let linked = create_file_link(&external_target, &linked_temp).is_ok();
+    let uri = format!("/api/v1/projects/{project_id}/samples/demo_001/thumbnail");
+
+    let (status, _, _) = router_raw_request(&app, Method::GET, &uri, READER_TOKEN, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!stale_temp.exists());
+    assert_eq!(
+        fs::read(&neighboring_file).unwrap(),
+        b"keep neighboring file"
+    );
+    assert_eq!(fs::read(&external_target).unwrap(), b"external target");
+    if linked {
+        assert!(fs::symlink_metadata(&linked_temp).is_ok());
+        assert_eq!(fs::read(&linked_temp).unwrap(), b"external target");
+    }
 }
 
 async fn assert_thumbnail_fixture_supported(

@@ -124,7 +124,11 @@ pub fn test_project_paths(project_id: &str) -> ProjectPaths {
 }
 
 pub fn workspace_project_paths(project_id: &str) -> ProjectPaths {
-    let root = workspace_projects_dir().join(project_id);
+    workspace_project_paths_from(&workspace_data_root(), project_id)
+}
+
+pub fn workspace_project_paths_from(data_root: &Path, project_id: &str) -> ProjectPaths {
+    let root = data_root.join("projects").join(project_id);
     ProjectPaths {
         raw: root.join("assets").join("original"),
         annotations: root.join("annotations").join("native"),
@@ -149,8 +153,12 @@ pub fn ensure_test_data_dirs() -> Result<(), String> {
 }
 
 pub fn ensure_workspace_dirs() -> Result<(), String> {
-    fs::create_dir_all(workspace_projects_dir()).map_err(|err| err.to_string())?;
-    let registry = workspace_data_root().join("registry.json");
+    ensure_workspace_dirs_from(&workspace_data_root())
+}
+
+pub fn ensure_workspace_dirs_from(data_root: &Path) -> Result<(), String> {
+    fs::create_dir_all(data_root.join("projects")).map_err(|err| err.to_string())?;
+    let registry = data_root.join("registry.json");
     if !registry.exists() {
         fs::write(&registry, "[]\n").map_err(|err| err.to_string())?;
     }
@@ -165,6 +173,14 @@ pub fn ensure_project_dirs(project_id: &str) -> Result<ProjectPaths, String> {
 pub fn ensure_workspace_project_dirs(project_id: &str) -> Result<ProjectPaths, String> {
     ensure_workspace_dirs()?;
     ensure_dirs(workspace_project_paths(project_id))
+}
+
+pub fn ensure_workspace_project_dirs_from(
+    data_root: &Path,
+    project_id: &str,
+) -> Result<ProjectPaths, String> {
+    ensure_workspace_dirs_from(data_root)?;
+    ensure_dirs(workspace_project_paths_from(data_root, project_id))
 }
 
 pub fn ensure_test_project_dirs(project_id: &str) -> Result<ProjectPaths, String> {

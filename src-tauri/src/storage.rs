@@ -20,6 +20,14 @@ pub struct StoredImage {
     pub review_note: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSampleMetadata {
+    pub split: String,
+    pub status: String,
+    pub qa_status: String,
+    pub review_note: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredClass {
     pub id: u32,
@@ -337,6 +345,9 @@ pub fn upsert_project_index(
                 manifest.created_at,
             ],
         )
+        .map_err(|err| err.to_string())?;
+    transaction
+        .execute("DELETE FROM sample_class_links", [])
         .map_err(|err| err.to_string())?;
     transaction
         .execute("DELETE FROM images", [])
@@ -861,6 +872,7 @@ pub fn query_samples(
 pub fn update_sample_metadata(
     path: &Path,
     image_id: &str,
+    operation_id: &str,
     split: Option<&str>,
     status: Option<&str>,
     qa_status: Option<&str>,
@@ -890,7 +902,7 @@ pub fn update_sample_metadata(
             .execute(
                 "INSERT INTO audit_events (id, action, image_id, message, created_at)
                  VALUES (?1, 'sample.update', ?2, '更新样本元数据', ?3)",
-                params![unique_id("audit"), image_id, now_unix_string()],
+                params![operation_id, image_id, now_unix_string()],
             )
             .map_err(|err| err.to_string())?;
     }
@@ -900,9 +912,36 @@ pub fn update_sample_metadata(
     Ok(updated == 1)
 }
 
+pub fn read_sample_metadata(
+    path: &Path,
+    image_id: &str,
+) -> Result<Option<StoredSampleMetadata>, String> {
+    validate_project_database_artifacts(path)?;
+    let connection = open_project_database_read_only(path)?;
+    let metadata = connection
+        .query_row(
+            "SELECT split, status, qa_status, review_note
+             FROM images WHERE id = ?1",
+            [image_id],
+            |row| {
+                Ok(StoredSampleMetadata {
+                    split: row.get(0)?,
+                    status: row.get(1)?,
+                    qa_status: row.get(2)?,
+                    review_note: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|err| err.to_string())?;
+    validate_project_database_artifacts(path)?;
+    Ok(metadata)
+}
+
 pub fn restore_sample_metadata(
     path: &Path,
     image_id: &str,
+    operation_id: &str,
     split: &str,
     status: &str,
     qa_status: &str,
@@ -910,9 +949,10 @@ pub fn restore_sample_metadata(
 ) -> Result<(), String> {
     initialize_project_database(path)?;
     validate_project_database_artifacts(path)?;
-    let connection = open_project_database_writable(path)?;
+    let mut connection = open_project_database_writable(path)?;
     validate_project_database_artifacts(path)?;
-    let updated = connection
+    let transaction = connection.transaction().map_err(|err| err.to_string())?;
+    let updated = transaction
         .execute(
             "UPDATE images
              SET split = ?2, status = ?3, qa_status = ?4, review_note = ?5
@@ -920,9 +960,23 @@ pub fn restore_sample_metadata(
             params![image_id, split, status, qa_status, review_note],
         )
         .map_err(|err| err.to_string())?;
+    if updated == 1 {
+        transaction
+            .execute(
+                "INSERT INTO audit_events (id, action, image_id, message, created_at)
+                 VALUES (?1, 'sample.update.rollback', ?2, '回滚样本元数据更新', ?3)",
+                params![
+                    format!("{operation_id}:rollback"),
+                    image_id,
+                    now_unix_string()
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+    }
     validate_project_database_artifacts(path)?;
     if updated == 1 {
-        Ok(())
+        transaction.commit().map_err(|err| err.to_string())?;
+        validate_project_database_artifacts(path)
     } else {
         Err("sample metadata rollback target was not found".to_string())
     }

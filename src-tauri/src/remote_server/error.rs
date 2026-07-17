@@ -29,13 +29,6 @@ impl ServerBuildError {
         }
     }
 
-    pub(crate) const fn data_root_conflict() -> Self {
-        Self {
-            code: "data_root_conflict",
-            message: "the configured data directory does not match the process workspace root",
-        }
-    }
-
     pub(crate) const fn data_root_in_use() -> Self {
         Self {
             code: "data_root_in_use",

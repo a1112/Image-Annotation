@@ -306,6 +306,20 @@ pub fn create_dataset_project(
     dataset_type: &str,
     demo_template: &str,
 ) -> Result<domain::DatasetProject, String> {
+    create_dataset_project_in(
+        &project_fs::workspace_data_root(),
+        name,
+        dataset_type,
+        demo_template,
+    )
+}
+
+pub fn create_dataset_project_in(
+    data_root: &Path,
+    name: &str,
+    dataset_type: &str,
+    demo_template: &str,
+) -> Result<domain::DatasetProject, String> {
     let project_id = project_id_from_name(name, demo_template);
     let format = match dataset_type {
         "yolo-seg" => "yolo-seg",
@@ -324,7 +338,7 @@ pub fn create_dataset_project(
         format: format.to_string(),
         download_url: String::new(),
     };
-    let paths = project_fs::ensure_workspace_project_dirs(&source.key)?;
+    let paths = project_fs::ensure_workspace_project_dirs_from(data_root, &source.key)?;
     if demo_template != "empty" {
         create_demo_files(&paths.raw, &source.format, demo_template)?;
     }
@@ -351,7 +365,7 @@ pub fn create_dataset_project(
         image_count: images.len() as u32,
     };
 
-    project_fs::write_manifest(&manifest)?;
+    project_fs::write_manifest_to_path(&manifest, &paths.manifest)?;
     storage::initialize_project_database(&paths.sqlite)?;
     storage::upsert_project_index(&paths.sqlite, &manifest, &images, &classes)?;
 

@@ -21,7 +21,10 @@ use crate::{
     datasets,
     domain::{DatasetProject, SampleRepository},
     project_fs,
-    storage::{self as project_storage, StoredSample, StoredSampleClass, StoredSampleFilter},
+    storage::{
+        self as project_storage, StoredImage, StoredSample, StoredSampleClass, StoredSampleFilter,
+        StoredSampleMetadata,
+    },
 };
 
 use super::{
@@ -139,7 +142,7 @@ pub(super) struct SampleQueryOptions {
     pub query: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SamplePatch {
     pub split: Option<String>,
@@ -148,12 +151,70 @@ pub(super) struct SamplePatch {
     pub review_note: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SampleMetadataSnapshot {
+    split: String,
+    status: String,
+    qa_status: String,
+    review_note: Option<String>,
+}
+
+impl SampleMetadataSnapshot {
+    fn from_stored_image(image: &StoredImage) -> Self {
+        Self {
+            split: image.split.clone(),
+            status: image.status.clone(),
+            qa_status: image.qa_status.clone(),
+            review_note: image.review_note.clone(),
+        }
+    }
+
+    fn from_stored_metadata(metadata: StoredSampleMetadata) -> Self {
+        Self {
+            split: metadata.split,
+            status: metadata.status,
+            qa_status: metadata.qa_status,
+            review_note: metadata.review_note,
+        }
+    }
+
+    fn apply_patch(&self, patch: &SamplePatch) -> Self {
+        Self {
+            split: patch.split.clone().unwrap_or_else(|| self.split.clone()),
+            status: patch.status.clone().unwrap_or_else(|| self.status.clone()),
+            qa_status: patch
+                .qa_status
+                .clone()
+                .unwrap_or_else(|| self.qa_status.clone()),
+            review_note: patch
+                .review_note
+                .clone()
+                .or_else(|| self.review_note.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SampleMutationPayload<'a> {
     project_id: &'a str,
     image_id: &'a str,
+    before: &'a SampleMetadataSnapshot,
     patch: &'a SamplePatch,
+    after: &'a SampleMetadataSnapshot,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingSampleMutationPayload {
+    project_id: String,
+    image_id: String,
+    #[serde(default)]
+    before: Option<SampleMetadataSnapshot>,
+    patch: SamplePatch,
+    #[serde(default)]
+    after: Option<SampleMetadataSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -236,17 +297,6 @@ impl RemoteSampleService {
                 return Err(ServerBuildError::initialization_failed());
             }
         };
-
-        match project_fs::configure_workspace_data_root(config.data_dir.clone()) {
-            Ok(()) => {}
-            Err(_) => {
-                let configured_root = canonical_existing(&project_fs::workspace_data_root())
-                    .map_err(|_| ServerBuildError::initialization_failed())?;
-                if configured_root != data_dir {
-                    return Err(ServerBuildError::data_root_conflict());
-                }
-            }
-        }
 
         let projects_dir = ensure_managed_subdirectory(&data_dir, &["projects"])
             .map_err(|_| ServerBuildError::initialization_failed())?;
@@ -344,10 +394,14 @@ impl RemoteSampleService {
         let _mutation_guard = mutation_guard();
         let context = self.sample_project_context(project_id)?;
         let previous = self.stored_sample(&context, sample_id)?;
+        let before = SampleMetadataSnapshot::from_stored_image(&previous.image);
+        let after = before.apply_patch(&patch);
         let operation_payload = serde_json::to_string(&SampleMutationPayload {
             project_id,
             image_id: sample_id,
+            before: &before,
             patch: &patch,
+            after: &after,
         })
         .map_err(storage_failure)?;
         let operation = self
@@ -365,6 +419,7 @@ impl RemoteSampleService {
         let updated = match project_storage::update_sample_metadata(
             &context.sqlite,
             sample_id,
+            &operation.operation_id,
             patch.split.as_deref(),
             patch.status.as_deref(),
             patch.qa_status.as_deref(),
@@ -389,9 +444,24 @@ impl RemoteSampleService {
         let updated_sample = match updated_sample {
             Ok(updated_sample) => updated_sample,
             Err(error) => {
-                self.restore_sample_metadata_best_effort(&context, &previous);
-                self.fail_audit_best_effort(&operation, failure_message(error));
-                return Err(error);
+                return match self.restore_sample_metadata(&context, sample_id, &before, &operation)
+                {
+                    Ok(()) => {
+                        self.fail_audit_best_effort(&operation, failure_message(error));
+                        Err(error)
+                    }
+                    Err(rollback_error) => {
+                        tracing::error!(
+                            ?rollback_error,
+                            "failed to compensate sample metadata update"
+                        );
+                        self.note_pending_audit_best_effort(
+                            &operation,
+                            "sample metadata rollback failed after response validation",
+                        );
+                        Err(ServiceError::Storage)
+                    }
+                };
             }
         };
         if let Err(error) = self
@@ -399,9 +469,10 @@ impl RemoteSampleService {
             .complete_audit(&operation, "sample metadata updated")
         {
             tracing::error!(%error, "failed to complete sample metadata audit operation");
-            self.restore_sample_metadata_best_effort(&context, &previous);
-            self.fail_audit_best_effort(&operation, failure_message(ServiceError::Storage));
-            return Err(ServiceError::Storage);
+            self.note_pending_audit_best_effort(
+                &operation,
+                "sample metadata applied; audit completion deferred",
+            );
         }
         Ok(updated_sample)
     }
@@ -444,15 +515,22 @@ impl RemoteSampleService {
         let context = self.sample_project_context(project_id)?;
         let sample = self.stored_sample(&context, sample_id)?;
         let original_path = self.resolve_sample_asset(&context, &sample.image.file_name)?;
-        let cache_name = format!("{}.jpg", sha256_hex(sample_id.as_bytes()));
+        let source = fs::read(&original_path).map_err(storage_failure)?;
+        let sample_cache_prefix = sha256_hex(sample_id.as_bytes());
+        let source_fingerprint = sha256_hex(&source);
+        let cache_name = format!("{sample_cache_prefix}-{source_fingerprint}.jpg");
         let cache_path = context.thumbnail_dir.join(cache_name);
+        self.cleanup_stale_sample_thumbnails(
+            &context.thumbnail_dir,
+            &sample_cache_prefix,
+            &cache_path,
+        )?;
         let bytes = match fs::symlink_metadata(&cache_path) {
             Ok(_) => {
                 self.validate_managed_asset_file(&context.thumbnail_dir, &cache_path)?;
                 fs::read(&cache_path).map_err(storage_failure)?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let source = fs::read(&original_path).map_err(storage_failure)?;
                 let decoded =
                     image::load_from_memory(&source).map_err(|_| ServiceError::UnsupportedMedia)?;
                 let thumbnail = decoded.thumbnail(THUMBNAIL_EDGE, THUMBNAIL_EDGE);
@@ -534,12 +612,13 @@ impl RemoteSampleService {
             }
             return Err(error);
         }
-        let result = datasets::create_dataset_project(name, dataset_type, demo_template)
-            .map_err(storage_failure)
-            .and_then(|project| {
-                self.validate_created_project_root(&project_id)?;
-                Ok(project)
-            });
+        let result =
+            datasets::create_dataset_project_in(&self.data_dir, name, dataset_type, demo_template)
+                .map_err(storage_failure)
+                .and_then(|project| {
+                    self.validate_created_project_root(&project_id)?;
+                    Ok(project)
+                });
         match result {
             Ok(project) => {
                 self.complete_audit_best_effort(&operation, "project created");
@@ -967,6 +1046,7 @@ impl RemoteSampleService {
             match record.action.as_str() {
                 "create_project" => self.reconcile_pending_create(&record)?,
                 "update_project" => self.reconcile_pending_update(&record)?,
+                "update_sample_metadata" => self.reconcile_pending_sample_update(&record),
                 "delete_project" => {
                     let project_id = record.project_id.as_deref().ok_or(ServiceError::Storage)?;
                     validate_lifecycle_record_payload(&record, project_id)?;
@@ -1139,6 +1219,157 @@ impl RemoteSampleService {
         }
     }
 
+    fn reconcile_pending_sample_update(&self, record: &OperationRecord) {
+        let operation = AuditOperation {
+            operation_id: record.operation_id.clone(),
+        };
+        let payload = match serde_json::from_str::<PendingSampleMutationPayload>(&record.payload) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    operation_id = %record.operation_id,
+                    "failed to parse pending sample mutation payload"
+                );
+                self.fail_sample_reconciliation(
+                    &operation,
+                    "legacy or invalid sample mutation payload was not applied",
+                );
+                return;
+            }
+        };
+        let Some(before) = payload.before else {
+            self.fail_sample_reconciliation(
+                &operation,
+                "legacy sample mutation has no trusted before state and was not applied",
+            );
+            return;
+        };
+        let Some(after) = payload.after else {
+            self.fail_sample_reconciliation(
+                &operation,
+                "legacy sample mutation has no trusted after state and was not applied",
+            );
+            return;
+        };
+        if record.project_id.as_deref() != Some(payload.project_id.as_str())
+            || record.image_id.as_deref() != Some(payload.image_id.as_str())
+            || validate_project_id(&payload.project_id).is_err()
+            || validate_sample_id(&payload.image_id).is_err()
+            || validate_sample_patch(&payload.patch).is_err()
+            || validate_sample_metadata_snapshot(&before).is_err()
+            || validate_sample_metadata_snapshot(&after).is_err()
+            || before.apply_patch(&payload.patch) != after
+        {
+            self.fail_sample_reconciliation(
+                &operation,
+                "sample mutation audit identity or state validation failed",
+            );
+            return;
+        }
+        let context = match self.sample_project_context(&payload.project_id) {
+            Ok(context) => context,
+            Err(ServiceError::NotFound) => {
+                self.fail_sample_reconciliation(
+                    &operation,
+                    "sample mutation project is missing and was not applied",
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::error!(
+                    ?error,
+                    operation_id = %record.operation_id,
+                    "could not inspect pending sample mutation project"
+                );
+                self.note_pending_audit_best_effort(
+                    &operation,
+                    "sample mutation project could not be inspected during startup",
+                );
+                return;
+            }
+        };
+        let current =
+            match project_storage::read_sample_metadata(&context.sqlite, &payload.image_id) {
+                Ok(Some(current)) => SampleMetadataSnapshot::from_stored_metadata(current),
+                Ok(None) => {
+                    self.fail_sample_reconciliation(
+                        &operation,
+                        "sample mutation target is missing and was not applied",
+                    );
+                    return;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        operation_id = %record.operation_id,
+                        "could not inspect pending sample metadata"
+                    );
+                    self.note_pending_audit_best_effort(
+                        &operation,
+                        "sample metadata could not be inspected during startup",
+                    );
+                    return;
+                }
+            };
+        if current == after {
+            self.complete_sample_reconciliation(&operation, "sample metadata update reconciled");
+            return;
+        }
+        if current == before {
+            self.fail_sample_reconciliation(
+                &operation,
+                "sample metadata update was not applied before restart",
+            );
+            return;
+        }
+        match self.restore_sample_metadata(&context, &payload.image_id, &before, &operation) {
+            Ok(()) => self.fail_sample_reconciliation(
+                &operation,
+                "partial sample metadata update rolled back during startup",
+            ),
+            Err(error) => {
+                tracing::error!(
+                    ?error,
+                    operation_id = %record.operation_id,
+                    "failed to roll back partial sample metadata update"
+                );
+                self.note_pending_audit_best_effort(
+                    &operation,
+                    "partial sample metadata rollback failed during startup",
+                );
+            }
+        }
+    }
+
+    fn complete_sample_reconciliation(&self, operation: &AuditOperation, message: &str) {
+        if let Err(error) = self.storage.complete_audit(operation, message) {
+            tracing::error!(
+                %error,
+                operation_id = %operation.operation_id,
+                "failed to complete reconciled sample audit"
+            );
+            self.note_pending_audit_best_effort(
+                operation,
+                "sample mutation is applied; startup audit completion remains pending",
+            );
+        }
+    }
+
+    fn fail_sample_reconciliation(&self, operation: &AuditOperation, message: &str) {
+        if let Err(error) = self.storage.fail_audit(operation, message) {
+            tracing::error!(
+                %error,
+                operation_id = %operation.operation_id,
+                "failed to fail reconciled sample audit"
+            );
+            self.note_pending_audit_best_effort(
+                operation,
+                "sample mutation reconciliation could not update the audit state",
+            );
+        }
+    }
+
     fn reject_active_trash_collisions(&self) -> Result<(), ServiceError> {
         for entry in fs::read_dir(self.trash_projects_dir.as_ref()).map_err(storage_failure)? {
             let entry = entry.map_err(storage_failure)?;
@@ -1291,12 +1522,20 @@ impl RemoteSampleService {
     }
 
     fn ensure_configured_root(&self) -> Result<(), ServiceError> {
-        let configured =
-            canonical_existing(&project_fs::workspace_data_root()).map_err(storage_failure)?;
-        if configured == *self.data_dir {
-            Ok(())
-        } else {
+        let data_dir = canonical_existing(self.data_dir.as_ref()).map_err(storage_failure)?;
+        let projects_dir =
+            canonical_existing(self.projects_dir.as_ref()).map_err(storage_failure)?;
+        let trash_projects_dir =
+            canonical_existing(self.trash_projects_dir.as_ref()).map_err(storage_failure)?;
+        if data_dir != *self.data_dir
+            || projects_dir != *self.projects_dir
+            || trash_projects_dir != *self.trash_projects_dir
+            || !canonical_path_is_within(&data_dir, &projects_dir)
+            || !canonical_path_is_within(&data_dir, &trash_projects_dir)
+        {
             Err(ServiceError::Storage)
+        } else {
+            Ok(())
         }
     }
 
@@ -1511,6 +1750,7 @@ impl RemoteSampleService {
         let original_dir = validate_managed_directory_chain(&project_dir, &["assets", "original"])?;
         let thumbnail_dir =
             validate_managed_directory_chain(&project_dir, &["assets", "thumbnails"])?;
+        self.cleanup_thumbnail_temporary_files(&thumbnail_dir)?;
         Ok(SampleProjectContext {
             manifest,
             sqlite,
@@ -1649,6 +1889,58 @@ impl RemoteSampleService {
             current = canonical;
         }
         validate_regular_file_within(root, path).map_err(storage_failure)
+    }
+
+    fn cleanup_thumbnail_temporary_files(&self, thumbnail_dir: &Path) -> Result<(), ServiceError> {
+        for entry in fs::read_dir(thumbnail_dir).map_err(storage_failure)? {
+            let entry = entry.map_err(storage_failure)?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !name.starts_with(".thumbnail-") || !name.ends_with(".tmp") {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(storage_failure)?;
+            if is_symlink_or_reparse(&metadata) || !metadata.is_file() {
+                continue;
+            }
+            self.validate_managed_asset_file(thumbnail_dir, &path)?;
+            fs::remove_file(path).map_err(storage_failure)?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_stale_sample_thumbnails(
+        &self,
+        thumbnail_dir: &Path,
+        sample_cache_prefix: &str,
+        current_cache_path: &Path,
+    ) -> Result<(), ServiceError> {
+        let legacy_name = format!("{sample_cache_prefix}.jpg");
+        let fingerprinted_prefix = format!("{sample_cache_prefix}-");
+        for entry in fs::read_dir(thumbnail_dir).map_err(storage_failure)? {
+            let entry = entry.map_err(storage_failure)?;
+            let path = entry.path();
+            if path == current_cache_path {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name != legacy_name
+                && !(name.starts_with(&fingerprinted_prefix) && name.ends_with(".jpg"))
+            {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path).map_err(storage_failure)?;
+            if is_symlink_or_reparse(&metadata) || !metadata.is_file() {
+                continue;
+            }
+            self.validate_managed_asset_file(thumbnail_dir, &path)?;
+            fs::remove_file(path).map_err(storage_failure)?;
+        }
+        Ok(())
     }
 
     fn persist_thumbnail(
@@ -1884,20 +2176,28 @@ impl RemoteSampleService {
         }
     }
 
-    fn restore_sample_metadata_best_effort(
+    fn restore_sample_metadata(
         &self,
         context: &SampleProjectContext,
-        previous: &StoredSample,
-    ) {
-        if let Err(error) = project_storage::restore_sample_metadata(
+        sample_id: &str,
+        before: &SampleMetadataSnapshot,
+        operation: &AuditOperation,
+    ) -> Result<(), ServiceError> {
+        project_storage::restore_sample_metadata(
             &context.sqlite,
-            &previous.image.id,
-            &previous.image.split,
-            &previous.image.status,
-            &previous.image.qa_status,
-            previous.image.review_note.as_deref(),
-        ) {
-            tracing::error!(%error, "failed to roll back sample metadata update");
+            sample_id,
+            &operation.operation_id,
+            &before.split,
+            &before.status,
+            &before.qa_status,
+            before.review_note.as_deref(),
+        )
+        .map_err(storage_failure)
+    }
+
+    fn note_pending_audit_best_effort(&self, operation: &AuditOperation, message: &str) {
+        if let Err(error) = self.storage.note_pending_audit(operation, message) {
+            tracing::error!(%error, "failed to update pending sample audit message");
         }
     }
 
@@ -2183,6 +2483,25 @@ fn validate_sample_patch(patch: &SamplePatch) -> Result<(), ServiceError> {
         return Err(ServiceError::Validation);
     }
     Ok(())
+}
+
+fn validate_sample_metadata_snapshot(
+    snapshot: &SampleMetadataSnapshot,
+) -> Result<(), ServiceError> {
+    if !valid_split(&snapshot.split)
+        || !valid_status(&snapshot.status)
+        || !valid_qa_status(&snapshot.qa_status)
+        || snapshot.review_note.as_deref().is_some_and(|value| {
+            value.chars().count() > MAX_SAMPLE_TEXT_CHARS
+                || value.chars().any(|character| {
+                    character.is_control() && character != '\n' && character != '\t'
+                })
+        })
+    {
+        Err(ServiceError::Validation)
+    } else {
+        Ok(())
+    }
 }
 
 fn valid_split(value: &str) -> bool {
