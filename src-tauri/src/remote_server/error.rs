@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,6 +12,51 @@ use axum::{
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tower_http::request_id::{MakeRequestId, RequestId};
+
+use super::{config::ConfigError, service::ServiceError};
+
+#[derive(Debug)]
+pub struct ServerBuildError {
+    code: &'static str,
+    message: &'static str,
+}
+
+impl ServerBuildError {
+    pub(crate) const fn initialization_failed() -> Self {
+        Self {
+            code: "server_initialization_failed",
+            message: "the remote sample service could not initialize its data storage",
+        }
+    }
+
+    pub(crate) const fn data_root_conflict() -> Self {
+        Self {
+            code: "data_root_conflict",
+            message: "the configured data directory does not match the process workspace root",
+        }
+    }
+
+    pub const fn code(&self) -> &'static str {
+        self.code
+    }
+}
+
+impl From<ConfigError> for ServerBuildError {
+    fn from(error: ConfigError) -> Self {
+        Self {
+            code: error.code(),
+            message: "the remote sample server configuration is invalid",
+        }
+    }
+}
+
+impl fmt::Display for ServerBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for ServerBuildError {}
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -39,11 +85,11 @@ impl ApiError {
         )
     }
 
-    pub(crate) fn not_implemented() -> Self {
+    pub(crate) fn validation() -> Self {
         Self::new(
-            StatusCode::NOT_IMPLEMENTED,
-            "not_implemented",
-            "project creation is not implemented yet",
+            StatusCode::BAD_REQUEST,
+            "validation",
+            "the request contains invalid project data",
         )
     }
 
@@ -68,6 +114,22 @@ impl ApiError {
             StatusCode::METHOD_NOT_ALLOWED,
             "method_not_allowed",
             "the request method is not supported for this API route",
+        )
+    }
+
+    fn conflict() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "the project state conflicts with this operation",
+        )
+    }
+
+    fn storage() -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage",
+            "the server could not complete the storage operation",
         )
     }
 
@@ -101,6 +163,17 @@ impl ApiError {
             code,
             message,
             details: Value::Object(Map::new()),
+        }
+    }
+}
+
+impl From<ServiceError> for ApiError {
+    fn from(error: ServiceError) -> Self {
+        match error {
+            ServiceError::Validation => Self::validation(),
+            ServiceError::NotFound => Self::not_found(),
+            ServiceError::Conflict => Self::conflict(),
+            ServiceError::Storage => Self::storage(),
         }
     }
 }
@@ -144,6 +217,16 @@ pub(crate) fn request_id(extensions: &Extensions) -> String {
     extensions
         .get::<RequestId>()
         .and_then(|request_id| request_id.header_value().to_str().ok())
+        .filter(|request_id| !request_id.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(next_request_id)
+}
+
+pub(crate) fn request_id_value(request_id: &RequestId) -> String {
+    request_id
+        .header_value()
+        .to_str()
+        .ok()
         .filter(|request_id| !request_id.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(next_request_id)

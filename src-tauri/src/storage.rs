@@ -350,6 +350,22 @@ pub fn read_project_manifest(path: &Path) -> Result<Option<ProjectManifest>, Str
         .map_err(|err| err.to_string())
 }
 
+pub fn update_project_name(path: &Path, project_id: &str, name: &str) -> Result<(), String> {
+    initialize_project_database(path)?;
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    let updated = connection
+        .execute(
+            "UPDATE projects SET name = ?1, updated_at = ?2 WHERE id = ?3",
+            params![name, now_unix_string(), project_id],
+        )
+        .map_err(|err| err.to_string())?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err("project index was not found".to_string())
+    }
+}
+
 pub fn write_dataset_source(path: &Path, source: &StoredDatasetSource) -> Result<(), String> {
     initialize_project_database(path)?;
     let connection = Connection::open(path).map_err(|err| err.to_string())?;

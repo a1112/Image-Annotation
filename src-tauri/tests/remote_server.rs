@@ -1,12 +1,14 @@
 use std::{
+    fs,
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::Command,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, OnceLock,
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -32,11 +34,37 @@ const SHARED_TOKEN: &str = "shared-token-0123456789abcdef0123456789abcdef";
 const HELP_READER_SECRET: &str = "help-reader-0123456789abcdef0123456789abcdef";
 const HELP_EDITOR_SECRET: &str = "help-editor-0123456789abcdef0123456789abcdef";
 const HELP_ADMIN_SECRET: &str = "help-admin-0123456789abcdef0123456789abcdef";
+static PROJECT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static PROCESS_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+fn process_data_root() -> PathBuf {
+    PROCESS_DATA_ROOT
+        .get_or_init(|| {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "image-annotation-remote-server-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            root
+        })
+        .clone()
+}
+
+fn unique_project(prefix: &str) -> (String, String) {
+    let sequence = PROJECT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let name = format!("{prefix} {} {sequence}", std::process::id());
+    let id = name.to_ascii_lowercase().replace(' ', "-");
+    (name, id)
+}
 
 fn test_config(bind_ip: Ipv4Addr) -> ServerConfig {
     ServerConfig {
         bind: SocketAddr::new(IpAddr::V4(bind_ip), 17311),
-        data_dir: PathBuf::from("test-data"),
+        data_dir: process_data_root(),
         reader_token: None,
         editor_token: None,
         admin_token: None,
@@ -59,6 +87,37 @@ async fn request(
 
     let response = app
         .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&body).expect("response should be valid JSON");
+
+    (status, headers, json)
+}
+
+async fn router_request(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    bearer: &str,
+    json_body: Option<Value>,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+    let body = match json_body {
+        Some(value) => {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+            Body::from(serde_json::to_vec(&value).unwrap())
+        }
+        None => Body::empty(),
+    };
+    let response = app
+        .clone()
+        .oneshot(request.body(body).unwrap())
         .await
         .unwrap();
     let status = response.status();
@@ -371,7 +430,7 @@ async fn reader_can_list() {
         request(config, Method::GET, "/api/v1/projects", Some(READER_TOKEN)).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["data"], serde_json::json!([]));
+    assert!(body["data"].is_array());
     assert_request_id(&headers, &body);
 }
 
@@ -510,16 +569,303 @@ async fn role_classified_routes_enforce_editor_and_admin_before_handlers() {
 }
 
 #[tokio::test]
-async fn admin_route_is_an_explicit_placeholder() {
+async fn invalid_project_create_uses_validation_envelope() {
     let mut config = test_config(Ipv4Addr::LOCALHOST);
     config.admin_token = Some(ADMIN_TOKEN.to_string());
 
     let (status, headers, body) =
         request(config, Method::POST, "/api/v1/projects", Some(ADMIN_TOKEN)).await;
 
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(body["error"]["code"], "not_implemented");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "validation");
     assert_request_id(&headers, &body);
+}
+
+#[tokio::test]
+async fn admin_project_lifecycle_moves_directories_and_records_audit() {
+    let (name, project_id) = unique_project("Task3 lifecycle");
+    let renamed = format!("{name} renamed");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+
+    let (create_status, create_headers, created) = router_request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        ADMIN_TOKEN,
+        Some(serde_json::json!({
+            "name": name,
+            "datasetType": "yolo-detect"
+        })),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["data"]["id"], project_id);
+    assert_eq!(created["data"]["name"], name);
+    assert_request_id(&create_headers, &created);
+    let create_request_id = created["requestId"].as_str().unwrap().to_string();
+
+    let (active_duplicate_status, _, active_duplicate) = router_request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        ADMIN_TOKEN,
+        Some(serde_json::json!({
+            "name": name,
+            "datasetType": "yolo-detect"
+        })),
+    )
+    .await;
+    assert_eq!(
+        active_duplicate_status,
+        StatusCode::CONFLICT,
+        "{active_duplicate}"
+    );
+    assert_eq!(active_duplicate["error"]["code"], "conflict");
+
+    let active_dir = data_dir.join("projects").join(&project_id);
+    let trash_dir = data_dir.join("trash").join("projects").join(&project_id);
+    assert!(active_dir.join("project.json").is_file());
+    assert!(active_dir.join("project.sqlite").is_file());
+
+    let (list_status, _, listed) =
+        router_request(&app, Method::GET, "/api/v1/projects", READER_TOKEN, None).await;
+    assert_eq!(list_status, StatusCode::OK, "{listed}");
+    assert!(listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|project| project["id"] == project_id));
+
+    let project_uri = format!("/api/v1/projects/{project_id}");
+    let (get_status, _, detail) =
+        router_request(&app, Method::GET, &project_uri, READER_TOKEN, None).await;
+    assert_eq!(get_status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["data"]["id"], project_id);
+
+    let (editor_get_status, _, editor_detail) =
+        router_request(&app, Method::GET, &project_uri, EDITOR_TOKEN, None).await;
+    assert_eq!(editor_get_status, StatusCode::OK, "{editor_detail}");
+
+    let (editor_patch_status, _, editor_patch) = router_request(
+        &app,
+        Method::PATCH,
+        &project_uri,
+        EDITOR_TOKEN,
+        Some(serde_json::json!({"name": renamed})),
+    )
+    .await;
+    assert_eq!(editor_patch_status, StatusCode::FORBIDDEN, "{editor_patch}");
+    assert_eq!(editor_patch["error"]["code"], "forbidden");
+
+    let (rename_status, _, renamed_project) = router_request(
+        &app,
+        Method::PATCH,
+        &project_uri,
+        ADMIN_TOKEN,
+        Some(serde_json::json!({
+            "name": renamed,
+            "description": "remote lifecycle project"
+        })),
+    )
+    .await;
+    assert_eq!(rename_status, StatusCode::OK, "{renamed_project}");
+    assert_eq!(renamed_project["data"]["name"], renamed);
+    assert_eq!(
+        renamed_project["data"]["description"],
+        "remote lifecycle project"
+    );
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(active_dir.join("project.json")).unwrap()).unwrap();
+    assert_eq!(manifest["name"], renamed);
+    let project_db = rusqlite::Connection::open(active_dir.join("project.sqlite")).unwrap();
+    let indexed_name: String = project_db
+        .query_row("SELECT name FROM projects LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(indexed_name, renamed);
+    drop(project_db);
+
+    let (delete_status, _, deleted) =
+        router_request(&app, Method::DELETE, &project_uri, ADMIN_TOKEN, None).await;
+    assert_eq!(delete_status, StatusCode::OK, "{deleted}");
+    assert_eq!(deleted["data"]["projectId"], project_id);
+    assert_eq!(deleted["data"]["status"], "trashed");
+    assert!(!active_dir.exists());
+    assert!(trash_dir.join("project.json").is_file());
+
+    let (missing_status, _, missing) =
+        router_request(&app, Method::GET, &project_uri, READER_TOKEN, None).await;
+    assert_eq!(missing_status, StatusCode::NOT_FOUND, "{missing}");
+    assert_eq!(missing["error"]["code"], "not_found");
+    let (trashed_list_status, _, trashed_list) =
+        router_request(&app, Method::GET, "/api/v1/projects", READER_TOKEN, None).await;
+    assert_eq!(trashed_list_status, StatusCode::OK, "{trashed_list}");
+    assert!(!trashed_list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|project| project["id"] == project_id));
+
+    let (second_delete_status, _, second_deleted) =
+        router_request(&app, Method::DELETE, &project_uri, ADMIN_TOKEN, None).await;
+    assert_eq!(second_delete_status, StatusCode::OK, "{second_deleted}");
+    assert_eq!(second_deleted["data"], deleted["data"]);
+
+    let (duplicate_status, _, duplicate) = router_request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        ADMIN_TOKEN,
+        Some(serde_json::json!({
+            "name": name,
+            "datasetType": "yolo-detect",
+            "demoTemplate": "empty"
+        })),
+    )
+    .await;
+    assert_eq!(duplicate_status, StatusCode::CONFLICT, "{duplicate}");
+    assert_eq!(duplicate["error"]["code"], "conflict");
+
+    let restore_uri = format!("{project_uri}/restore");
+    let (restore_status, _, restored) =
+        router_request(&app, Method::POST, &restore_uri, ADMIN_TOKEN, None).await;
+    assert_eq!(restore_status, StatusCode::OK, "{restored}");
+    assert_eq!(restored["data"]["id"], project_id);
+    assert_eq!(restored["data"]["name"], renamed);
+    assert!(active_dir.join("project.json").is_file());
+    assert!(!trash_dir.exists());
+
+    let (second_restore_status, _, second_restored) =
+        router_request(&app, Method::POST, &restore_uri, ADMIN_TOKEN, None).await;
+    assert_eq!(second_restore_status, StatusCode::OK, "{second_restored}");
+    assert_eq!(second_restored["data"]["id"], project_id);
+    let (restored_list_status, _, restored_list) =
+        router_request(&app, Method::GET, "/api/v1/projects", READER_TOKEN, None).await;
+    assert_eq!(restored_list_status, StatusCode::OK, "{restored_list}");
+    assert!(restored_list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|project| project["id"] == project_id));
+
+    let server_db = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    let create_audit_count: i64 = server_db
+        .query_row(
+            "SELECT COUNT(*) FROM service_audit
+             WHERE request_id = ?1 AND role = 'admin'
+               AND action = 'create_project' AND project_id = ?2",
+            rusqlite::params![create_request_id, project_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(create_audit_count, 1);
+    let audit_text: String = server_db
+        .query_row(
+            "SELECT group_concat(request_id || role || action || ifnull(project_id, '') ||
+                    ifnull(image_id, '') || message, '')
+             FROM service_audit",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!audit_text.contains(ADMIN_TOKEN));
+    for action in [
+        "create_project",
+        "rename_project",
+        "delete_project",
+        "restore_project",
+    ] {
+        assert!(audit_text.contains(action), "missing audit action {action}");
+    }
+
+    for table in ["service_audit", "trashed_projects", "import_sessions"] {
+        let exists: i64 = server_db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "missing server table {table}");
+    }
+}
+
+#[tokio::test]
+async fn project_routes_reject_invalid_input_and_enforce_admin_mutations() {
+    let (name, _) = unique_project("Task3 boundary");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let app = build_router(config).unwrap();
+
+    let (reader_create_status, _, reader_create) = router_request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        READER_TOKEN,
+        Some(serde_json::json!({
+            "name": name,
+            "datasetType": "yolo-detect"
+        })),
+    )
+    .await;
+    assert_eq!(
+        reader_create_status,
+        StatusCode::FORBIDDEN,
+        "{reader_create}"
+    );
+
+    for (method, uri, body) in [
+        (
+            Method::PATCH,
+            "/api/v1/projects/missing-project",
+            Some(serde_json::json!({"name": "renamed"})),
+        ),
+        (Method::DELETE, "/api/v1/projects/missing-project", None),
+        (
+            Method::POST,
+            "/api/v1/projects/missing-project/restore",
+            None,
+        ),
+    ] {
+        let (status, _, response) = router_request(&app, method, uri, EDITOR_TOKEN, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+        assert_eq!(response["error"]["code"], "forbidden");
+    }
+
+    let (invalid_type_status, _, invalid_type) = router_request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        ADMIN_TOKEN,
+        Some(serde_json::json!({
+            "name": name,
+            "datasetType": "unsupported"
+        })),
+    )
+    .await;
+    assert_eq!(
+        invalid_type_status,
+        StatusCode::BAD_REQUEST,
+        "{invalid_type}"
+    );
+    assert_eq!(invalid_type["error"]["code"], "validation");
+
+    let (traversal_status, _, traversal) = router_request(
+        &app,
+        Method::DELETE,
+        "/api/v1/projects/%2E%2E%2Foutside",
+        ADMIN_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(traversal_status, StatusCode::BAD_REQUEST, "{traversal}");
+    assert_eq!(traversal["error"]["code"], "validation");
 }
 
 #[tokio::test]

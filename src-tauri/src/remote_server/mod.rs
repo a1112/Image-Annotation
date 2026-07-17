@@ -1,6 +1,9 @@
 mod auth;
 mod config;
 mod error;
+mod projects;
+mod service;
+mod storage;
 
 use std::sync::Arc;
 
@@ -10,11 +13,12 @@ use axum::{
     http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::Response,
-    routing::{get, post},
+    routing::get,
     Router,
 };
 use error::{is_error_envelope, request_id, success, ApiError, RequestIdGenerator};
 use serde_json::json;
+use service::RemoteSampleService;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     limit::RequestBodyLimitLayer,
@@ -27,6 +31,7 @@ const MULTIPART_FRAMING_ALLOWANCE_BYTES: usize = 1024 * 1024;
 
 pub use auth::Role;
 pub use config::{ConfigError, ServerConfig};
+pub use error::ServerBuildError;
 
 #[derive(Default)]
 pub struct PrivateRouteGroups {
@@ -52,24 +57,23 @@ impl PrivateRouteGroups {
     }
 }
 
-pub fn build_router(config: ServerConfig) -> Result<Router, ConfigError> {
+pub fn build_router(config: ServerConfig) -> Result<Router, ServerBuildError> {
     build_router_with_private_routes(config, PrivateRouteGroups::default())
 }
 
 pub fn build_router_with_private_routes(
     config: ServerConfig,
     private_route_groups: PrivateRouteGroups,
-) -> Result<Router, ConfigError> {
-    config.validate()?;
+) -> Result<Router, ServerBuildError> {
+    config.validate().map_err(ServerBuildError::from)?;
 
     let authenticator = Arc::new(TokenAuthenticator::from_config(&config));
+    let service = RemoteSampleService::initialize(&config)?;
     let private_route_groups = private_route_groups
-        .with_reader(with_api_body_limit(
-            Router::new().route("/projects", get(list_projects)),
-        ))
-        .with_admin(with_api_body_limit(
-            Router::new().route("/projects", post(create_project)),
-        ));
+        .with_reader(with_api_body_limit(projects::reader_routes(
+            service.clone(),
+        )))
+        .with_admin(with_api_body_limit(projects::admin_routes(service)));
     let private_routes = protect_private_route_groups(private_route_groups);
     let routes = Router::new()
         .route("/api/v1/health", get(health))
@@ -151,23 +155,12 @@ async fn health(request: Request) -> Response {
             "capabilities": [
                 "authenticated-project-listing",
                 "role-based-authorization",
-                "project-creation-placeholder"
+                "remote-project-lifecycle",
+                "recoverable-project-trash"
             ]
         }),
         request_id,
     )
-}
-
-async fn list_projects(request: Request) -> Response {
-    success(
-        StatusCode::OK,
-        Vec::<serde_json::Value>::new(),
-        request_id(request.extensions()),
-    )
-}
-
-async fn create_project(request: Request) -> Response {
-    ApiError::not_implemented().into_response(request_id(request.extensions()))
 }
 
 async fn authenticate_private_api(

@@ -306,7 +306,6 @@ pub fn create_dataset_project(
     dataset_type: &str,
     demo_template: &str,
 ) -> Result<domain::DatasetProject, String> {
-    project_fs::ensure_test_data_dirs()?;
     let project_id = project_id_from_name(name, demo_template);
     let format = match dataset_type {
         "yolo-seg" => "yolo-seg",
@@ -901,7 +900,7 @@ fn demo_class_labels() -> Vec<String> {
         .collect()
 }
 
-fn project_id_from_name(name: &str, fallback: &str) -> String {
+pub(crate) fn project_id_from_name(name: &str, fallback: &str) -> String {
     let mut id = String::new();
     let mut last_dash = false;
     for character in name.trim().to_ascii_lowercase().chars() {
