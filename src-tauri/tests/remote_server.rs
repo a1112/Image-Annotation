@@ -5810,6 +5810,26 @@ async fn annotation_body_revision_and_if_match_must_describe_the_same_version() 
     .await;
     assert_eq!(mismatched_status, StatusCode::BAD_REQUEST, "{mismatched}");
     assert_eq!(mismatched["error"]["code"], "validation");
+
+    for invalid_header in [
+        format!("\"{third_revision}\", \"different\""),
+        format!("W/\"{third_revision}\""),
+        "*".to_string(),
+    ] {
+        let mut payload = bbox_annotation_body("body-revision-invalid-header", 0, "object");
+        payload["revision"] = Value::String(third_revision.to_string());
+        let (status, _, body) = router_json_request_with_headers(
+            &app,
+            Method::PUT,
+            &uri,
+            EDITOR_TOKEN,
+            &[("if-match", &invalid_header)],
+            payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid_header}: {body}");
+        assert_eq!(body["error"]["code"], "validation");
+    }
 }
 
 #[tokio::test]
@@ -6492,6 +6512,13 @@ fn completed_annotation_file_transaction_recovers_as_an_orphan_on_restart() {
     );
 }
 
+#[test]
+fn completed_annotation_orphan_preserves_a_divergent_external_sidecar_on_restart() {
+    run_ignored_test_in_subprocess(
+        "completed_annotation_orphan_preserves_a_divergent_external_sidecar_on_restart_child",
+    );
+}
+
 #[tokio::test]
 #[ignore]
 async fn completed_annotation_file_transaction_recovers_as_an_orphan_on_restart_child() {
@@ -6588,6 +6615,122 @@ async fn completed_annotation_file_transaction_recovers_as_an_orphan_on_restart_
         format!("sha256:{}", sha256_hex_fixture(&new_sidecar))
     );
     assert!(!transaction_dir.exists());
+    drop(restarted);
+}
+
+#[tokio::test]
+#[ignore]
+async fn completed_annotation_orphan_preserves_a_divergent_external_sidecar_on_restart_child() {
+    let (name, project_id) = unique_project("Task5 divergent orphan recovery");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    clear_annotation_fixture(&data_dir, &project_id, "demo_001");
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let sidecar_path = project_dir
+        .join("assets")
+        .join("original")
+        .join("labels")
+        .join("train")
+        .join("demo_001.txt");
+    let old_sidecar = fs::read(&sidecar_path).unwrap();
+    let uri = format!("/api/v1/projects/{project_id}/samples/demo_001/annotations");
+    let (status, _, saved) = router_json_request_with_headers(
+        &app,
+        Method::PUT,
+        &uri,
+        EDITOR_TOKEN,
+        &[],
+        bbox_annotation_body("divergent-orphan", 0, "object"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let request_id = saved["requestId"].as_str().unwrap();
+    let operation_id: String = rusqlite::Connection::open(data_dir.join("server.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT operation_id FROM service_audit WHERE request_id = ?1",
+            [request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let new_sidecar = fs::read(&sidecar_path).unwrap();
+    let source_before: (String, String, Option<String>, Option<String>, String) =
+        rusqlite::Connection::open(annotation_project_sqlite(&data_dir, &project_id))
+            .unwrap()
+            .query_row(
+                "SELECT image_id, relative_path, external_id, annotation_path, source_version
+                 FROM image_sources WHERE image_id = 'demo_001'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+    let transaction_dir = project_dir
+        .join("annotations")
+        .join("transactions")
+        .join(sha256_hex_fixture(operation_id.as_bytes()));
+    fs::create_dir(&transaction_dir).unwrap();
+    fs::write(transaction_dir.join("sidecar.old"), old_sidecar).unwrap();
+    fs::write(transaction_dir.join("sidecar.new"), new_sidecar).unwrap();
+    fs::write(
+        transaction_dir.join("journal.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "operationId": operation_id,
+            "projectId": project_id,
+            "imageId": "demo_001",
+            "imageRelativePath": source_before.1.clone(),
+            "sidecarRelativePath": source_before.3.clone(),
+            "expectedSourceVersion": "",
+            "managedHadOriginal": false,
+            "sidecarHadOriginal": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let external_sidecar = b"externally edited after completed save\n";
+    fs::write(&sidecar_path, external_sidecar).unwrap();
+    drop(app);
+
+    let restarted = build_router(config).unwrap();
+    assert_eq!(fs::read(&sidecar_path).unwrap(), external_sidecar);
+    let source_after: (String, String, Option<String>, Option<String>, String) =
+        rusqlite::Connection::open(annotation_project_sqlite(&data_dir, &project_id))
+            .unwrap()
+            .query_row(
+                "SELECT image_id, relative_path, external_id, annotation_path, source_version
+                 FROM image_sources WHERE image_id = 'demo_001'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+    assert_eq!(source_after, source_before);
+    let (state, message) = sample_operation_state(&data_dir, &operation_id);
+    assert_eq!(state, "completed");
+    assert_eq!(
+        message,
+        "annotation file recovery conflicted with external content"
+    );
+    assert!(transaction_dir.exists());
     drop(restarted);
 }
 
@@ -6722,6 +6865,13 @@ fn pending_annotation_mutations_reconcile_only_from_bound_project_evidence() {
 }
 
 #[test]
+fn pending_annotation_recovery_rejects_a_journal_bound_to_another_sample() {
+    run_ignored_test_in_subprocess(
+        "pending_annotation_recovery_rejects_a_journal_bound_to_another_sample_child",
+    );
+}
+
+#[test]
 fn uncommitted_annotation_file_transaction_rolls_back_on_restart() {
     run_ignored_test_in_subprocess(
         "uncommitted_annotation_file_transaction_rolls_back_on_restart_child",
@@ -6802,6 +6952,128 @@ async fn uncommitted_annotation_file_transaction_rolls_back_on_restart_child() {
         operation_state(&data_dir, &operation_id).as_deref(),
         Some("indeterminate")
     );
+    drop(restarted);
+}
+
+#[tokio::test]
+#[ignore]
+async fn pending_annotation_recovery_rejects_a_journal_bound_to_another_sample_child() {
+    let (name, project_id) = unique_project("Task5 journal sample binding");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    clear_annotation_fixture(&data_dir, &project_id, "demo_002");
+    let uri = format!("/api/v1/projects/{project_id}/samples/demo_002/annotations");
+    let (status, _, body) = router_json_request_with_headers(
+        &app,
+        Method::PUT,
+        &uri,
+        EDITOR_TOKEN,
+        &[],
+        bbox_annotation_body("sample-b-before", 0, "object"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    drop(app);
+
+    let operation_id =
+        insert_pending_annotation_operation(&data_dir, &project_id, "demo_001", "save_annotations");
+    insert_project_annotation_event(
+        &data_dir,
+        &project_id,
+        "demo_001",
+        &operation_id,
+        "annotation.save",
+    );
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let sidecar_path = project_dir
+        .join("assets")
+        .join("original")
+        .join("labels")
+        .join("train")
+        .join("demo_002.txt");
+    let managed_path = project_dir
+        .join("annotations")
+        .join("native")
+        .join("demo_002.json");
+    let sidecar_before = fs::read(&sidecar_path).unwrap();
+    let managed_before = fs::read(&managed_path).ok();
+    let source_before: (String, String, Option<String>, Option<String>, String) =
+        rusqlite::Connection::open(annotation_project_sqlite(&data_dir, &project_id))
+            .unwrap()
+            .query_row(
+                "SELECT image_id, relative_path, external_id, annotation_path, source_version
+                 FROM image_sources WHERE image_id = 'demo_002'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+    let transaction_dir = project_dir
+        .join("annotations")
+        .join("transactions")
+        .join(sha256_hex_fixture(operation_id.as_bytes()));
+    fs::create_dir(&transaction_dir).unwrap();
+    fs::write(transaction_dir.join("sidecar.old"), &sidecar_before).unwrap();
+    fs::write(
+        transaction_dir.join("sidecar.new"),
+        b"0 0.900000 0.900000 0.100000 0.100000\n",
+    )
+    .unwrap();
+    fs::write(
+        transaction_dir.join("journal.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "operationId": operation_id,
+            "projectId": project_id,
+            "imageId": "demo_002",
+            "imageRelativePath": source_before.1.clone(),
+            "sidecarRelativePath": source_before.3.clone(),
+            "expectedSourceVersion": "",
+            "managedHadOriginal": managed_before.is_some(),
+            "sidecarHadOriginal": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let restarted = build_router(config).unwrap();
+    assert_eq!(fs::read(&sidecar_path).unwrap(), sidecar_before);
+    assert_eq!(fs::read(&managed_path).ok(), managed_before);
+    let source_after: (String, String, Option<String>, Option<String>, String) =
+        rusqlite::Connection::open(annotation_project_sqlite(&data_dir, &project_id))
+            .unwrap()
+            .query_row(
+                "SELECT image_id, relative_path, external_id, annotation_path, source_version
+                 FROM image_sources WHERE image_id = 'demo_002'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+    assert_eq!(source_after, source_before);
+    assert_ne!(
+        operation_state(&data_dir, &operation_id).as_deref(),
+        Some("completed")
+    );
+    assert!(transaction_dir.exists());
     drop(restarted);
 }
 

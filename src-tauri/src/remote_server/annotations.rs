@@ -279,7 +279,7 @@ fn merge_revision_expectation(
             body_revision.to_string(),
         ])),
         AnnotationRevisionExpectation::Strong(revisions)
-            if revisions.iter().any(|revision| revision == body_revision) =>
+            if revisions.len() == 1 && revisions[0] == body_revision =>
         {
             Ok(AnnotationRevisionExpectation::Strong(vec![
                 body_revision.to_string()

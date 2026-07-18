@@ -250,6 +250,27 @@ impl ServerStorage {
         }
     }
 
+    pub(super) fn note_completed_audit(
+        &self,
+        operation: &AuditOperation,
+        message: &str,
+    ) -> Result<(), String> {
+        let connection = self.connection()?;
+        let updated = connection
+            .execute(
+                "UPDATE service_audit
+                 SET message = ?1, updated_at = ?2
+                 WHERE operation_id = ?3 AND state = 'completed'",
+                params![message, now_unix_string(), operation.operation_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err("completed audit operation was not found".to_string())
+        }
+    }
+
     pub(super) fn complete_metadata_and_audit(
         &self,
         project_id: &str,

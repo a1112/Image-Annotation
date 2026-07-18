@@ -1531,14 +1531,14 @@ impl RemoteSampleService {
                 else {
                     return Err(ServiceError::Storage);
                 };
+                if operation.state == "pending" {
+                    continue;
+                }
                 if operation.action != "save_annotations"
                     || operation.project_id.as_deref() != Some(journal.project_id.as_str())
                     || operation.image_id.as_deref() != Some(journal.image_id.as_str())
                 {
                     return Err(ServiceError::Storage);
-                }
-                if operation.state == "pending" {
-                    continue;
                 }
                 let Some(transaction) =
                     self.load_annotation_file_transaction(&context, &journal.operation_id)?
@@ -1568,6 +1568,22 @@ impl RemoteSampleService {
                         operation_id = %journal.operation_id,
                         "orphan annotation file transaction recovery failed"
                     );
+                    if error == ServiceError::Conflict {
+                        let audit_operation = AuditOperation {
+                            operation_id: journal.operation_id.clone(),
+                        };
+                        if let Err(note_error) = self.storage.note_completed_audit(
+                            &audit_operation,
+                            "annotation file recovery conflicted with external content",
+                        ) {
+                            tracing::warn!(
+                                %note_error,
+                                operation_id = %journal.operation_id,
+                                "failed to record annotation recovery conflict"
+                            );
+                        }
+                        continue;
+                    }
                     return Err(error);
                 }
             }
@@ -1897,6 +1913,17 @@ impl RemoteSampleService {
         } else {
             None
         };
+        if file_transaction.as_ref().is_some_and(|transaction| {
+            transaction.journal.operation_id != record.operation_id
+                || transaction.journal.project_id != payload.project_id
+                || transaction.journal.image_id != payload.image_id
+        }) {
+            self.note_pending_audit_best_effort(
+                &operation,
+                "annotation file transaction identity is inconsistent",
+            );
+            return;
+        }
         match evidence {
             SampleMutationEvidence::Committed => {
                 if repair_native {
