@@ -250,7 +250,7 @@ impl ServerStorage {
         }
     }
 
-    pub(super) fn note_completed_audit(
+    pub(super) fn mark_orphan_audit_indeterminate(
         &self,
         operation: &AuditOperation,
         message: &str,
@@ -259,15 +259,17 @@ impl ServerStorage {
         let updated = connection
             .execute(
                 "UPDATE service_audit
-                 SET message = ?1, updated_at = ?2
-                 WHERE operation_id = ?3 AND state = 'completed'",
+                 SET status = 'indeterminate', state = 'indeterminate',
+                     message = ?1, updated_at = ?2
+                 WHERE operation_id = ?3
+                   AND state IN ('completed', 'indeterminate')",
                 params![message, now_unix_string(), operation.operation_id],
             )
             .map_err(|error| error.to_string())?;
         if updated == 1 {
             Ok(())
         } else {
-            Err("completed audit operation was not found".to_string())
+            Err("orphan audit operation was not completed or indeterminate".to_string())
         }
     }
 

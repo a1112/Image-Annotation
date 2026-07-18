@@ -1572,7 +1572,7 @@ impl RemoteSampleService {
                         let audit_operation = AuditOperation {
                             operation_id: journal.operation_id.clone(),
                         };
-                        if let Err(note_error) = self.storage.note_completed_audit(
+                        if let Err(note_error) = self.storage.mark_orphan_audit_indeterminate(
                             &audit_operation,
                             "annotation file recovery conflicted with external content",
                         ) {

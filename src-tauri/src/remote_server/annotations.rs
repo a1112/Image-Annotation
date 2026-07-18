@@ -37,6 +37,13 @@ struct ReviewAnnotationsRequest {
     note: String,
 }
 
+#[derive(Debug)]
+struct ParsedIfMatch {
+    expectation: AnnotationRevisionExpectation,
+    tag_count: usize,
+    weak_tag_count: usize,
+}
+
 pub(super) fn reader_routes(service: RemoteSampleService) -> Router {
     Router::new()
         .route(
@@ -216,10 +223,14 @@ fn revision_etag(revision: &str) -> Result<HeaderValue, ServiceError> {
     HeaderValue::from_str(&format!("\"{revision}\"")).map_err(|_| ServiceError::storage())
 }
 
-fn parse_if_match(headers: &HeaderMap) -> Result<AnnotationRevisionExpectation, ApiError> {
+fn parse_if_match(headers: &HeaderMap) -> Result<ParsedIfMatch, ApiError> {
     let values = headers.get_all(header::IF_MATCH);
     if values.iter().next().is_none() {
-        return Ok(AnnotationRevisionExpectation::Missing);
+        return Ok(ParsedIfMatch {
+            expectation: AnnotationRevisionExpectation::Missing,
+            tag_count: 0,
+            weak_tag_count: 0,
+        });
     }
     let mut tags = Vec::new();
     for value in values {
@@ -234,12 +245,18 @@ fn parse_if_match(headers: &HeaderMap) -> Result<AnnotationRevisionExpectation, 
     }
     if tags.iter().any(|tag| tag == "*") {
         return if tags.len() == 1 {
-            Ok(AnnotationRevisionExpectation::AnyExisting)
+            Ok(ParsedIfMatch {
+                expectation: AnnotationRevisionExpectation::AnyExisting,
+                tag_count: 1,
+                weak_tag_count: 0,
+            })
         } else {
             Err(ApiError::validation())
         };
     }
 
+    let tag_count = tags.len();
+    let mut weak_tag_count = 0;
     let mut strong = Vec::new();
     for tag in tags {
         let (weak, encoded) = match tag.strip_prefix("W/") {
@@ -253,33 +270,43 @@ fn parse_if_match(headers: &HeaderMap) -> Result<AnnotationRevisionExpectation, 
         if !valid_revision(revision) {
             return Err(ApiError::validation());
         }
-        if !weak {
+        if weak {
+            weak_tag_count += 1;
+        } else {
             strong.push(revision.to_string());
         }
     }
-    if strong.is_empty() {
-        Ok(AnnotationRevisionExpectation::Never)
+    let expectation = if strong.is_empty() {
+        AnnotationRevisionExpectation::Never
     } else {
-        Ok(AnnotationRevisionExpectation::Strong(strong))
-    }
+        AnnotationRevisionExpectation::Strong(strong)
+    };
+    Ok(ParsedIfMatch {
+        expectation,
+        tag_count,
+        weak_tag_count,
+    })
 }
 
 fn merge_revision_expectation(
-    header: AnnotationRevisionExpectation,
+    header: ParsedIfMatch,
     body_revision: Option<&str>,
 ) -> Result<AnnotationRevisionExpectation, ApiError> {
     let Some(body_revision) = body_revision else {
-        return Ok(header);
+        return Ok(header.expectation);
     };
     if !valid_revision(body_revision) {
         return Err(ApiError::validation());
     }
-    match header {
+    match header.expectation {
         AnnotationRevisionExpectation::Missing => Ok(AnnotationRevisionExpectation::Strong(vec![
             body_revision.to_string(),
         ])),
         AnnotationRevisionExpectation::Strong(revisions)
-            if revisions.len() == 1 && revisions[0] == body_revision =>
+            if header.tag_count == 1
+                && header.weak_tag_count == 0
+                && revisions.len() == 1
+                && revisions[0] == body_revision =>
         {
             Ok(AnnotationRevisionExpectation::Strong(vec![
                 body_revision.to_string()

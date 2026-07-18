@@ -5814,6 +5814,7 @@ async fn annotation_body_revision_and_if_match_must_describe_the_same_version() 
     for invalid_header in [
         format!("\"{third_revision}\", \"different\""),
         format!("W/\"{third_revision}\""),
+        format!("W/\"other\", \"{third_revision}\""),
         "*".to_string(),
     ] {
         let mut payload = bbox_annotation_body("body-revision-invalid-header", 0, "object");
@@ -6725,7 +6726,7 @@ async fn completed_annotation_orphan_preserves_a_divergent_external_sidecar_on_r
             .unwrap();
     assert_eq!(source_after, source_before);
     let (state, message) = sample_operation_state(&data_dir, &operation_id);
-    assert_eq!(state, "completed");
+    assert_eq!(state, "indeterminate");
     assert_eq!(
         message,
         "annotation file recovery conflicted with external content"
