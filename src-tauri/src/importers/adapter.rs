@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 use walkdir::WalkDir;
 
@@ -143,6 +144,23 @@ pub fn source_version(path: &Path) -> String {
     format!("sha256:{encoded}")
 }
 
+pub fn legacy_source_version(path: &Path) -> String {
+    let Ok(metadata) = fs::metadata(path) else {
+        return String::new();
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{}:{modified}", metadata.len())
+}
+
+pub fn source_version_matches(path: &Path, expected: &str) -> bool {
+    source_version(path) == expected || legacy_source_version(path) == expected
+}
+
 pub fn verify_source_version(path: &Path, expected: Option<&str>) -> Result<(), String> {
     verify_source_version_for_prepare(path, expected).map_err(|error| error.to_string())
 }
@@ -154,8 +172,7 @@ pub fn verify_source_version_for_prepare(
     let Some(expected) = expected else {
         return Ok(());
     };
-    let current = source_version(path);
-    if current != expected {
+    if !source_version_matches(path, expected) {
         return Err(PrepareSourceSyncError::Conflict);
     }
     Ok(())

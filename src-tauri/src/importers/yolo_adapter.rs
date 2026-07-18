@@ -211,6 +211,52 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn yolo_prepare_accepts_an_unchanged_legacy_source_version() {
+        let root = temp_root("yolo-prepare-legacy-version");
+        let image_path = root.join("images").join("train").join("a.png");
+        let label_path = root.join("labels").join("train").join("a.txt");
+        fs::create_dir_all(image_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(label_path.parent().unwrap()).unwrap();
+        image::RgbaImage::new(100, 100).save(&image_path).unwrap();
+        fs::write(&label_path, "0 0.500000 0.500000 0.400000 0.200000\n").unwrap();
+        let metadata = fs::metadata(&label_path).unwrap();
+        let modified = metadata
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let legacy_version = format!("{}:{modified}", metadata.len());
+        let object = AnnotationObject::bbox(
+            "new".to_string(),
+            0,
+            "defect".to_string(),
+            BBox {
+                x: 10.0,
+                y: 20.0,
+                width: 30.0,
+                height: 40.0,
+            },
+        );
+
+        let prepared = prepare_annotations(
+            &root,
+            &image_path,
+            "yolo-detect",
+            &[object],
+            Some(&legacy_version),
+        )
+        .unwrap();
+
+        assert_eq!(prepared.path, label_path);
+        assert_eq!(
+            fs::read(&prepared.path).unwrap(),
+            b"0 0.500000 0.500000 0.400000 0.200000\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn temp_root(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)

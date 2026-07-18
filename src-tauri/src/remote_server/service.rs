@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+
 use crate::{
     datasets,
     domain::{
@@ -24,7 +27,7 @@ use crate::{
         SampleRepository,
     },
     importers::{
-        adapter::{PrepareSourceSyncError, PreparedSourceSync},
+        adapter::{source_version_matches, PrepareSourceSyncError, PreparedSourceSync},
         labelme, voc_adapter, yolo_adapter,
     },
     project_fs,
@@ -55,7 +58,7 @@ const MAX_ANNOTATION_ATTRIBUTES_BYTES: usize = 16 * 1024;
 const MAX_REVIEW_NOTE_CHARS: usize = 2_000;
 const THUMBNAIL_EDGE: u32 = 320;
 const CREATE_OWNERSHIP_FILE: &str = ".remote-create-owner";
-const ANNOTATION_TRANSACTION_VERSION: u8 = 1;
+const ANNOTATION_TRANSACTION_VERSION: u8 = 2;
 static PROJECT_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static DATA_ROOT_LEASES: OnceLock<Mutex<HashMap<PathBuf, Weak<DataRootLease>>>> = OnceLock::new();
 static CREATE_OWNERSHIP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -321,6 +324,7 @@ struct SampleProjectContext {
     thumbnail_dir: PathBuf,
     managed_annotations_dir: PathBuf,
     annotation_transactions_dir: PathBuf,
+    annotation_transaction_quarantine_dir: PathBuf,
 }
 
 struct NativeAnnotationTarget {
@@ -344,6 +348,14 @@ struct AnnotationFileJournal {
     expected_source_version: String,
     managed_had_original: bool,
     sidecar_had_original: bool,
+    #[serde(default)]
+    managed_old_sha256: Option<String>,
+    #[serde(default)]
+    managed_new_sha256: Option<String>,
+    #[serde(default)]
+    sidecar_old_sha256: Option<String>,
+    #[serde(default)]
+    sidecar_new_sha256: String,
 }
 
 struct AnnotationFileTransaction {
@@ -641,7 +653,7 @@ impl RemoteSampleService {
                 payload: &operation_payload,
             })
             .map_err(storage_failure)?;
-        let file_transaction = match self.prepare_annotation_file_transaction(
+        let mut file_transaction = match self.prepare_annotation_file_transaction(
             &context,
             project_id,
             sample_id,
@@ -716,17 +728,14 @@ impl RemoteSampleService {
             updated_at: Some(saved.saved_at.clone()),
         };
         if let Err(error) = self
-            .stage_managed_annotation(&context, &file_transaction, &state)
+            .stage_managed_annotation(&context, &mut file_transaction, &state)
             .and_then(|()| self.apply_managed_annotation_transaction(&context, &file_transaction))
         {
             let database_rolled_back = project_storage::compensate_remote_annotation_save(
                 &context.sqlite,
                 sample_id,
                 &operation.operation_id,
-                &saved.revision,
-                saved.previous_annotation.as_ref(),
-                &saved.previous_metadata,
-                saved.previous_source.as_ref(),
+                &saved,
             )
             .unwrap_or(false);
             let files_rolled_back = self
@@ -1514,22 +1523,68 @@ impl RemoteSampleService {
                 if fs::symlink_metadata(&journal_path)
                     .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
                 {
-                    cleanup_controlled_transaction_directory(
-                        &context.annotation_transactions_dir,
+                    self.mark_unreadable_annotation_transaction_indeterminate(
+                        &transaction_entry.path(),
+                    );
+                    self.quarantine_annotation_file_transaction(
+                        &context,
                         &transaction_entry.path(),
                     )?;
                     continue;
                 }
                 self.validate_required_project_file(&transaction_entry.path(), &journal_path)?;
-                let journal: AnnotationFileJournal =
-                    serde_json::from_slice(&fs::read(journal_path).map_err(storage_failure)?)
-                        .map_err(storage_failure)?;
-                let Some(operation) = self
+                let journal_bytes = fs::read(journal_path).map_err(storage_failure)?;
+                let journal: AnnotationFileJournal = match serde_json::from_slice(&journal_bytes) {
+                    Ok(journal) => journal,
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            transaction = %transaction_entry.path().display(),
+                            "annotation transaction journal is corrupt"
+                        );
+                        self.mark_unreadable_annotation_transaction_indeterminate(
+                            &transaction_entry.path(),
+                        );
+                        self.quarantine_annotation_file_transaction(
+                            &context,
+                            &transaction_entry.path(),
+                        )?;
+                        continue;
+                    }
+                };
+                let operation = self
                     .storage
                     .operation(&journal.operation_id)
-                    .map_err(storage_failure)?
-                else {
-                    return Err(ServiceError::Storage);
+                    .map_err(storage_failure)?;
+                if journal.version != ANNOTATION_TRANSACTION_VERSION {
+                    if let Some(operation) = operation.as_ref() {
+                        if operation.state == "pending" {
+                            let audit_operation = AuditOperation {
+                                operation_id: operation.operation_id.clone(),
+                            };
+                            self.mark_sample_reconciliation_indeterminate(
+                                &audit_operation,
+                                "annotation transaction journal version is unsupported",
+                            );
+                        } else {
+                            self.mark_orphan_annotation_indeterminate(
+                                &operation.operation_id,
+                                "annotation transaction journal version is unsupported",
+                            );
+                        }
+                    }
+                    self.quarantine_annotation_file_transaction(
+                        &context,
+                        &transaction_entry.path(),
+                    )?;
+                    continue;
+                }
+                let Some(operation) = operation else {
+                    self.quarantine_annotation_file_transaction(
+                        &context,
+                        &transaction_entry.path(),
+                    )?;
+                    continue;
                 };
                 if operation.state == "pending" {
                     continue;
@@ -1538,13 +1593,25 @@ impl RemoteSampleService {
                     || operation.project_id.as_deref() != Some(journal.project_id.as_str())
                     || operation.image_id.as_deref() != Some(journal.image_id.as_str())
                 {
-                    return Err(ServiceError::Storage);
-                }
-                let Some(transaction) =
-                    self.load_annotation_file_transaction(&context, &journal.operation_id)?
-                else {
+                    self.mark_orphan_annotation_indeterminate(
+                        &operation.operation_id,
+                        "annotation transaction identity is inconsistent",
+                    );
                     continue;
-                };
+                }
+                let transaction =
+                    match self.load_annotation_file_transaction(&context, &journal.operation_id) {
+                        Ok(Some(transaction)) => transaction,
+                        Ok(None) => continue,
+                        Err(ServiceError::Conflict | ServiceError::NotFound) => {
+                            self.mark_orphan_annotation_indeterminate(
+                                &operation.operation_id,
+                                "annotation transaction identity or content is inconsistent",
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                 let evidence = project_storage::remote_mutation_evidence(
                     &context.sqlite,
                     &journal.operation_id,
@@ -1589,6 +1656,77 @@ impl RemoteSampleService {
             }
         }
         Ok(())
+    }
+
+    fn mark_unreadable_annotation_transaction_indeterminate(&self, directory: &Path) {
+        let Some(directory_name) = directory.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let operations = match self.storage.pending_operations() {
+            Ok(operations) => operations,
+            Err(error) => {
+                tracing::warn!(%error, "failed to inspect pending annotation operations");
+                return;
+            }
+        };
+        for operation in operations {
+            if operation.action == "save_annotations"
+                && sha256_hex(operation.operation_id.as_bytes()) == directory_name
+            {
+                let audit_operation = AuditOperation {
+                    operation_id: operation.operation_id,
+                };
+                self.mark_sample_reconciliation_indeterminate(
+                    &audit_operation,
+                    "annotation transaction journal is unreadable",
+                );
+            }
+        }
+    }
+
+    fn mark_orphan_annotation_indeterminate(&self, operation_id: &str, message: &str) {
+        let operation = AuditOperation {
+            operation_id: operation_id.to_string(),
+        };
+        if let Err(error) = self
+            .storage
+            .mark_orphan_audit_indeterminate(&operation, message)
+        {
+            tracing::warn!(
+                %error,
+                operation_id,
+                "failed to mark orphan annotation transaction indeterminate"
+            );
+        }
+    }
+
+    fn quarantine_annotation_file_transaction(
+        &self,
+        context: &SampleProjectContext,
+        directory: &Path,
+    ) -> Result<(), ServiceError> {
+        if directory.parent() != Some(&context.annotation_transactions_dir) {
+            return Err(ServiceError::Storage);
+        }
+        let metadata = fs::symlink_metadata(directory).map_err(storage_failure)?;
+        if is_symlink_or_reparse(&metadata) || !metadata.is_dir() {
+            return Err(ServiceError::Storage);
+        }
+        let name = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(ServiceError::Storage)?;
+        let destination = context.annotation_transaction_quarantine_dir.join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            ANNOTATION_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        if fs::symlink_metadata(&destination).is_ok() {
+            return Err(ServiceError::Storage);
+        }
+        fs::rename(directory, &destination).map_err(storage_failure)?;
+        sync_directory(&context.annotation_transactions_dir)?;
+        sync_directory(&context.annotation_transaction_quarantine_dir)
     }
 
     fn reconcile_pending_create(&self, record: &OperationRecord) -> Result<(), ServiceError> {
@@ -2479,14 +2617,59 @@ impl RemoteSampleService {
                 status: sample.image.status,
                 updated_at: Some(payload.updated_at),
             }),
-            None => Ok(AnnotationState {
-                image_id: sample_id.to_string(),
-                revision: None,
-                objects: Vec::new(),
-                status: sample.image.status,
-                updated_at: None,
-            }),
+            None => {
+                let objects = self.load_native_annotation_objects(context, &sample.image)?;
+                Ok(AnnotationState {
+                    image_id: sample_id.to_string(),
+                    revision: None,
+                    objects,
+                    status: sample.image.status,
+                    updated_at: None,
+                })
+            }
         }
+    }
+
+    fn load_native_annotation_objects(
+        &self,
+        context: &SampleProjectContext,
+        image: &StoredImage,
+    ) -> Result<Vec<AnnotationObject>, ServiceError> {
+        let image_path = self.resolve_sample_asset(context, &image.file_name)?;
+        let annotation_path = match context.manifest.format.as_str() {
+            "yolo-detect" | "yolo-seg" => {
+                yolo_adapter::annotation_path(&context.original_dir, &image_path)
+            }
+            "voc-detect" => voc_adapter::annotation_path(&context.original_dir, &image_path),
+            "labelme" => labelme::annotation_path(&context.original_dir, &image_path),
+            _ => return Ok(Vec::new()),
+        };
+        if self
+            .read_optional_managed_file(&context.original_dir, &annotation_path)?
+            .is_none()
+        {
+            return Ok(Vec::new());
+        }
+        let labels = project_storage::read_enabled_classes(&context.sqlite)
+            .map_err(storage_failure)?
+            .into_iter()
+            .map(|class| class.label)
+            .collect::<Vec<_>>();
+        match context.manifest.format.as_str() {
+            "yolo-detect" | "yolo-seg" => yolo_adapter::load_annotations(
+                &context.original_dir,
+                &image_path,
+                &context.manifest.format,
+                &labels,
+            ),
+            "voc-detect" => {
+                voc_adapter::load_annotations(&context.original_dir, &image_path, &labels)
+            }
+            "labelme" => labelme::load_annotations(&context.original_dir, &image_path, &labels)
+                .map(|loaded| loaded.objects),
+            _ => Ok(Vec::new()),
+        }
+        .map_err(storage_failure)
     }
 
     fn annotation_workflow_mutation<F>(
@@ -2572,19 +2755,9 @@ impl RemoteSampleService {
         context: &SampleProjectContext,
         image: &StoredImage,
     ) -> Result<NativeAnnotationTarget, ServiceError> {
-        let image_path = self.resolve_sample_asset(context, &image.file_name)?;
-        let annotation_path = match context.manifest.format.as_str() {
-            "yolo-detect" | "yolo-seg" => {
-                yolo_adapter::annotation_path(&context.original_dir, &image_path)
-            }
-            "voc-detect" => voc_adapter::annotation_path(&context.original_dir, &image_path),
-            "labelme" => labelme::annotation_path(&context.original_dir, &image_path),
-            _ => return Err(ServiceError::AnnotationValidation),
-        };
+        let (image_path, annotation_path, relative_path, relative_annotation_path) =
+            self.native_annotation_paths(context, image)?;
         self.prepare_native_sidecar_path(&context.original_dir, &annotation_path)?;
-        let relative_path = relative_managed_path(&context.original_dir, &image_path)?;
-        let relative_annotation_path =
-            relative_managed_path(&context.original_dir, &annotation_path)?;
         let source = project_storage::read_image_source(&context.sqlite, &image.id)
             .map_err(storage_failure)?;
         if let Some(source) = &source {
@@ -2602,7 +2775,9 @@ impl RemoteSampleService {
         if source
             .as_ref()
             .map(|source| source.source_version.as_str())
-            .is_some_and(|expected| !expected.is_empty() && expected != current_source_version)
+            .is_some_and(|expected| {
+                !expected.is_empty() && !source_version_matches(&annotation_path, expected)
+            })
         {
             return Err(ServiceError::Conflict);
         }
@@ -2614,6 +2789,31 @@ impl RemoteSampleService {
             expected_source_version: current_source_version,
             external_id: source.and_then(|source| source.external_id),
         })
+    }
+
+    fn native_annotation_paths(
+        &self,
+        context: &SampleProjectContext,
+        image: &StoredImage,
+    ) -> Result<(PathBuf, PathBuf, String, String), ServiceError> {
+        let image_path = self.resolve_sample_asset(context, &image.file_name)?;
+        let annotation_path = match context.manifest.format.as_str() {
+            "yolo-detect" | "yolo-seg" => {
+                yolo_adapter::annotation_path(&context.original_dir, &image_path)
+            }
+            "voc-detect" => voc_adapter::annotation_path(&context.original_dir, &image_path),
+            "labelme" => labelme::annotation_path(&context.original_dir, &image_path),
+            _ => return Err(ServiceError::AnnotationValidation),
+        };
+        let relative_path = relative_managed_path(&context.original_dir, &image_path)?;
+        let relative_annotation_path =
+            relative_managed_path(&context.original_dir, &annotation_path)?;
+        Ok((
+            image_path,
+            annotation_path,
+            relative_path,
+            relative_annotation_path,
+        ))
     }
 
     fn prepare_native_sidecar_path(&self, root: &Path, path: &Path) -> Result<(), ServiceError> {
@@ -2711,7 +2911,7 @@ impl RemoteSampleService {
         let directory_name = sha256_hex(operation_id.as_bytes());
         let directory = context.annotation_transactions_dir.join(&directory_name);
         match fs::create_dir(&directory) {
-            Ok(()) => {}
+            Ok(()) => sync_directory(&context.annotation_transactions_dir)?,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(ServiceError::Storage);
             }
@@ -2754,9 +2954,12 @@ impl RemoteSampleService {
                 expected_source_version: target.expected_source_version.clone(),
                 managed_had_original: managed_before.is_some(),
                 sidecar_had_original: sidecar_before.is_some(),
+                managed_old_sha256: managed_before.as_deref().map(sha256_hex),
+                managed_new_sha256: None,
+                sidecar_old_sha256: sidecar_before.as_deref().map(sha256_hex),
+                sidecar_new_sha256: sha256_hex(&prepared.data),
             };
-            let journal_bytes = serde_json::to_vec_pretty(&journal).map_err(storage_failure)?;
-            write_new_synced_file(&directory.join("journal.json"), &journal_bytes)?;
+            write_annotation_journal(&directory, &journal, true)?;
             Ok(AnnotationFileTransaction {
                 directory: directory.clone(),
                 journal,
@@ -2774,12 +2977,14 @@ impl RemoteSampleService {
     fn stage_managed_annotation(
         &self,
         context: &SampleProjectContext,
-        transaction: &AnnotationFileTransaction,
+        transaction: &mut AnnotationFileTransaction,
         state: &AnnotationState,
     ) -> Result<(), ServiceError> {
         self.validate_annotation_file_transaction(context, transaction)?;
         let bytes = serde_json::to_vec_pretty(state).map_err(storage_failure)?;
-        write_new_synced_file(&transaction.directory.join("managed.new"), &bytes)
+        write_new_synced_file(&transaction.directory.join("managed.new"), &bytes)?;
+        transaction.journal.managed_new_sha256 = Some(sha256_hex(&bytes));
+        write_annotation_journal(&transaction.directory, &transaction.journal, false)
     }
 
     fn apply_native_annotation_transaction(
@@ -2892,6 +3097,38 @@ impl RemoteSampleService {
             return Err(ServiceError::Storage);
         }
         validate_managed_directory_chain(&context.annotation_transactions_dir, &[directory_name])?;
+        let sample = self.stored_sample(context, &transaction.journal.image_id)?;
+        let (_, _, image_relative_path, sidecar_relative_path) =
+            self.native_annotation_paths(context, &sample.image)?;
+        if transaction.journal.image_relative_path != image_relative_path
+            || transaction.journal.sidecar_relative_path != sidecar_relative_path
+        {
+            return Err(ServiceError::Conflict);
+        }
+        validate_staged_artifact(
+            &transaction.directory,
+            "managed.old",
+            transaction.journal.managed_old_sha256.as_deref(),
+            transaction.journal.managed_had_original,
+        )?;
+        validate_staged_artifact(
+            &transaction.directory,
+            "managed.new",
+            transaction.journal.managed_new_sha256.as_deref(),
+            transaction.journal.managed_new_sha256.is_some(),
+        )?;
+        validate_staged_artifact(
+            &transaction.directory,
+            "sidecar.old",
+            transaction.journal.sidecar_old_sha256.as_deref(),
+            transaction.journal.sidecar_had_original,
+        )?;
+        validate_staged_artifact(
+            &transaction.directory,
+            "sidecar.new",
+            Some(&transaction.journal.sidecar_new_sha256),
+            true,
+        )?;
         Ok(())
     }
 
@@ -2975,15 +3212,28 @@ impl RemoteSampleService {
         if state.revision.is_none() {
             return Err(ServiceError::Storage);
         }
-        let recovery_stage = transaction.directory.join("managed.recovery");
-        if optional_regular_file(&recovery_stage)?.is_some() {
-            fs::remove_file(&recovery_stage).map_err(storage_failure)?;
-        }
-        let managed_bytes = serde_json::to_vec_pretty(&state).map_err(storage_failure)?;
-        write_new_synced_file(&recovery_stage, &managed_bytes)?;
         let managed_target = context
             .managed_annotations_dir
             .join(format!("{}.json", transaction.journal.image_id));
+        let managed_new = optional_regular_file(&transaction.directory.join("managed.new"))?;
+        validate_roll_forward_transaction_target(
+            &context.managed_annotations_dir,
+            &managed_target,
+            transaction
+                .journal
+                .managed_had_original
+                .then(|| transaction.directory.join("managed.old"))
+                .as_deref(),
+            managed_new.as_deref(),
+        )?;
+        let recovery_stage = transaction.directory.join("managed.recovery");
+        if optional_regular_file(&recovery_stage)?.is_some() {
+            fs::remove_file(&recovery_stage).map_err(storage_failure)?;
+            sync_directory(&transaction.directory)?;
+        }
+        let managed_bytes = serde_json::to_vec_pretty(&state).map_err(storage_failure)?;
+        write_new_synced_file(&recovery_stage, &managed_bytes)?;
+        sync_directory(&transaction.directory)?;
         replace_file_from_stage(
             &context.managed_annotations_dir,
             &managed_target,
@@ -3034,9 +3284,13 @@ impl RemoteSampleService {
             .validate_optional_project_file(&context.managed_annotations_dir, &backup)?
             .is_some();
         match (target_exists, backup_exists) {
-            (true, true) => fs::remove_file(backup).map_err(storage_failure),
+            (true, true) => {
+                fs::remove_file(backup).map_err(storage_failure)?;
+                sync_directory(&context.managed_annotations_dir)
+            }
             (false, true) => {
                 fs::rename(&backup, &target).map_err(storage_failure)?;
+                sync_directory(&context.managed_annotations_dir)?;
                 self.validate_required_project_file(&context.managed_annotations_dir, &target)?;
                 Ok(())
             }
@@ -3069,6 +3323,7 @@ impl RemoteSampleService {
                 .and_then(|()| file.sync_all())
                 .map_err(storage_failure)?;
             drop(file);
+            sync_directory(&context.managed_annotations_dir)?;
             self.validate_required_project_file(&context.managed_annotations_dir, &temporary)?;
             let had_target = self
                 .validate_optional_project_file(&context.managed_annotations_dir, &target)?
@@ -3076,6 +3331,7 @@ impl RemoteSampleService {
             self.validate_optional_project_file(&context.managed_annotations_dir, &backup)?;
             if had_target {
                 fs::rename(&target, &backup).map_err(storage_failure)?;
+                sync_directory(&context.managed_annotations_dir)?;
             }
             if let Err(error) = fs::rename(&temporary, &target).map_err(storage_failure) {
                 if had_target {
@@ -3083,9 +3339,11 @@ impl RemoteSampleService {
                     if fs::rename(&backup, &target).is_err() {
                         return Err(ServiceError::Storage);
                     }
+                    sync_directory(&context.managed_annotations_dir)?;
                 }
                 return Err(error);
             }
+            sync_directory(&context.managed_annotations_dir)?;
             if let Err(error) =
                 self.validate_required_project_file(&context.managed_annotations_dir, &target)
             {
@@ -3093,15 +3351,12 @@ impl RemoteSampleService {
                 if had_target && fs::rename(&backup, &target).is_err() {
                     return Err(ServiceError::Storage);
                 }
+                sync_directory(&context.managed_annotations_dir)?;
                 return Err(error);
             }
             if had_target {
-                if let Err(error) = fs::remove_file(&backup) {
-                    tracing::warn!(
-                        %error,
-                        "native annotation backup cleanup is deferred"
-                    );
-                }
+                fs::remove_file(&backup).map_err(storage_failure)?;
+                sync_directory(&context.managed_annotations_dir)?;
             }
             Ok(())
         })();
@@ -3109,8 +3364,9 @@ impl RemoteSampleService {
             && fs::symlink_metadata(&temporary)
                 .ok()
                 .is_some_and(|metadata| metadata.is_file() && !is_symlink_or_reparse(&metadata))
+            && fs::remove_file(&temporary).is_ok()
         {
-            let _ = fs::remove_file(&temporary);
+            let _ = sync_directory(&context.managed_annotations_dir);
         }
         result
     }
@@ -3135,6 +3391,9 @@ impl RemoteSampleService {
         let annotation_transactions_dir =
             ensure_managed_subdirectory(&project_dir, &["annotations", "transactions"])
                 .map_err(storage_failure)?;
+        let annotation_transaction_quarantine_dir =
+            ensure_managed_subdirectory(&project_dir, &["annotations", "transaction-quarantine"])
+                .map_err(storage_failure)?;
         self.cleanup_thumbnail_temporary_files(&thumbnail_dir)?;
         self.cleanup_annotation_temporary_files(&managed_annotations_dir)?;
         Ok(SampleProjectContext {
@@ -3144,6 +3403,7 @@ impl RemoteSampleService {
             thumbnail_dir,
             managed_annotations_dir,
             annotation_transactions_dir,
+            annotation_transaction_quarantine_dir,
         })
     }
 
@@ -4148,6 +4408,64 @@ fn write_new_synced_file(path: &Path, bytes: &[u8]) -> Result<(), ServiceError> 
         .map_err(storage_failure)
 }
 
+fn write_annotation_journal(
+    directory: &Path,
+    journal: &AnnotationFileJournal,
+    initial: bool,
+) -> Result<(), ServiceError> {
+    let bytes = serde_json::to_vec_pretty(journal).map_err(storage_failure)?;
+    let target = directory.join("journal.json");
+    if initial {
+        write_new_synced_file(&target, &bytes)?;
+        return sync_directory(directory);
+    }
+    let temporary = directory.join("journal.next");
+    let backup = directory.join("journal.prev");
+    if optional_regular_file(&temporary)?.is_some()
+        || optional_regular_file(&backup)?.is_some()
+        || optional_regular_file(&target)?.is_none()
+    {
+        return Err(ServiceError::Storage);
+    }
+    write_new_synced_file(&temporary, &bytes)?;
+    sync_directory(directory)?;
+    fs::rename(&target, &backup).map_err(storage_failure)?;
+    sync_directory(directory)?;
+    if let Err(error) = fs::rename(&temporary, &target) {
+        let _ = fs::rename(&backup, &target);
+        let _ = sync_directory(directory);
+        return Err(storage_failure(error));
+    }
+    sync_directory(directory)?;
+    fs::remove_file(&backup).map_err(storage_failure)?;
+    sync_directory(directory)
+}
+
+fn sync_directory(path: &Path) -> Result<(), ServiceError> {
+    #[cfg(unix)]
+    {
+        File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(storage_failure)
+    }
+    #[cfg(windows)]
+    {
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(storage_failure)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(ServiceError::Storage)
+    }
+}
+
 fn optional_regular_file(path: &Path) -> Result<Option<PathBuf>, ServiceError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if is_symlink_or_reparse(&metadata) || !metadata.is_file() => {
@@ -4156,6 +4474,31 @@ fn optional_regular_file(path: &Path) -> Result<Option<PathBuf>, ServiceError> {
         Ok(_) => Ok(Some(path.to_path_buf())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(storage_failure(error)),
+    }
+}
+
+fn validate_staged_artifact(
+    directory: &Path,
+    name: &str,
+    expected_sha256: Option<&str>,
+    should_exist: bool,
+) -> Result<(), ServiceError> {
+    if should_exist != expected_sha256.is_some() {
+        return Err(ServiceError::Conflict);
+    }
+    let path = directory.join(name);
+    let actual = optional_regular_file(&path)?;
+    match (actual, expected_sha256) {
+        (None, None) => Ok(()),
+        (Some(path), Some(expected)) => {
+            let bytes = fs::read(path).map_err(storage_failure)?;
+            if sha256_hex(&bytes) == expected {
+                Ok(())
+            } else {
+                Err(ServiceError::Conflict)
+            }
+        }
+        _ => Err(ServiceError::Conflict),
     }
 }
 
@@ -4202,13 +4545,16 @@ fn normalize_replacement_artifacts(
     if optional_regular_file(temporary)?.is_some() {
         validate_regular_file_within(root, temporary).map_err(storage_failure)?;
         fs::remove_file(temporary).map_err(storage_failure)?;
+        sync_directory(temporary.parent().ok_or(ServiceError::Storage)?)?;
     }
     if optional_regular_file(displaced)?.is_some() {
         validate_regular_file_within(root, displaced).map_err(storage_failure)?;
         if target.exists() {
             fs::remove_file(displaced).map_err(storage_failure)?;
+            sync_directory(displaced.parent().ok_or(ServiceError::Storage)?)?;
         } else {
             fs::rename(displaced, target).map_err(storage_failure)?;
+            sync_directory(target.parent().ok_or(ServiceError::Storage)?)?;
         }
     }
     Ok(())
@@ -4228,21 +4574,28 @@ fn replace_file_from_stage(
     normalize_replacement_artifacts(root, target, &temporary, &displaced)?;
     let bytes = fs::read(staged).map_err(storage_failure)?;
     write_new_synced_file(&temporary, &bytes)?;
+    let parent = target.parent().ok_or(ServiceError::Storage)?;
+    sync_directory(parent)?;
     validate_regular_file_within(root, &temporary).map_err(storage_failure)?;
     let had_target = target.exists();
     if had_target {
         fs::rename(target, &displaced).map_err(storage_failure)?;
+        sync_directory(parent)?;
     }
     if let Err(error) = fs::rename(&temporary, target) {
         if had_target {
             let _ = fs::rename(&displaced, target);
+            let _ = sync_directory(parent);
         }
         let _ = fs::remove_file(&temporary);
+        let _ = sync_directory(parent);
         return Err(storage_failure(error));
     }
+    sync_directory(parent)?;
     validate_regular_file_within(root, target).map_err(storage_failure)?;
     if had_target {
         fs::remove_file(displaced).map_err(storage_failure)?;
+        sync_directory(parent)?;
     }
     Ok(())
 }
@@ -4278,7 +4631,8 @@ fn restore_transaction_target(
         None => match current {
             None => Ok(()),
             Some(current) if Some(current.as_slice()) == new_bytes.as_deref() => {
-                fs::remove_file(target).map_err(storage_failure)
+                fs::remove_file(target).map_err(storage_failure)?;
+                sync_directory(target.parent().ok_or(ServiceError::Storage)?)
             }
             Some(_) => Err(ServiceError::Conflict),
         },
@@ -4312,6 +4666,35 @@ fn roll_forward_transaction_target(
     replace_file_from_stage(root, target, new_stage, operation_id, label)
 }
 
+fn validate_roll_forward_transaction_target(
+    root: &Path,
+    target: &Path,
+    old_stage: Option<&Path>,
+    new_stage: Option<&Path>,
+) -> Result<(), ServiceError> {
+    validate_replacement_target_parent(root, target)?;
+    let current = optional_regular_file(target)?
+        .map(fs::read)
+        .transpose()
+        .map_err(storage_failure)?;
+    if current.is_none() {
+        return Ok(());
+    }
+    let old_bytes = old_stage
+        .map(fs::read)
+        .transpose()
+        .map_err(storage_failure)?;
+    let new_bytes = new_stage
+        .map(fs::read)
+        .transpose()
+        .map_err(storage_failure)?;
+    if current.as_deref() == old_bytes.as_deref() || current.as_deref() == new_bytes.as_deref() {
+        Ok(())
+    } else {
+        Err(ServiceError::Conflict)
+    }
+}
+
 fn cleanup_controlled_transaction_directory(
     root: &Path,
     directory: &Path,
@@ -4341,7 +4724,8 @@ fn cleanup_controlled_transaction_directory(
     for path in files {
         fs::remove_file(path).map_err(storage_failure)?;
     }
-    fs::remove_dir(directory).map_err(storage_failure)
+    fs::remove_dir(directory).map_err(storage_failure)?;
+    sync_directory(root)
 }
 
 fn relative_managed_path(root: &Path, path: &Path) -> Result<String, ServiceError> {
@@ -4615,8 +4999,10 @@ fn remote_mutation_error(error: RemoteMutationError) -> ServiceError {
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_project_path_is_direct_child;
+    use super::{canonical_project_path_is_direct_child, sync_directory, ServiceError};
+    use std::fs;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn canonical_project_path_must_be_a_direct_child_of_root() {
@@ -4633,5 +5019,26 @@ mod tests {
             &root,
             Path::new("outside").join("project").as_path()
         ));
+    }
+
+    #[test]
+    fn directory_sync_succeeds_for_a_directory_and_rejects_a_missing_path() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "image-annotation-directory-sync-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+
+        assert_eq!(sync_directory(&directory), Ok(()));
+        assert_eq!(
+            sync_directory(&directory.join("missing")),
+            Err(ServiceError::Storage)
+        );
+
+        fs::remove_dir(directory).unwrap();
     }
 }

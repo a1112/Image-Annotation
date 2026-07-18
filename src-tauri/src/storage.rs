@@ -125,6 +125,8 @@ pub struct RemoteAnnotationSaveResult {
     pub previous_annotation: Option<AnnotationPayload>,
     pub previous_metadata: StoredSampleMetadata,
     pub previous_source: Option<StoredImageSource>,
+    pub applied_metadata: StoredSampleMetadata,
+    pub applied_source: StoredImageSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1577,12 +1579,20 @@ pub fn save_remote_annotation_payload(
         .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
     validate_project_database_artifacts(path).map_err(RemoteMutationError::Storage)?;
 
+    let applied_metadata = StoredSampleMetadata {
+        split: previous_metadata.split.clone(),
+        status: "草稿".to_string(),
+        qa_status: String::new(),
+        review_note: None,
+    };
     Ok(RemoteAnnotationSaveResult {
         revision,
         saved_at,
         previous_annotation,
         previous_metadata,
         previous_source,
+        applied_metadata,
+        applied_source: source.clone(),
     })
 }
 
@@ -1590,10 +1600,7 @@ pub fn compensate_remote_annotation_save(
     path: &Path,
     image_id: &str,
     operation_id: &str,
-    applied_revision: &str,
-    previous_annotation: Option<&AnnotationPayload>,
-    previous_metadata: &StoredSampleMetadata,
-    previous_source: Option<&StoredImageSource>,
+    saved: &RemoteAnnotationSaveResult,
 ) -> Result<bool, String> {
     initialize_project_database(path)?;
     validate_project_database_artifacts(path)?;
@@ -1626,7 +1633,7 @@ pub fn compensate_remote_annotation_save(
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    if current_revision.as_deref() != Some(applied_revision)
+    if current_revision.as_deref() != Some(saved.revision.as_str())
         || committed_event
             .as_ref()
             .is_none_or(|(action, event_image_id)| {
@@ -1635,8 +1642,45 @@ pub fn compensate_remote_annotation_save(
     {
         return Ok(false);
     }
+    let current_metadata = transaction
+        .query_row(
+            "SELECT split, status, qa_status, review_note FROM images WHERE id = ?1",
+            [image_id],
+            |row| {
+                Ok(StoredSampleMetadata {
+                    split: row.get(0)?,
+                    status: row.get(1)?,
+                    qa_status: row.get(2)?,
+                    review_note: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let current_source = transaction
+        .query_row(
+            "SELECT image_id, relative_path, external_id, annotation_path, source_version
+             FROM image_sources WHERE image_id = ?1",
+            [image_id],
+            |row| {
+                Ok(StoredImageSource {
+                    image_id: row.get(0)?,
+                    relative_path: row.get(1)?,
+                    external_id: row.get(2)?,
+                    annotation_path: row.get(3)?,
+                    source_version: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if current_metadata.as_ref() != Some(&saved.applied_metadata)
+        || current_source.as_ref() != Some(&saved.applied_source)
+    {
+        return Ok(false);
+    }
 
-    match previous_annotation {
+    match saved.previous_annotation.as_ref() {
         Some(previous) => {
             transaction
                 .execute(
@@ -1661,7 +1705,7 @@ pub fn compensate_remote_annotation_save(
     transaction
         .execute(
             "DELETE FROM annotation_versions WHERE id = ?1 AND revision = ?2",
-            params![format!("{operation_id}:version"), applied_revision],
+            params![format!("{operation_id}:version"), saved.revision],
         )
         .map_err(|error| error.to_string())?;
     transaction
@@ -1671,14 +1715,14 @@ pub fn compensate_remote_annotation_save(
              WHERE id = ?1",
             params![
                 image_id,
-                previous_metadata.split,
-                previous_metadata.status,
-                previous_metadata.qa_status,
-                previous_metadata.review_note
+                saved.previous_metadata.split,
+                saved.previous_metadata.status,
+                saved.previous_metadata.qa_status,
+                saved.previous_metadata.review_note
             ],
         )
         .map_err(|error| error.to_string())?;
-    match previous_source {
+    match saved.previous_source.as_ref() {
         Some(source) => {
             transaction
                 .execute(
@@ -2456,6 +2500,119 @@ mod tests {
             .unwrap();
         assert_eq!(released.status, "草稿");
         assert_eq!(released.locked_at, None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn remote_annotation_compensation_preserves_concurrent_metadata_changes() {
+        let path =
+            std::env::temp_dir().join("image_annotation_remote_compensation_metadata_test.sqlite");
+        let _ = std::fs::remove_file(&path);
+        initialize_project_database(&path).unwrap();
+        seed_test_image(&path, "img-1");
+        let source = StoredImageSource {
+            image_id: "img-1".to_string(),
+            relative_path: "images/img-1.jpg".to_string(),
+            external_id: None,
+            annotation_path: Some("labels/img-1.txt".to_string()),
+            source_version: "sha256:applied".to_string(),
+        };
+        let saved = save_remote_annotation_payload(
+            &path,
+            "img-1",
+            &AnnotationRevisionExpectation::Missing,
+            r#"[{"id":"applied"}]"#,
+            "metadata-cas-operation",
+            &source,
+        )
+        .unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE images
+                 SET split = 'val', status = '通过', qa_status = '通过',
+                     review_note = 'concurrent metadata'
+                 WHERE id = 'img-1'",
+                [],
+            )
+            .unwrap();
+
+        let compensated =
+            compensate_remote_annotation_save(&path, "img-1", "metadata-cas-operation", &saved)
+                .unwrap();
+
+        assert!(!compensated);
+        assert_eq!(
+            read_sample_metadata(&path, "img-1").unwrap().unwrap(),
+            StoredSampleMetadata {
+                split: "val".to_string(),
+                status: "通过".to_string(),
+                qa_status: "通过".to_string(),
+                review_note: Some("concurrent metadata".to_string()),
+            }
+        );
+        assert_eq!(
+            read_annotation_payload(&path, "img-1")
+                .unwrap()
+                .unwrap()
+                .revision,
+            saved.revision
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn remote_annotation_compensation_preserves_concurrent_source_changes() {
+        let path =
+            std::env::temp_dir().join("image_annotation_remote_compensation_source_test.sqlite");
+        let _ = std::fs::remove_file(&path);
+        initialize_project_database(&path).unwrap();
+        seed_test_image(&path, "img-1");
+        let source = StoredImageSource {
+            image_id: "img-1".to_string(),
+            relative_path: "images/img-1.jpg".to_string(),
+            external_id: None,
+            annotation_path: Some("labels/img-1.txt".to_string()),
+            source_version: "sha256:applied".to_string(),
+        };
+        let saved = save_remote_annotation_payload(
+            &path,
+            "img-1",
+            &AnnotationRevisionExpectation::Missing,
+            r#"[{"id":"applied"}]"#,
+            "source-cas-operation",
+            &source,
+        )
+        .unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE image_sources
+                 SET annotation_path = 'labels/external.txt',
+                     source_version = 'sha256:external'
+                 WHERE image_id = 'img-1'",
+                [],
+            )
+            .unwrap();
+
+        let compensated =
+            compensate_remote_annotation_save(&path, "img-1", "source-cas-operation", &saved)
+                .unwrap();
+
+        assert!(!compensated);
+        let current = read_image_source(&path, "img-1").unwrap().unwrap();
+        assert_eq!(
+            current.annotation_path.as_deref(),
+            Some("labels/external.txt")
+        );
+        assert_eq!(current.source_version, "sha256:external");
+        assert_eq!(
+            read_annotation_payload(&path, "img-1")
+                .unwrap()
+                .unwrap()
+                .revision,
+            saved.revision
+        );
         let _ = std::fs::remove_file(path);
     }
 
