@@ -23,11 +23,15 @@ use crate::{
         AnnotationObject, AnnotationState, AnnotationVersion, BBox, DatasetProject, Point,
         SampleRepository,
     },
+    importers::{
+        adapter::{PrepareSourceSyncError, PreparedSourceSync},
+        labelme, voc_adapter, yolo_adapter,
+    },
     project_fs,
     storage::{
         self as project_storage, AnnotationRevisionExpectation, RemoteMutationError,
-        RemoteWorkflowState, SampleMutationEvidence, StoredImage, StoredSample, StoredSampleClass,
-        StoredSampleFilter,
+        RemoteWorkflowState, SampleMutationEvidence, StoredImage, StoredImageSource, StoredSample,
+        StoredSampleClass, StoredSampleFilter,
     },
 };
 
@@ -51,6 +55,7 @@ const MAX_ANNOTATION_ATTRIBUTES_BYTES: usize = 16 * 1024;
 const MAX_REVIEW_NOTE_CHARS: usize = 2_000;
 const THUMBNAIL_EDGE: u32 = 320;
 const CREATE_OWNERSHIP_FILE: &str = ".remote-create-owner";
+const ANNOTATION_TRANSACTION_VERSION: u8 = 1;
 static PROJECT_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static DATA_ROOT_LEASES: OnceLock<Mutex<HashMap<PathBuf, Weak<DataRootLease>>>> = OnceLock::new();
 static CREATE_OWNERSHIP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -314,7 +319,36 @@ struct SampleProjectContext {
     sqlite: PathBuf,
     original_dir: PathBuf,
     thumbnail_dir: PathBuf,
-    annotations_dir: PathBuf,
+    managed_annotations_dir: PathBuf,
+    annotation_transactions_dir: PathBuf,
+}
+
+struct NativeAnnotationTarget {
+    image_path: PathBuf,
+    annotation_path: PathBuf,
+    relative_path: String,
+    relative_annotation_path: String,
+    expected_source_version: String,
+    external_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnnotationFileJournal {
+    version: u8,
+    operation_id: String,
+    project_id: String,
+    image_id: String,
+    image_relative_path: String,
+    sidecar_relative_path: String,
+    expected_source_version: String,
+    managed_had_original: bool,
+    sidecar_had_original: bool,
+}
+
+struct AnnotationFileTransaction {
+    directory: PathBuf,
+    journal: AnnotationFileJournal,
 }
 
 #[derive(Clone)]
@@ -371,6 +405,9 @@ impl RemoteSampleService {
         }
         service
             .reconcile_pending_operations()
+            .map_err(|_| ServerBuildError::initialization_failed())?;
+        service
+            .reconcile_orphan_annotation_file_transactions()
             .map_err(|_| ServerBuildError::initialization_failed())?;
         service
             .repair_project_manifests()
@@ -580,8 +617,9 @@ impl RemoteSampleService {
             return Err(ServiceError::AnnotationValidation);
         }
         let objects = self.validate_annotation_objects(&context, &sample.image, raw_objects)?;
+        let native_target = self.native_annotation_target(&context, &sample.image)?;
+        let prepared_native = self.prepare_native_annotation(&context, &objects, &native_target)?;
         let object_json = serde_json::to_string(&objects).map_err(storage_failure)?;
-        self.prepare_native_annotation_artifacts(&context, sample_id)?;
         let operation_payload = serde_json::to_string(&AnnotationOperationPayload {
             project_id: project_id.to_string(),
             image_id: sample_id.to_string(),
@@ -603,17 +641,70 @@ impl RemoteSampleService {
                 payload: &operation_payload,
             })
             .map_err(storage_failure)?;
+        let file_transaction = match self.prepare_annotation_file_transaction(
+            &context,
+            project_id,
+            sample_id,
+            &operation.operation_id,
+            &native_target,
+            &prepared_native,
+        ) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                self.fail_audit_best_effort(&operation, failure_message(error));
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.apply_native_annotation_transaction(&context, &file_transaction) {
+            if self
+                .rollback_annotation_file_transaction(&context, &file_transaction)
+                .and_then(|()| self.cleanup_annotation_file_transaction(&file_transaction))
+                .is_ok()
+            {
+                self.fail_audit_best_effort(&operation, failure_message(error));
+            } else {
+                self.note_pending_audit_best_effort(
+                    &operation,
+                    "annotation file replacement requires startup rollback",
+                );
+            }
+            return Err(error);
+        }
+        let source_version = native_source_version(
+            &context.manifest.format,
+            &context.original_dir,
+            &native_target.image_path,
+        )?;
+        let source = StoredImageSource {
+            image_id: sample_id.to_string(),
+            relative_path: native_target.relative_path.clone(),
+            external_id: native_target.external_id.clone(),
+            annotation_path: Some(native_target.relative_annotation_path.clone()),
+            source_version,
+        };
         let saved = match project_storage::save_remote_annotation_payload(
             &context.sqlite,
             sample_id,
             &expectation,
             &object_json,
             &operation.operation_id,
+            &source,
         ) {
             Ok(saved) => saved,
             Err(error) => {
                 let service_error = remote_mutation_error(error);
-                self.fail_audit_best_effort(&operation, failure_message(service_error));
+                if self
+                    .rollback_annotation_file_transaction(&context, &file_transaction)
+                    .and_then(|()| self.cleanup_annotation_file_transaction(&file_transaction))
+                    .is_ok()
+                {
+                    self.fail_audit_best_effort(&operation, failure_message(service_error));
+                } else {
+                    self.note_pending_audit_best_effort(
+                        &operation,
+                        "annotation database rejection requires startup file rollback",
+                    );
+                }
                 return Err(service_error);
             }
         };
@@ -624,31 +715,59 @@ impl RemoteSampleService {
             status: "草稿".to_string(),
             updated_at: Some(saved.saved_at.clone()),
         };
-        if let Err(error) = self.persist_native_annotation(&context, sample_id, &state) {
-            match project_storage::compensate_remote_annotation_save(
+        if let Err(error) = self
+            .stage_managed_annotation(&context, &file_transaction, &state)
+            .and_then(|()| self.apply_managed_annotation_transaction(&context, &file_transaction))
+        {
+            let database_rolled_back = project_storage::compensate_remote_annotation_save(
                 &context.sqlite,
                 sample_id,
                 &operation.operation_id,
                 &saved.revision,
                 saved.previous_annotation.as_ref(),
                 &saved.previous_metadata,
-            ) {
-                Ok(true) => {
-                    self.fail_audit_best_effort(
-                        &operation,
-                        "annotation native persistence failed and was compensated",
-                    );
-                }
-                Ok(false) | Err(_) => {
-                    self.note_pending_audit_best_effort(
-                        &operation,
-                        "annotation project commit requires startup reconciliation",
-                    );
-                }
+                saved.previous_source.as_ref(),
+            )
+            .unwrap_or(false);
+            let files_rolled_back = self
+                .rollback_annotation_file_transaction(&context, &file_transaction)
+                .is_ok();
+            if database_rolled_back
+                && files_rolled_back
+                && self
+                    .cleanup_annotation_file_transaction(&file_transaction)
+                    .is_ok()
+            {
+                self.fail_audit_best_effort(
+                    &operation,
+                    "annotation managed persistence failed and was compensated",
+                );
+            } else {
+                self.note_pending_audit_best_effort(
+                    &operation,
+                    "annotation persistence compensation requires startup reconciliation",
+                );
             }
             return Err(error);
         }
-        self.complete_audit_best_effort(&operation, "annotation saved");
+        match self.storage.complete_audit(&operation, "annotation saved") {
+            Ok(()) => {
+                if let Err(error) = self.cleanup_annotation_file_transaction(&file_transaction) {
+                    tracing::warn!(
+                        ?error,
+                        operation_id = %operation.operation_id,
+                        "annotation transaction cleanup is deferred"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    operation_id = %operation.operation_id,
+                    "failed to complete annotation audit operation"
+                );
+            }
+        }
         Ok(state)
     }
 
@@ -1362,6 +1481,100 @@ impl RemoteSampleService {
         Ok(())
     }
 
+    fn reconcile_orphan_annotation_file_transactions(&self) -> Result<(), ServiceError> {
+        for entry in fs::read_dir(self.projects_dir.as_ref()).map_err(storage_failure)? {
+            let entry = entry.map_err(storage_failure)?;
+            let Some(project_id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if validate_project_id(&project_id).is_err() {
+                continue;
+            }
+            let context = match self.sample_project_context(&project_id) {
+                Ok(context) => context,
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        project_id,
+                        "annotation transaction project is unavailable during startup"
+                    );
+                    continue;
+                }
+            };
+            for transaction_entry in
+                fs::read_dir(&context.annotation_transactions_dir).map_err(storage_failure)?
+            {
+                let transaction_entry = transaction_entry.map_err(storage_failure)?;
+                let metadata =
+                    fs::symlink_metadata(transaction_entry.path()).map_err(storage_failure)?;
+                if is_symlink_or_reparse(&metadata) || !metadata.is_dir() {
+                    return Err(ServiceError::Storage);
+                }
+                let journal_path = transaction_entry.path().join("journal.json");
+                if fs::symlink_metadata(&journal_path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    cleanup_controlled_transaction_directory(
+                        &context.annotation_transactions_dir,
+                        &transaction_entry.path(),
+                    )?;
+                    continue;
+                }
+                self.validate_required_project_file(&transaction_entry.path(), &journal_path)?;
+                let journal: AnnotationFileJournal =
+                    serde_json::from_slice(&fs::read(journal_path).map_err(storage_failure)?)
+                        .map_err(storage_failure)?;
+                let Some(operation) = self
+                    .storage
+                    .operation(&journal.operation_id)
+                    .map_err(storage_failure)?
+                else {
+                    return Err(ServiceError::Storage);
+                };
+                if operation.action != "save_annotations"
+                    || operation.project_id.as_deref() != Some(journal.project_id.as_str())
+                    || operation.image_id.as_deref() != Some(journal.image_id.as_str())
+                {
+                    return Err(ServiceError::Storage);
+                }
+                if operation.state == "pending" {
+                    continue;
+                }
+                let Some(transaction) =
+                    self.load_annotation_file_transaction(&context, &journal.operation_id)?
+                else {
+                    continue;
+                };
+                let evidence = project_storage::remote_mutation_evidence(
+                    &context.sqlite,
+                    &journal.operation_id,
+                    &journal.image_id,
+                    "annotation.save",
+                    Some("annotation.save.rollback"),
+                )
+                .map_err(storage_failure)?;
+                let result = match evidence {
+                    SampleMutationEvidence::Committed => {
+                        self.recover_committed_annotation_file_transaction(&context, &transaction)
+                    }
+                    SampleMutationEvidence::Compensated | SampleMutationEvidence::None => {
+                        self.recover_rolled_back_annotation_file_transaction(&context, &transaction)
+                    }
+                    SampleMutationEvidence::Indeterminate => continue,
+                };
+                if let Err(error) = result {
+                    tracing::error!(
+                        ?error,
+                        operation_id = %journal.operation_id,
+                        "orphan annotation file transaction recovery failed"
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn reconcile_pending_create(&self, record: &OperationRecord) -> Result<(), ServiceError> {
         let payload: CreateOperationPayload =
             serde_json::from_str(&record.payload).map_err(storage_failure)?;
@@ -1665,33 +1878,74 @@ impl RemoteSampleService {
                 return;
             }
         };
+        let file_transaction = if repair_native {
+            match self.load_annotation_file_transaction(&context, &record.operation_id) {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    tracing::error!(
+                        ?error,
+                        operation_id = %record.operation_id,
+                        "annotation file transaction could not be loaded"
+                    );
+                    self.note_pending_audit_best_effort(
+                        &operation,
+                        "annotation file recovery remains pending",
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         match evidence {
             SampleMutationEvidence::Committed => {
                 if repair_native {
-                    let state = match self.annotation_state_in_context(&context, &payload.image_id)
-                    {
-                        Ok(state) if state.revision.is_some() => state,
-                        _ => {
-                            self.mark_sample_reconciliation_indeterminate(
-                                &operation,
-                                "annotation native state cannot be repaired from project evidence",
-                            );
-                            return;
+                    match file_transaction.as_ref() {
+                        Some(transaction) => {
+                            if let Err(error) = self.recover_committed_annotation_file_transaction(
+                                &context,
+                                transaction,
+                            ) {
+                                tracing::error!(
+                                    ?error,
+                                    operation_id = %record.operation_id,
+                                    "annotation committed file recovery failed"
+                                );
+                                self.note_pending_audit_best_effort(
+                                    &operation,
+                                    "annotation project commit is valid; file recovery remains pending",
+                                );
+                                return;
+                            }
                         }
-                    };
-                    if let Err(error) =
-                        self.persist_native_annotation(&context, &payload.image_id, &state)
-                    {
-                        tracing::error!(
-                            ?error,
-                            operation_id = %record.operation_id,
-                            "annotation native state repair failed"
-                        );
-                        self.note_pending_audit_best_effort(
-                            &operation,
-                            "annotation project commit is valid; native repair remains pending",
-                        );
-                        return;
+                        None => {
+                            let state = match self
+                                .annotation_state_in_context(&context, &payload.image_id)
+                            {
+                                Ok(state) if state.revision.is_some() => state,
+                                _ => {
+                                    self.mark_sample_reconciliation_indeterminate(
+                                        &operation,
+                                        "annotation native state cannot be repaired from project evidence",
+                                    );
+                                    return;
+                                }
+                            };
+                            if let Err(error) =
+                                self.persist_managed_annotation(&context, &payload.image_id, &state)
+                            {
+                                tracing::error!(
+                                    ?error,
+                                    operation_id = %record.operation_id,
+                                    "legacy annotation managed state repair failed"
+                                );
+                                self.note_pending_audit_best_effort(
+                                    &operation,
+                                    "annotation project commit is valid; managed repair remains pending",
+                                );
+                                return;
+                            }
+                        }
                     }
                 }
                 self.complete_sample_reconciliation(
@@ -1699,15 +1953,54 @@ impl RemoteSampleService {
                     "annotation mutation reconciled from project evidence",
                 );
             }
-            SampleMutationEvidence::Compensated => self.fail_sample_reconciliation(
-                &operation,
-                "annotation mutation was compensated in project storage",
-            ),
-            SampleMutationEvidence::None | SampleMutationEvidence::Indeterminate => self
-                .mark_sample_reconciliation_indeterminate(
+            SampleMutationEvidence::Compensated => {
+                if let Some(transaction) = file_transaction.as_ref() {
+                    if let Err(error) =
+                        self.recover_rolled_back_annotation_file_transaction(&context, transaction)
+                    {
+                        tracing::error!(
+                            ?error,
+                            operation_id = %record.operation_id,
+                            "annotation compensated file rollback failed"
+                        );
+                        self.note_pending_audit_best_effort(
+                            &operation,
+                            "annotation compensation file rollback remains pending",
+                        );
+                        return;
+                    }
+                }
+                self.fail_sample_reconciliation(
+                    &operation,
+                    "annotation mutation was compensated in project storage",
+                );
+            }
+            SampleMutationEvidence::None => {
+                if let Some(transaction) = file_transaction.as_ref() {
+                    if let Err(error) =
+                        self.recover_rolled_back_annotation_file_transaction(&context, transaction)
+                    {
+                        tracing::error!(
+                            ?error,
+                            operation_id = %record.operation_id,
+                            "uncommitted annotation file rollback failed"
+                        );
+                        self.note_pending_audit_best_effort(
+                            &operation,
+                            "uncommitted annotation file rollback remains pending",
+                        );
+                        return;
+                    }
+                }
+                self.mark_sample_reconciliation_indeterminate(
                     &operation,
                     "annotation mutation has no conclusive project evidence",
-                ),
+                );
+            }
+            SampleMutationEvidence::Indeterminate => self.mark_sample_reconciliation_indeterminate(
+                &operation,
+                "annotation mutation project evidence is inconsistent",
+            ),
         }
     }
 
@@ -1805,7 +2098,8 @@ impl RemoteSampleService {
             };
             match self.ensure_project_manifest(&project_dir, require_active_root) {
                 Ok(_) if require_active_root => {
-                    match validate_managed_directory_chain(&project_dir, &["annotations"]) {
+                    match validate_managed_directory_chain(&project_dir, &["annotations", "native"])
+                    {
                         Ok(annotations_dir) => {
                             if let Err(error) =
                                 self.cleanup_annotation_temporary_files(&annotations_dir)
@@ -2057,7 +2351,7 @@ impl RemoteSampleService {
             || manifest.source_dataset_key != "local-demo"
             || !matches!(
                 manifest.format.as_str(),
-                "yolo-detect" | "yolo-seg" | "image-classification"
+                "yolo-detect" | "yolo-seg" | "voc-detect" | "labelme" | "image-classification"
             )
         {
             return Err(ServiceError::Storage);
@@ -2232,56 +2526,506 @@ impl RemoteSampleService {
             if !ids.insert(object.id.clone()) {
                 return Err(ServiceError::AnnotationValidation);
             }
+            let supported = match context.manifest.format.as_str() {
+                "yolo-detect" | "voc-detect" => object.bbox.is_some(),
+                "yolo-seg" => object.polygon.is_some(),
+                "labelme" => object.bbox.is_some() || object.polygon.is_some(),
+                _ => false,
+            };
+            if !supported {
+                return Err(ServiceError::AnnotationValidation);
+            }
             objects.push(object);
         }
         Ok(objects)
     }
 
-    fn native_annotation_paths(
+    fn native_annotation_target(
+        &self,
+        context: &SampleProjectContext,
+        image: &StoredImage,
+    ) -> Result<NativeAnnotationTarget, ServiceError> {
+        let image_path = self.resolve_sample_asset(context, &image.file_name)?;
+        let annotation_path = match context.manifest.format.as_str() {
+            "yolo-detect" | "yolo-seg" => {
+                yolo_adapter::annotation_path(&context.original_dir, &image_path)
+            }
+            "voc-detect" => voc_adapter::annotation_path(&context.original_dir, &image_path),
+            "labelme" => labelme::annotation_path(&context.original_dir, &image_path),
+            _ => return Err(ServiceError::AnnotationValidation),
+        };
+        self.prepare_native_sidecar_path(&context.original_dir, &annotation_path)?;
+        let relative_path = relative_managed_path(&context.original_dir, &image_path)?;
+        let relative_annotation_path =
+            relative_managed_path(&context.original_dir, &annotation_path)?;
+        let source = project_storage::read_image_source(&context.sqlite, &image.id)
+            .map_err(storage_failure)?;
+        if let Some(source) = &source {
+            if normalize_separator(&source.relative_path) != relative_path
+                || source
+                    .annotation_path
+                    .as_deref()
+                    .is_some_and(|path| normalize_separator(path) != relative_annotation_path)
+            {
+                return Err(ServiceError::Conflict);
+            }
+        }
+        let current_source_version =
+            native_source_version(&context.manifest.format, &context.original_dir, &image_path)?;
+        if source
+            .as_ref()
+            .map(|source| source.source_version.as_str())
+            .is_some_and(|expected| !expected.is_empty() && expected != current_source_version)
+        {
+            return Err(ServiceError::Conflict);
+        }
+        Ok(NativeAnnotationTarget {
+            image_path,
+            annotation_path,
+            relative_path,
+            relative_annotation_path,
+            expected_source_version: current_source_version,
+            external_id: source.and_then(|source| source.external_id),
+        })
+    }
+
+    fn prepare_native_sidecar_path(&self, root: &Path, path: &Path) -> Result<(), ServiceError> {
+        let relative = path.strip_prefix(root).map_err(|_| ServiceError::Storage)?;
+        if relative.as_os_str().is_empty()
+            || !relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(ServiceError::Storage);
+        }
+        let parent = relative.parent().ok_or(ServiceError::Storage)?;
+        let components = parent
+            .components()
+            .map(|component| {
+                let Component::Normal(component) = component else {
+                    return Err(ServiceError::Storage);
+                };
+                component
+                    .to_str()
+                    .map(str::to_string)
+                    .ok_or(ServiceError::Storage)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let component_refs = components.iter().map(String::as_str).collect::<Vec<_>>();
+        ensure_managed_subdirectory(root, &component_refs).map_err(storage_failure)?;
+        for candidate in [path.to_path_buf(), adapter_temporary_path(path)] {
+            match fs::symlink_metadata(&candidate) {
+                Ok(_) => {
+                    self.validate_managed_asset_file(root, &candidate)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(storage_failure(error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_native_annotation(
+        &self,
+        context: &SampleProjectContext,
+        objects: &[AnnotationObject],
+        target: &NativeAnnotationTarget,
+    ) -> Result<PreparedSourceSync, ServiceError> {
+        let expected_version = Some(target.expected_source_version.as_str());
+        let prepared = match context.manifest.format.as_str() {
+            "yolo-detect" | "yolo-seg" => yolo_adapter::prepare_annotations(
+                &context.original_dir,
+                &target.image_path,
+                &context.manifest.format,
+                objects,
+                expected_version,
+            ),
+            "voc-detect" => voc_adapter::prepare_annotations(
+                &context.original_dir,
+                &target.image_path,
+                objects,
+                expected_version,
+            ),
+            "labelme" => labelme::prepare_annotations(
+                &context.original_dir,
+                &target.image_path,
+                objects,
+                expected_version,
+            ),
+            _ => return Err(ServiceError::AnnotationValidation),
+        }
+        .map_err(|error| match error {
+            PrepareSourceSyncError::Conflict => ServiceError::Conflict,
+            PrepareSourceSyncError::Storage(message) => storage_failure(message),
+        })?;
+        if prepared.path != target.annotation_path {
+            return Err(ServiceError::Storage);
+        }
+        Ok(prepared)
+    }
+
+    fn prepare_annotation_file_transaction(
+        &self,
+        context: &SampleProjectContext,
+        project_id: &str,
+        sample_id: &str,
+        operation_id: &str,
+        target: &NativeAnnotationTarget,
+        prepared: &PreparedSourceSync,
+    ) -> Result<AnnotationFileTransaction, ServiceError> {
+        if native_source_version(
+            &context.manifest.format,
+            &context.original_dir,
+            &target.image_path,
+        )? != target.expected_source_version
+        {
+            return Err(ServiceError::Conflict);
+        }
+        let directory_name = sha256_hex(operation_id.as_bytes());
+        let directory = context.annotation_transactions_dir.join(&directory_name);
+        match fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(ServiceError::Storage);
+            }
+            Err(error) => return Err(storage_failure(error)),
+        }
+        let result = (|| {
+            validate_managed_directory_chain(
+                &context.annotation_transactions_dir,
+                &[&directory_name],
+            )?;
+            let managed_target = context
+                .managed_annotations_dir
+                .join(format!("{sample_id}.json"));
+            let managed_before =
+                self.read_optional_managed_file(&context.managed_annotations_dir, &managed_target)?;
+            let sidecar_before =
+                self.read_optional_managed_file(&context.original_dir, &target.annotation_path)?;
+            if native_source_version(
+                &context.manifest.format,
+                &context.original_dir,
+                &target.image_path,
+            )? != target.expected_source_version
+            {
+                return Err(ServiceError::Conflict);
+            }
+            if let Some(bytes) = managed_before.as_deref() {
+                write_new_synced_file(&directory.join("managed.old"), bytes)?;
+            }
+            if let Some(bytes) = sidecar_before.as_deref() {
+                write_new_synced_file(&directory.join("sidecar.old"), bytes)?;
+            }
+            write_new_synced_file(&directory.join("sidecar.new"), &prepared.data)?;
+            let journal = AnnotationFileJournal {
+                version: ANNOTATION_TRANSACTION_VERSION,
+                operation_id: operation_id.to_string(),
+                project_id: project_id.to_string(),
+                image_id: sample_id.to_string(),
+                image_relative_path: target.relative_path.clone(),
+                sidecar_relative_path: target.relative_annotation_path.clone(),
+                expected_source_version: target.expected_source_version.clone(),
+                managed_had_original: managed_before.is_some(),
+                sidecar_had_original: sidecar_before.is_some(),
+            };
+            let journal_bytes = serde_json::to_vec_pretty(&journal).map_err(storage_failure)?;
+            write_new_synced_file(&directory.join("journal.json"), &journal_bytes)?;
+            Ok(AnnotationFileTransaction {
+                directory: directory.clone(),
+                journal,
+            })
+        })();
+        if result.is_err() {
+            let _ = cleanup_controlled_transaction_directory(
+                &context.annotation_transactions_dir,
+                &directory,
+            );
+        }
+        result
+    }
+
+    fn stage_managed_annotation(
+        &self,
+        context: &SampleProjectContext,
+        transaction: &AnnotationFileTransaction,
+        state: &AnnotationState,
+    ) -> Result<(), ServiceError> {
+        self.validate_annotation_file_transaction(context, transaction)?;
+        let bytes = serde_json::to_vec_pretty(state).map_err(storage_failure)?;
+        write_new_synced_file(&transaction.directory.join("managed.new"), &bytes)
+    }
+
+    fn apply_native_annotation_transaction(
+        &self,
+        context: &SampleProjectContext,
+        transaction: &AnnotationFileTransaction,
+    ) -> Result<(), ServiceError> {
+        self.validate_annotation_file_transaction(context, transaction)?;
+        let target = context.original_dir.join(validated_relative_asset_path(
+            &transaction.journal.sidecar_relative_path,
+        )?);
+        let current_version = crate::importers::adapter::source_version(&target);
+        if current_version != transaction.journal.expected_source_version {
+            return Err(ServiceError::Conflict);
+        }
+        replace_file_from_stage(
+            &context.original_dir,
+            &target,
+            &transaction.directory.join("sidecar.new"),
+            &transaction.journal.operation_id,
+            "sidecar",
+        )
+    }
+
+    fn apply_managed_annotation_transaction(
+        &self,
+        context: &SampleProjectContext,
+        transaction: &AnnotationFileTransaction,
+    ) -> Result<(), ServiceError> {
+        self.validate_annotation_file_transaction(context, transaction)?;
+        let target = context
+            .managed_annotations_dir
+            .join(format!("{}.json", transaction.journal.image_id));
+        replace_file_from_stage(
+            &context.managed_annotations_dir,
+            &target,
+            &transaction.directory.join("managed.new"),
+            &transaction.journal.operation_id,
+            "managed",
+        )
+    }
+
+    fn rollback_annotation_file_transaction(
+        &self,
+        context: &SampleProjectContext,
+        transaction: &AnnotationFileTransaction,
+    ) -> Result<(), ServiceError> {
+        self.validate_annotation_file_transaction(context, transaction)?;
+        let managed_target = context
+            .managed_annotations_dir
+            .join(format!("{}.json", transaction.journal.image_id));
+        restore_transaction_target(
+            &context.managed_annotations_dir,
+            &managed_target,
+            transaction
+                .journal
+                .managed_had_original
+                .then(|| transaction.directory.join("managed.old"))
+                .as_deref(),
+            optional_regular_file(&transaction.directory.join("managed.new"))?.as_deref(),
+            &transaction.journal.operation_id,
+            "managed",
+        )?;
+        let sidecar_target = context.original_dir.join(validated_relative_asset_path(
+            &transaction.journal.sidecar_relative_path,
+        )?);
+        restore_transaction_target(
+            &context.original_dir,
+            &sidecar_target,
+            transaction
+                .journal
+                .sidecar_had_original
+                .then(|| transaction.directory.join("sidecar.old"))
+                .as_deref(),
+            Some(transaction.directory.join("sidecar.new").as_path()),
+            &transaction.journal.operation_id,
+            "sidecar",
+        )
+    }
+
+    fn cleanup_annotation_file_transaction(
+        &self,
+        transaction: &AnnotationFileTransaction,
+    ) -> Result<(), ServiceError> {
+        let parent = transaction
+            .directory
+            .parent()
+            .ok_or(ServiceError::Storage)?;
+        cleanup_controlled_transaction_directory(parent, &transaction.directory)
+    }
+
+    fn validate_annotation_file_transaction(
+        &self,
+        context: &SampleProjectContext,
+        transaction: &AnnotationFileTransaction,
+    ) -> Result<(), ServiceError> {
+        if transaction.journal.version != ANNOTATION_TRANSACTION_VERSION
+            || transaction.journal.project_id != context.manifest.id
+            || validate_sample_id(&transaction.journal.image_id).is_err()
+            || transaction.directory.parent() != Some(&context.annotation_transactions_dir)
+        {
+            return Err(ServiceError::Storage);
+        }
+        let directory_name = transaction
+            .directory
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or(ServiceError::Storage)?;
+        if directory_name != sha256_hex(transaction.journal.operation_id.as_bytes()) {
+            return Err(ServiceError::Storage);
+        }
+        validate_managed_directory_chain(&context.annotation_transactions_dir, &[directory_name])?;
+        Ok(())
+    }
+
+    fn read_optional_managed_file(
+        &self,
+        root: &Path,
+        path: &Path,
+    ) -> Result<Option<Vec<u8>>, ServiceError> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                self.validate_managed_asset_file(root, path)?;
+                fs::read(path).map(Some).map_err(storage_failure)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(storage_failure(error)),
+        }
+    }
+
+    fn load_annotation_file_transaction(
+        &self,
+        context: &SampleProjectContext,
+        operation_id: &str,
+    ) -> Result<Option<AnnotationFileTransaction>, ServiceError> {
+        let directory = context
+            .annotation_transactions_dir
+            .join(sha256_hex(operation_id.as_bytes()));
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(storage_failure(error)),
+        };
+        if is_symlink_or_reparse(&metadata) || !metadata.is_dir() {
+            return Err(ServiceError::Storage);
+        }
+        let journal_path = directory.join("journal.json");
+        self.validate_required_project_file(&directory, &journal_path)?;
+        let journal: AnnotationFileJournal =
+            serde_json::from_slice(&fs::read(journal_path).map_err(storage_failure)?)
+                .map_err(storage_failure)?;
+        if journal.operation_id != operation_id {
+            return Err(ServiceError::Storage);
+        }
+        let transaction = AnnotationFileTransaction { directory, journal };
+        self.validate_annotation_file_transaction(context, &transaction)?;
+        Ok(Some(transaction))
+    }
+
+    fn recover_committed_annotation_file_transaction(
+        &self,
+        context: &SampleProjectContext,
+        transaction: &AnnotationFileTransaction,
+    ) -> Result<(), ServiceError> {
+        self.validate_annotation_file_transaction(context, transaction)?;
+        let mut source =
+            project_storage::read_image_source(&context.sqlite, &transaction.journal.image_id)
+                .map_err(storage_failure)?
+                .ok_or(ServiceError::Storage)?;
+        if normalize_separator(&source.relative_path) != transaction.journal.image_relative_path
+            || source.annotation_path.as_deref().map(normalize_separator)
+                != Some(transaction.journal.sidecar_relative_path.clone())
+        {
+            return Err(ServiceError::Conflict);
+        }
+        let sidecar_target = context.original_dir.join(validated_relative_asset_path(
+            &transaction.journal.sidecar_relative_path,
+        )?);
+        roll_forward_transaction_target(
+            &context.original_dir,
+            &sidecar_target,
+            transaction
+                .journal
+                .sidecar_had_original
+                .then(|| transaction.directory.join("sidecar.old"))
+                .as_deref(),
+            &transaction.directory.join("sidecar.new"),
+            &transaction.journal.operation_id,
+            "sidecar",
+        )?;
+
+        let state = self.annotation_state_in_context(context, &transaction.journal.image_id)?;
+        if state.revision.is_none() {
+            return Err(ServiceError::Storage);
+        }
+        let recovery_stage = transaction.directory.join("managed.recovery");
+        if optional_regular_file(&recovery_stage)?.is_some() {
+            fs::remove_file(&recovery_stage).map_err(storage_failure)?;
+        }
+        let managed_bytes = serde_json::to_vec_pretty(&state).map_err(storage_failure)?;
+        write_new_synced_file(&recovery_stage, &managed_bytes)?;
+        let managed_target = context
+            .managed_annotations_dir
+            .join(format!("{}.json", transaction.journal.image_id));
+        replace_file_from_stage(
+            &context.managed_annotations_dir,
+            &managed_target,
+            &recovery_stage,
+            &transaction.journal.operation_id,
+            "managed",
+        )?;
+
+        source.source_version = crate::importers::adapter::source_version(&sidecar_target);
+        project_storage::write_image_source(&context.sqlite, &source).map_err(storage_failure)?;
+        self.cleanup_annotation_file_transaction(transaction)
+    }
+
+    fn recover_rolled_back_annotation_file_transaction(
+        &self,
+        context: &SampleProjectContext,
+        transaction: &AnnotationFileTransaction,
+    ) -> Result<(), ServiceError> {
+        self.rollback_annotation_file_transaction(context, transaction)?;
+        self.cleanup_annotation_file_transaction(transaction)
+    }
+
+    fn managed_annotation_paths(
         &self,
         context: &SampleProjectContext,
         sample_id: &str,
     ) -> (PathBuf, PathBuf) {
-        let target = context.annotations_dir.join(format!("{sample_id}.json"));
-        let backup = context.annotations_dir.join(format!(
+        let target = context
+            .managed_annotations_dir
+            .join(format!("{sample_id}.json"));
+        let backup = context.managed_annotations_dir.join(format!(
             ".annotation-{}.bak",
             sha256_hex(sample_id.as_bytes())
         ));
         (target, backup)
     }
 
-    fn prepare_native_annotation_artifacts(
+    fn prepare_managed_annotation_artifacts(
         &self,
         context: &SampleProjectContext,
         sample_id: &str,
     ) -> Result<(), ServiceError> {
-        let (target, backup) = self.native_annotation_paths(context, sample_id);
+        let (target, backup) = self.managed_annotation_paths(context, sample_id);
         let target_exists = self
-            .validate_optional_project_file(&context.annotations_dir, &target)?
+            .validate_optional_project_file(&context.managed_annotations_dir, &target)?
             .is_some();
         let backup_exists = self
-            .validate_optional_project_file(&context.annotations_dir, &backup)?
+            .validate_optional_project_file(&context.managed_annotations_dir, &backup)?
             .is_some();
         match (target_exists, backup_exists) {
             (true, true) => fs::remove_file(backup).map_err(storage_failure),
             (false, true) => {
                 fs::rename(&backup, &target).map_err(storage_failure)?;
-                self.validate_required_project_file(&context.annotations_dir, &target)?;
+                self.validate_required_project_file(&context.managed_annotations_dir, &target)?;
                 Ok(())
             }
             _ => Ok(()),
         }
     }
 
-    fn persist_native_annotation(
+    fn persist_managed_annotation(
         &self,
         context: &SampleProjectContext,
         sample_id: &str,
         state: &AnnotationState,
     ) -> Result<(), ServiceError> {
-        self.prepare_native_annotation_artifacts(context, sample_id)?;
-        let (target, backup) = self.native_annotation_paths(context, sample_id);
-        let temporary = context.annotations_dir.join(format!(
+        self.prepare_managed_annotation_artifacts(context, sample_id)?;
+        let (target, backup) = self.managed_annotation_paths(context, sample_id);
+        let temporary = context.managed_annotations_dir.join(format!(
             ".annotation-{}-{}-{}.tmp",
             sha256_hex(sample_id.as_bytes()),
             std::process::id(),
@@ -2298,11 +3042,11 @@ impl RemoteSampleService {
                 .and_then(|()| file.sync_all())
                 .map_err(storage_failure)?;
             drop(file);
-            self.validate_required_project_file(&context.annotations_dir, &temporary)?;
+            self.validate_required_project_file(&context.managed_annotations_dir, &temporary)?;
             let had_target = self
-                .validate_optional_project_file(&context.annotations_dir, &target)?
+                .validate_optional_project_file(&context.managed_annotations_dir, &target)?
                 .is_some();
-            self.validate_optional_project_file(&context.annotations_dir, &backup)?;
+            self.validate_optional_project_file(&context.managed_annotations_dir, &backup)?;
             if had_target {
                 fs::rename(&target, &backup).map_err(storage_failure)?;
             }
@@ -2316,7 +3060,7 @@ impl RemoteSampleService {
                 return Err(error);
             }
             if let Err(error) =
-                self.validate_required_project_file(&context.annotations_dir, &target)
+                self.validate_required_project_file(&context.managed_annotations_dir, &target)
             {
                 let _ = fs::remove_file(&target);
                 if had_target && fs::rename(&backup, &target).is_err() {
@@ -2359,15 +3103,20 @@ impl RemoteSampleService {
         let original_dir = validate_managed_directory_chain(&project_dir, &["assets", "original"])?;
         let thumbnail_dir =
             validate_managed_directory_chain(&project_dir, &["assets", "thumbnails"])?;
-        let annotations_dir = validate_managed_directory_chain(&project_dir, &["annotations"])?;
+        let managed_annotations_dir =
+            validate_managed_directory_chain(&project_dir, &["annotations", "native"])?;
+        let annotation_transactions_dir =
+            ensure_managed_subdirectory(&project_dir, &["annotations", "transactions"])
+                .map_err(storage_failure)?;
         self.cleanup_thumbnail_temporary_files(&thumbnail_dir)?;
-        self.cleanup_annotation_temporary_files(&annotations_dir)?;
+        self.cleanup_annotation_temporary_files(&managed_annotations_dir)?;
         Ok(SampleProjectContext {
             manifest,
             sqlite,
             original_dir,
             thumbnail_dir,
-            annotations_dir,
+            managed_annotations_dir,
+            annotation_transactions_dir,
         })
     }
 
@@ -3361,6 +4110,246 @@ fn normalize_separator(value: &str) -> String {
     value.replace('\\', "/")
 }
 
+fn write_new_synced_file(path: &Path, bytes: &[u8]) -> Result<(), ServiceError> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(storage_failure)?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(storage_failure)
+}
+
+fn optional_regular_file(path: &Path) -> Result<Option<PathBuf>, ServiceError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if is_symlink_or_reparse(&metadata) || !metadata.is_file() => {
+            Err(ServiceError::Storage)
+        }
+        Ok(_) => Ok(Some(path.to_path_buf())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(storage_failure(error)),
+    }
+}
+
+fn validate_replacement_target_parent(root: &Path, target: &Path) -> Result<(), ServiceError> {
+    if target.parent().is_none_or(|parent| {
+        fs::canonicalize(parent).ok().is_none_or(|canonical| {
+            canonical != root && !canonical_path_is_within(root, &canonical)
+        })
+    }) {
+        return Err(ServiceError::Storage);
+    }
+    match fs::symlink_metadata(target) {
+        Ok(metadata) if is_symlink_or_reparse(&metadata) || !metadata.is_file() => {
+            Err(ServiceError::Storage)
+        }
+        Ok(_) => {
+            validate_regular_file_within(root, target).map_err(storage_failure)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(storage_failure(error)),
+    }
+}
+
+fn replacement_artifact(
+    target: &Path,
+    operation_id: &str,
+    label: &str,
+    suffix: &str,
+) -> Result<PathBuf, ServiceError> {
+    let parent = target.parent().ok_or(ServiceError::Storage)?;
+    Ok(parent.join(format!(
+        ".remote-annotation-{}-{label}.{suffix}",
+        sha256_hex(operation_id.as_bytes())
+    )))
+}
+
+fn normalize_replacement_artifacts(
+    root: &Path,
+    target: &Path,
+    temporary: &Path,
+    displaced: &Path,
+) -> Result<(), ServiceError> {
+    if optional_regular_file(temporary)?.is_some() {
+        validate_regular_file_within(root, temporary).map_err(storage_failure)?;
+        fs::remove_file(temporary).map_err(storage_failure)?;
+    }
+    if optional_regular_file(displaced)?.is_some() {
+        validate_regular_file_within(root, displaced).map_err(storage_failure)?;
+        if target.exists() {
+            fs::remove_file(displaced).map_err(storage_failure)?;
+        } else {
+            fs::rename(displaced, target).map_err(storage_failure)?;
+        }
+    }
+    Ok(())
+}
+
+fn replace_file_from_stage(
+    root: &Path,
+    target: &Path,
+    staged: &Path,
+    operation_id: &str,
+    label: &str,
+) -> Result<(), ServiceError> {
+    let staged = optional_regular_file(staged)?.ok_or(ServiceError::Storage)?;
+    validate_replacement_target_parent(root, target)?;
+    let temporary = replacement_artifact(target, operation_id, label, "tmp")?;
+    let displaced = replacement_artifact(target, operation_id, label, "bak")?;
+    normalize_replacement_artifacts(root, target, &temporary, &displaced)?;
+    let bytes = fs::read(staged).map_err(storage_failure)?;
+    write_new_synced_file(&temporary, &bytes)?;
+    validate_regular_file_within(root, &temporary).map_err(storage_failure)?;
+    let had_target = target.exists();
+    if had_target {
+        fs::rename(target, &displaced).map_err(storage_failure)?;
+    }
+    if let Err(error) = fs::rename(&temporary, target) {
+        if had_target {
+            let _ = fs::rename(&displaced, target);
+        }
+        let _ = fs::remove_file(&temporary);
+        return Err(storage_failure(error));
+    }
+    validate_regular_file_within(root, target).map_err(storage_failure)?;
+    if had_target {
+        fs::remove_file(displaced).map_err(storage_failure)?;
+    }
+    Ok(())
+}
+
+fn restore_transaction_target(
+    root: &Path,
+    target: &Path,
+    old_stage: Option<&Path>,
+    new_stage: Option<&Path>,
+    operation_id: &str,
+    label: &str,
+) -> Result<(), ServiceError> {
+    validate_replacement_target_parent(root, target)?;
+    let current = match optional_regular_file(target)? {
+        Some(path) => Some(fs::read(path).map_err(storage_failure)?),
+        None => None,
+    };
+    let new_bytes = new_stage
+        .map(fs::read)
+        .transpose()
+        .map_err(storage_failure)?;
+    match old_stage {
+        Some(old_stage) => {
+            let old_bytes = fs::read(old_stage).map_err(storage_failure)?;
+            if current.as_deref() == Some(old_bytes.as_slice()) {
+                return Ok(());
+            }
+            if current.is_some() && current.as_deref() != new_bytes.as_deref() {
+                return Err(ServiceError::Conflict);
+            }
+            replace_file_from_stage(root, target, old_stage, operation_id, label)
+        }
+        None => match current {
+            None => Ok(()),
+            Some(current) if Some(current.as_slice()) == new_bytes.as_deref() => {
+                fs::remove_file(target).map_err(storage_failure)
+            }
+            Some(_) => Err(ServiceError::Conflict),
+        },
+    }
+}
+
+fn roll_forward_transaction_target(
+    root: &Path,
+    target: &Path,
+    old_stage: Option<&Path>,
+    new_stage: &Path,
+    operation_id: &str,
+    label: &str,
+) -> Result<(), ServiceError> {
+    validate_replacement_target_parent(root, target)?;
+    let current = match optional_regular_file(target)? {
+        Some(path) => Some(fs::read(path).map_err(storage_failure)?),
+        None => None,
+    };
+    let new_bytes = fs::read(new_stage).map_err(storage_failure)?;
+    if current.as_deref() == Some(new_bytes.as_slice()) {
+        return Ok(());
+    }
+    let old_bytes = old_stage
+        .map(fs::read)
+        .transpose()
+        .map_err(storage_failure)?;
+    if current.is_some() && current.as_deref() != old_bytes.as_deref() {
+        return Err(ServiceError::Conflict);
+    }
+    replace_file_from_stage(root, target, new_stage, operation_id, label)
+}
+
+fn cleanup_controlled_transaction_directory(
+    root: &Path,
+    directory: &Path,
+) -> Result<(), ServiceError> {
+    if directory.parent() != Some(root) {
+        return Err(ServiceError::Storage);
+    }
+    let metadata = fs::symlink_metadata(directory).map_err(storage_failure)?;
+    if is_symlink_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(ServiceError::Storage);
+    }
+    let canonical = fs::canonicalize(directory).map_err(storage_failure)?;
+    if canonical.parent() != Some(root) {
+        return Err(ServiceError::Storage);
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(directory).map_err(storage_failure)? {
+        let entry = entry.map_err(storage_failure)?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(storage_failure)?;
+        if is_symlink_or_reparse(&metadata) || !metadata.is_file() {
+            return Err(ServiceError::Storage);
+        }
+        files.push(path);
+    }
+    files.sort_by_key(|path| path.file_name() == Some(std::ffi::OsStr::new("journal.json")));
+    for path in files {
+        fs::remove_file(path).map_err(storage_failure)?;
+    }
+    fs::remove_dir(directory).map_err(storage_failure)
+}
+
+fn relative_managed_path(root: &Path, path: &Path) -> Result<String, ServiceError> {
+    let relative = path.strip_prefix(root).map_err(|_| ServiceError::Storage)?;
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(ServiceError::Storage);
+    }
+    Ok(normalize_separator(&relative.to_string_lossy()))
+}
+
+fn adapter_temporary_path(path: &Path) -> PathBuf {
+    let extension = path
+        .extension()
+        .map(|value| format!("{}.tmp", value.to_string_lossy()))
+        .unwrap_or_else(|| "tmp".to_string());
+    path.with_extension(extension)
+}
+
+fn native_source_version(
+    format: &str,
+    root: &Path,
+    image_path: &Path,
+) -> Result<String, ServiceError> {
+    match format {
+        "yolo-detect" | "yolo-seg" => Ok(yolo_adapter::current_source_version(root, image_path)),
+        "voc-detect" => Ok(voc_adapter::current_source_version(root, image_path)),
+        "labelme" => Ok(labelme::current_source_version(root, image_path)),
+        _ => Err(ServiceError::AnnotationValidation),
+    }
+}
+
 fn image_content_type(path: &Path) -> Result<&'static str, ServiceError> {
     match path
         .extension()
@@ -3479,7 +4468,7 @@ fn validate_description(description: &str) -> Result<&str, ServiceError> {
 fn validate_dataset_type(dataset_type: &str) -> Result<(), ServiceError> {
     if matches!(
         dataset_type,
-        "yolo-detect" | "yolo-seg" | "image-classification"
+        "yolo-detect" | "yolo-seg" | "voc-detect" | "labelme" | "image-classification"
     ) {
         Ok(())
     } else {

@@ -1,5 +1,8 @@
 use super::{
-    adapter::{source_version, verify_source_version, write_replacing, SourceSyncResult},
+    adapter::{
+        source_version, verify_source_version_for_prepare, write_replacing, PrepareSourceSyncError,
+        PreparedSourceSync, SourceSyncResult,
+    },
     voc,
 };
 use crate::domain::AnnotationObject;
@@ -57,11 +60,27 @@ pub fn sync_annotations(
     objects: &[AnnotationObject],
     expected_version: Option<&str>,
 ) -> Result<SourceSyncResult, String> {
+    let prepared = prepare_annotations(root, image_path, objects, expected_version)
+        .map_err(|error| error.to_string())?;
+    write_replacing(&prepared.path, &prepared.data)
+}
+
+pub fn prepare_annotations(
+    root: &Path,
+    image_path: &Path,
+    objects: &[AnnotationObject],
+    expected_version: Option<&str>,
+) -> Result<PreparedSourceSync, PrepareSourceSyncError> {
     let path = annotation_path(root, image_path);
-    verify_source_version(&path, expected_version)?;
-    let (width, height) = image::image_dimensions(image_path).map_err(|err| err.to_string())?;
-    let xml = voc::annotations_to_voc_xml(image_path, width, height, objects)?;
-    write_replacing(&path, xml.as_bytes())
+    verify_source_version_for_prepare(&path, expected_version)?;
+    let (width, height) = image::image_dimensions(image_path)
+        .map_err(|error| PrepareSourceSyncError::Storage(error.to_string()))?;
+    let xml = voc::annotations_to_voc_xml(image_path, width, height, objects)
+        .map_err(PrepareSourceSyncError::Storage)?;
+    Ok(PreparedSourceSync {
+        path,
+        data: xml.into_bytes(),
+    })
 }
 
 pub fn current_source_version(root: &Path, image_path: &Path) -> String {

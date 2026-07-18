@@ -124,6 +124,7 @@ pub struct RemoteAnnotationSaveResult {
     pub saved_at: String,
     pub previous_annotation: Option<AnnotationPayload>,
     pub previous_metadata: StoredSampleMetadata,
+    pub previous_source: Option<StoredImageSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1440,6 +1441,7 @@ pub fn save_remote_annotation_payload(
     expectation: &AnnotationRevisionExpectation,
     object_json: &str,
     operation_id: &str,
+    source: &StoredImageSource,
 ) -> Result<RemoteAnnotationSaveResult, RemoteMutationError> {
     initialize_project_database(path).map_err(RemoteMutationError::Storage)?;
     validate_project_database_artifacts(path).map_err(RemoteMutationError::Storage)?;
@@ -1476,6 +1478,23 @@ pub fn save_remote_annotation_payload(
                     revision: row.get(1)?,
                     object_json: row.get(2)?,
                     updated_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    let previous_source = transaction
+        .query_row(
+            "SELECT image_id, relative_path, external_id, annotation_path, source_version
+             FROM image_sources WHERE image_id = ?1",
+            [image_id],
+            |row| {
+                Ok(StoredImageSource {
+                    image_id: row.get(0)?,
+                    relative_path: row.get(1)?,
+                    external_id: row.get(2)?,
+                    annotation_path: row.get(3)?,
+                    source_version: row.get(4)?,
                 })
             },
         )
@@ -1527,6 +1546,27 @@ pub fn save_remote_annotation_payload(
         .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
     transaction
         .execute(
+            r#"
+            INSERT INTO image_sources
+                (image_id, relative_path, external_id, annotation_path, source_version)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(image_id) DO UPDATE SET
+                relative_path = excluded.relative_path,
+                external_id = excluded.external_id,
+                annotation_path = excluded.annotation_path,
+                source_version = excluded.source_version
+            "#,
+            params![
+                source.image_id,
+                source.relative_path,
+                source.external_id,
+                source.annotation_path,
+                source.source_version,
+            ],
+        )
+        .map_err(|error| RemoteMutationError::Storage(error.to_string()))?;
+    transaction
+        .execute(
             "INSERT INTO audit_events (id, action, image_id, message, created_at)
              VALUES (?1, 'annotation.save', ?2, 'remote annotation saved', ?3)",
             params![operation_id, image_id, saved_at],
@@ -1542,6 +1582,7 @@ pub fn save_remote_annotation_payload(
         saved_at,
         previous_annotation,
         previous_metadata,
+        previous_source,
     })
 }
 
@@ -1552,6 +1593,7 @@ pub fn compensate_remote_annotation_save(
     applied_revision: &str,
     previous_annotation: Option<&AnnotationPayload>,
     previous_metadata: &StoredSampleMetadata,
+    previous_source: Option<&StoredImageSource>,
 ) -> Result<bool, String> {
     initialize_project_database(path)?;
     validate_project_database_artifacts(path)?;
@@ -1636,6 +1678,36 @@ pub fn compensate_remote_annotation_save(
             ],
         )
         .map_err(|error| error.to_string())?;
+    match previous_source {
+        Some(source) => {
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO image_sources
+                        (image_id, relative_path, external_id, annotation_path, source_version)
+                    VALUES (?1, ?2, ?3, ?4, ?5)
+                    ON CONFLICT(image_id) DO UPDATE SET
+                        relative_path = excluded.relative_path,
+                        external_id = excluded.external_id,
+                        annotation_path = excluded.annotation_path,
+                        source_version = excluded.source_version
+                    "#,
+                    params![
+                        source.image_id,
+                        source.relative_path,
+                        source.external_id,
+                        source.annotation_path,
+                        source.source_version,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        None => {
+            transaction
+                .execute("DELETE FROM image_sources WHERE image_id = ?1", [image_id])
+                .map_err(|error| error.to_string())?;
+        }
+    }
     transaction
         .execute(
             "INSERT INTO audit_events (id, action, image_id, message, created_at)

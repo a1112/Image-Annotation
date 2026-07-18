@@ -1,6 +1,7 @@
 use crate::domain::{AnnotationObject, BBox, Point};
 use crate::importers::adapter::{
-    source_version, verify_source_version, write_replacing, SourceSyncResult,
+    source_version, verify_source_version_for_prepare, write_replacing, PrepareSourceSyncError,
+    PreparedSourceSync, SourceSyncResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -114,18 +115,35 @@ pub fn sync_annotations(
     objects: &[AnnotationObject],
     expected_version: Option<&str>,
 ) -> Result<SourceSyncResult, String> {
+    let prepared = prepare_annotations(root, image_path, objects, expected_version)
+        .map_err(|error| error.to_string())?;
+    write_replacing(&prepared.path, &prepared.data)
+}
+
+pub fn prepare_annotations(
+    root: &Path,
+    image_path: &Path,
+    objects: &[AnnotationObject],
+    expected_version: Option<&str>,
+) -> Result<PreparedSourceSync, PrepareSourceSyncError> {
     let path = annotation_path(root, image_path);
-    verify_source_version(&path, expected_version)?;
+    verify_source_version_for_prepare(&path, expected_version)?;
     let parsed = if path.exists() {
-        let data = fs::read_to_string(&path).map_err(|err| err.to_string())?;
-        parse_labelme(&data, &[])?
+        let data = fs::read_to_string(&path)
+            .map_err(|error| PrepareSourceSyncError::Storage(error.to_string()))?;
+        parse_labelme(&data, &[]).map_err(PrepareSourceSyncError::Storage)?
     } else {
-        let (image_width, image_height) =
-            image::image_dimensions(image_path).map_err(|err| err.to_string())?;
+        let (image_width, image_height) = image::image_dimensions(image_path)
+            .map_err(|error| PrepareSourceSyncError::Storage(error.to_string()))?;
         let image_name = image_path
             .file_name()
             .map(|value| value.to_string_lossy().to_string())
-            .ok_or_else(|| format!("image file name not found: {}", image_path.display()))?;
+            .ok_or_else(|| {
+                PrepareSourceSyncError::Storage(format!(
+                    "image file name not found: {}",
+                    image_path.display()
+                ))
+            })?;
         ParsedLabelMe {
             image_path: image_name.clone(),
             image_width,
@@ -144,8 +162,12 @@ pub fn sync_annotations(
             },
         }
     };
-    let output = annotations_to_labelme_json(&parsed, objects)?;
-    write_replacing(&path, output.as_bytes())
+    let output =
+        annotations_to_labelme_json(&parsed, objects).map_err(PrepareSourceSyncError::Storage)?;
+    Ok(PreparedSourceSync {
+        path,
+        data: output.into_bytes(),
+    })
 }
 
 pub fn parse_labelme(data: &str, labels: &[String]) -> Result<ParsedLabelMe, String> {

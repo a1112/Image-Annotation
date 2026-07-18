@@ -1,9 +1,9 @@
 use crate::domain;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
 };
 use walkdir::WalkDir;
 
@@ -67,6 +67,29 @@ pub struct SourceSyncResult {
     pub source_version: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedSourceSync {
+    pub path: PathBuf,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepareSourceSyncError {
+    Conflict,
+    Storage(String),
+}
+
+impl std::fmt::Display for PrepareSourceSyncError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict => {
+                formatter.write_str("source annotation changed outside the application")
+            }
+            Self::Storage(message) => formatter.write_str(message),
+        }
+    }
+}
+
 pub fn collect_source_files(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for path in paths {
@@ -109,28 +132,31 @@ pub fn has_extension(path: &Path, extension: &str) -> bool {
 }
 
 pub fn source_version(path: &Path) -> String {
-    let Ok(metadata) = fs::metadata(path) else {
+    let Ok(bytes) = fs::read(path) else {
         return String::new();
     };
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    format!("{}:{modified}", metadata.len())
+    let digest = Sha256::digest(bytes);
+    let encoded = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{encoded}")
 }
 
 pub fn verify_source_version(path: &Path, expected: Option<&str>) -> Result<(), String> {
-    let Some(expected) = expected.filter(|value| !value.is_empty()) else {
+    verify_source_version_for_prepare(path, expected).map_err(|error| error.to_string())
+}
+
+pub fn verify_source_version_for_prepare(
+    path: &Path,
+    expected: Option<&str>,
+) -> Result<(), PrepareSourceSyncError> {
+    let Some(expected) = expected else {
         return Ok(());
     };
     let current = source_version(path);
     if current != expected {
-        return Err(format!(
-            "source annotation changed outside the application: {}",
-            path.display()
-        ));
+        return Err(PrepareSourceSyncError::Conflict);
     }
     Ok(())
 }

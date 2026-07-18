@@ -1150,10 +1150,30 @@ fn clear_annotation_fixture(data_dir: &Path, project_id: &str, image_id: &str) {
             [image_id],
         )
         .unwrap();
-    let native_path = project_dir
+    let managed_path = project_dir
         .join("annotations")
+        .join("native")
         .join(format!("{image_id}.json"));
-    let _ = fs::remove_file(native_path);
+    let _ = fs::remove_file(managed_path);
+}
+
+fn rewrite_project_format(data_dir: &Path, project_id: &str, format: &str) {
+    let project_dir = data_dir.join("projects").join(project_id);
+    let manifest_path = project_dir.join("project.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["format"] = Value::String(format.to_string());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    rusqlite::Connection::open(project_dir.join("project.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE projects SET format = ?1 WHERE id = ?2",
+            rusqlite::params![format, project_id],
+        )
+        .unwrap();
 }
 
 fn bbox_annotation_body(id: &str, class_id: u32, label: &str) -> Value {
@@ -1263,6 +1283,13 @@ fn sha256_etag(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("\"sha256-{encoded}\"")
+}
+
+fn sha256_hex_fixture(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn bmp_fixture_bytes() -> Vec<u8> {
@@ -5542,7 +5569,7 @@ async fn remote_annotations_support_revision_etags_conflicts_and_history() {
         &uri,
         EDITOR_TOKEN,
         &[("if-match", &first_etag)],
-        polygon_annotation_body("polygon-second", 1, "region"),
+        bbox_annotation_body("bbox-second", 1, "region"),
     )
     .await;
     assert_eq!(second_status, StatusCode::OK, "{second}");
@@ -5572,7 +5599,7 @@ async fn remote_annotations_support_revision_etags_conflicts_and_history() {
     assert_eq!(revisions[0]["revision"], first_revision);
     assert_eq!(revisions[1]["revision"], second_revision);
     assert_eq!(revisions[0]["objects"][0]["id"], "bbox-first");
-    assert_eq!(revisions[1]["objects"][0]["id"], "polygon-second");
+    assert_eq!(revisions[1]["objects"][0]["id"], "bbox-second");
     assert!(!history
         .to_string()
         .contains(&data_dir.to_string_lossy().to_string()));
@@ -5581,10 +5608,11 @@ async fn remote_annotations_support_revision_etags_conflicts_and_history() {
         .join("projects")
         .join(&project_id)
         .join("annotations")
+        .join("native")
         .join("demo_001.json");
     let native: Value = serde_json::from_slice(&fs::read(native_path).unwrap()).unwrap();
     assert_eq!(native["revision"], second_revision);
-    assert_eq!(native["objects"][0]["id"], "polygon-second");
+    assert_eq!(native["objects"][0]["id"], "bbox-second");
 }
 
 #[tokio::test]
@@ -5705,6 +5733,424 @@ async fn annotation_if_match_boundaries_and_editor_authorization_are_explicit() 
     )
     .await;
     assert_eq!(extra_status, StatusCode::BAD_REQUEST, "{extra}");
+}
+
+#[tokio::test]
+async fn annotation_body_revision_and_if_match_must_describe_the_same_version() {
+    let (name, project_id) = unique_project("Task5 body revision");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    clear_annotation_fixture(&data_dir, &project_id, "demo_001");
+    let uri = format!("/api/v1/projects/{project_id}/samples/demo_001/annotations");
+
+    let (first_status, _, first) = router_json_request_with_headers(
+        &app,
+        Method::PUT,
+        &uri,
+        EDITOR_TOKEN,
+        &[],
+        bbox_annotation_body("body-revision-first", 0, "object"),
+    )
+    .await;
+    assert_eq!(first_status, StatusCode::OK, "{first}");
+    let first_revision = first["data"]["revision"].as_str().unwrap();
+
+    let mut body_only_payload = bbox_annotation_body("body-revision-second", 0, "object");
+    body_only_payload["revision"] = Value::String(first_revision.to_string());
+    let (body_only_status, _, body_only) = router_json_request_with_headers(
+        &app,
+        Method::PUT,
+        &uri,
+        EDITOR_TOKEN,
+        &[],
+        body_only_payload,
+    )
+    .await;
+    assert_eq!(body_only_status, StatusCode::OK, "{body_only}");
+    let second_revision = body_only["data"]["revision"].as_str().unwrap();
+
+    let mut stale_payload = bbox_annotation_body("body-revision-stale", 0, "object");
+    stale_payload["revision"] = Value::String(first_revision.to_string());
+    let (stale_status, _, stale) =
+        router_json_request_with_headers(&app, Method::PUT, &uri, EDITOR_TOKEN, &[], stale_payload)
+            .await;
+    assert_eq!(stale_status, StatusCode::CONFLICT, "{stale}");
+    assert_eq!(stale["error"]["code"], "revision_conflict");
+
+    let mut matching_payload = bbox_annotation_body("body-revision-third", 0, "object");
+    matching_payload["revision"] = Value::String(second_revision.to_string());
+    let matching_header = format!("\"{second_revision}\"");
+    let (matching_status, _, matching) = router_json_request_with_headers(
+        &app,
+        Method::PUT,
+        &uri,
+        EDITOR_TOKEN,
+        &[("if-match", &matching_header)],
+        matching_payload,
+    )
+    .await;
+    assert_eq!(matching_status, StatusCode::OK, "{matching}");
+    let third_revision = matching["data"]["revision"].as_str().unwrap();
+
+    let mut mismatched_payload = bbox_annotation_body("body-revision-mismatch", 0, "object");
+    mismatched_payload["revision"] = Value::String(second_revision.to_string());
+    let mismatched_header = format!("\"{third_revision}\"");
+    let (mismatched_status, _, mismatched) = router_json_request_with_headers(
+        &app,
+        Method::PUT,
+        &uri,
+        EDITOR_TOKEN,
+        &[("if-match", &mismatched_header)],
+        mismatched_payload,
+    )
+    .await;
+    assert_eq!(mismatched_status, StatusCode::BAD_REQUEST, "{mismatched}");
+    assert_eq!(mismatched["error"]["code"], "validation");
+}
+
+#[tokio::test]
+async fn annotation_save_updates_managed_json_yolo_sidecar_and_source_mapping() {
+    let (name, project_id) = unique_project("Task5 native YOLO persistence");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    clear_annotation_fixture(&data_dir, &project_id, "demo_001");
+    let uri = format!("/api/v1/projects/{project_id}/samples/demo_001/annotations");
+
+    let (status, _, saved) = router_json_request_with_headers(
+        &app,
+        Method::PUT,
+        &uri,
+        EDITOR_TOKEN,
+        &[],
+        bbox_annotation_body("native-yolo", 0, "object"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let managed_path = project_dir
+        .join("annotations")
+        .join("native")
+        .join("demo_001.json");
+    let managed: Value =
+        serde_json::from_slice(&fs::read(&managed_path).expect("managed JSON must be written"))
+            .unwrap();
+    assert_eq!(managed["revision"], saved["data"]["revision"]);
+    assert_eq!(managed["objects"][0]["id"], "native-yolo");
+    assert!(
+        !project_dir
+            .join("annotations")
+            .join("demo_001.json")
+            .exists(),
+        "managed annotations must not use the legacy parent directory"
+    );
+
+    let yolo_path = project_dir
+        .join("assets")
+        .join("original")
+        .join("labels")
+        .join("train")
+        .join("demo_001.txt");
+    assert_eq!(
+        fs::read_to_string(&yolo_path).unwrap(),
+        "0 0.012500 0.019048 0.018750 0.023810\n"
+    );
+
+    let connection =
+        rusqlite::Connection::open(annotation_project_sqlite(&data_dir, &project_id)).unwrap();
+    let (relative_path, annotation_path, source_version): (String, String, String) = connection
+        .query_row(
+            "SELECT relative_path, annotation_path, source_version
+             FROM image_sources WHERE image_id = 'demo_001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(relative_path, "images/train/demo_001.png");
+    assert_eq!(annotation_path, "labels/train/demo_001.txt");
+    assert!(!source_version.is_empty());
+}
+
+#[tokio::test]
+async fn annotation_save_writes_yolo_seg_voc_and_labelme_sidecars() {
+    for (format, demo_template) in [
+        ("yolo-seg", "demo-polygon"),
+        ("voc-detect", "demo-bbox"),
+        ("labelme", "demo-bbox"),
+    ] {
+        let (name, project_id) = unique_project(&format!("Task5 {format} persistence"));
+        let mut config = test_config(Ipv4Addr::LOCALHOST);
+        config.editor_token = Some(EDITOR_TOKEN.to_string());
+        config.admin_token = Some(ADMIN_TOKEN.to_string());
+        let data_dir = config.data_dir.clone();
+        let app = build_router(config).unwrap();
+        let create_format = if format == "yolo-seg" {
+            "yolo-seg"
+        } else {
+            "yolo-detect"
+        };
+        create_demo_project(&app, &name, &project_id, create_format, demo_template).await;
+        clear_annotation_fixture(&data_dir, &project_id, "demo_001");
+        if format != create_format {
+            rewrite_project_format(&data_dir, &project_id, format);
+        }
+        let uri = format!("/api/v1/projects/{project_id}/samples/demo_001/annotations");
+        let payload = if format == "yolo-seg" {
+            polygon_annotation_body("native-polygon", 0, "object")
+        } else {
+            bbox_annotation_body("native-bbox", 0, "object")
+        };
+
+        let (status, _, saved) =
+            router_json_request_with_headers(&app, Method::PUT, &uri, EDITOR_TOKEN, &[], payload)
+                .await;
+        assert_eq!(status, StatusCode::OK, "{format}: {saved}");
+
+        let original = data_dir
+            .join("projects")
+            .join(&project_id)
+            .join("assets")
+            .join("original");
+        match format {
+            "yolo-seg" => {
+                let sidecar =
+                    fs::read_to_string(original.join("labels").join("train").join("demo_001.txt"))
+                        .unwrap();
+                assert_eq!(
+                    sidecar,
+                    "0 0.003125 0.004762 0.028125 0.004762 0.028125 0.038095 0.003125 0.038095\n"
+                );
+            }
+            "voc-detect" => {
+                let sidecar = fs::read_to_string(
+                    original
+                        .join("Annotations")
+                        .join("train")
+                        .join("demo_001.xml"),
+                )
+                .unwrap();
+                assert!(sidecar.contains("<name>object</name>"), "{sidecar}");
+                assert!(sidecar.contains("<xmin>2</xmin>"), "{sidecar}");
+            }
+            "labelme" => {
+                let sidecar: Value = serde_json::from_slice(
+                    &fs::read(original.join("images").join("train").join("demo_001.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(sidecar["shapes"][0]["label"], "object");
+                assert_eq!(sidecar["shapes"][0]["shape_type"], "rectangle");
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn annotation_save_rejects_external_sidecar_edits_without_overwriting_them() {
+    let (name, project_id) = unique_project("Task5 external sidecar conflict");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    clear_annotation_fixture(&data_dir, &project_id, "demo_001");
+    let uri = format!("/api/v1/projects/{project_id}/samples/demo_001/annotations");
+
+    let (first_status, _, first) = router_json_request_with_headers(
+        &app,
+        Method::PUT,
+        &uri,
+        EDITOR_TOKEN,
+        &[],
+        bbox_annotation_body("before-external-edit", 0, "object"),
+    )
+    .await;
+    assert_eq!(first_status, StatusCode::OK, "{first}");
+    let first_revision = first["data"]["revision"].as_str().unwrap();
+    let sidecar_path = data_dir
+        .join("projects")
+        .join(&project_id)
+        .join("assets")
+        .join("original")
+        .join("labels")
+        .join("train")
+        .join("demo_001.txt");
+    fs::write(&sidecar_path, b"external edit\n").unwrap();
+    let mut payload = bbox_annotation_body("must-not-win", 0, "object");
+    payload["revision"] = Value::String(first_revision.to_string());
+
+    let (status, _, body) =
+        router_json_request_with_headers(&app, Method::PUT, &uri, EDITOR_TOKEN, &[], payload).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "conflict");
+    assert_eq!(fs::read(&sidecar_path).unwrap(), b"external edit\n");
+    let revision: String =
+        rusqlite::Connection::open(annotation_project_sqlite(&data_dir, &project_id))
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM annotations WHERE image_id = 'demo_001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(revision, first_revision);
+}
+
+#[tokio::test]
+async fn annotation_save_rolls_back_files_and_sqlite_when_source_mapping_commit_fails() {
+    let (name, project_id) = unique_project("Task5 annotation compensation");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    clear_annotation_fixture(&data_dir, &project_id, "demo_001");
+    let uri = format!("/api/v1/projects/{project_id}/samples/demo_001/annotations");
+
+    let (first_status, _, first) = router_json_request_with_headers(
+        &app,
+        Method::PUT,
+        &uri,
+        EDITOR_TOKEN,
+        &[],
+        bbox_annotation_body("compensation-before", 0, "object"),
+    )
+    .await;
+    assert_eq!(first_status, StatusCode::OK, "{first}");
+    let first_revision = first["data"]["revision"].as_str().unwrap().to_string();
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let managed_path = project_dir
+        .join("annotations")
+        .join("native")
+        .join("demo_001.json");
+    let sidecar_path = project_dir
+        .join("assets")
+        .join("original")
+        .join("labels")
+        .join("train")
+        .join("demo_001.txt");
+    let managed_before = fs::read(&managed_path).unwrap();
+    let sidecar_before = fs::read(&sidecar_path).unwrap();
+    let project_db = annotation_project_sqlite(&data_dir, &project_id);
+    let source_before: (String, String, Option<String>, Option<String>, String) =
+        rusqlite::Connection::open(&project_db)
+            .unwrap()
+            .query_row(
+                "SELECT image_id, relative_path, external_id, annotation_path, source_version
+                 FROM image_sources WHERE image_id = 'demo_001'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+    rusqlite::Connection::open(&project_db)
+        .unwrap()
+        .execute_batch(
+            r#"
+            CREATE TRIGGER fail_task5_source_mapping
+            BEFORE UPDATE OF source_version ON image_sources
+            WHEN OLD.image_id = 'demo_001'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected source mapping failure');
+            END;
+            "#,
+        )
+        .unwrap();
+    let mut payload = bbox_annotation_body("compensation-after", 0, "object");
+    payload["revision"] = Value::String(first_revision.clone());
+    payload["objects"][0]["bbox"]["width"] = serde_json::json!(24.0);
+    payload["objects"][0]["bbox"]["height"] = serde_json::json!(18.0);
+
+    let (status, _, body) =
+        router_json_request_with_headers(&app, Method::PUT, &uri, EDITOR_TOKEN, &[], payload).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"]["code"], "storage");
+    assert_eq!(fs::read(&managed_path).unwrap(), managed_before);
+    assert_eq!(fs::read(&sidecar_path).unwrap(), sidecar_before);
+    let (revision, object_json): (String, String) = rusqlite::Connection::open(&project_db)
+        .unwrap()
+        .query_row(
+            "SELECT revision, object_json FROM annotations WHERE image_id = 'demo_001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(revision, first_revision);
+    assert_eq!(
+        serde_json::from_str::<Value>(&object_json).unwrap()[0]["id"],
+        "compensation-before"
+    );
+    let source_after: (String, String, Option<String>, Option<String>, String) =
+        rusqlite::Connection::open(project_db)
+            .unwrap()
+            .query_row(
+                "SELECT image_id, relative_path, external_id, annotation_path, source_version
+                 FROM image_sources WHERE image_id = 'demo_001'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+    assert_eq!(source_after, source_before);
+}
+
+#[tokio::test]
+async fn annotation_save_rejects_formats_without_safe_per_image_writeback() {
+    let (name, project_id) = unique_project("Task5 unsupported native writeback");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    clear_annotation_fixture(&data_dir, &project_id, "demo_001");
+    let uri = format!("/api/v1/projects/{project_id}/samples/demo_001/annotations");
+
+    let (status, _, body) = router_json_request_with_headers(
+        &app,
+        Method::PUT,
+        &uri,
+        EDITOR_TOKEN,
+        &[],
+        polygon_annotation_body("unsupported", 0, "object"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "annotation_validation");
+    let annotation_count: u64 =
+        rusqlite::Connection::open(annotation_project_sqlite(&data_dir, &project_id))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM annotations WHERE image_id = 'demo_001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(annotation_count, 0);
 }
 
 #[tokio::test]
@@ -6039,6 +6485,112 @@ fn annotation_completion_failure_recovers_from_project_evidence() {
     );
 }
 
+#[test]
+fn completed_annotation_file_transaction_recovers_as_an_orphan_on_restart() {
+    run_ignored_test_in_subprocess(
+        "completed_annotation_file_transaction_recovers_as_an_orphan_on_restart_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn completed_annotation_file_transaction_recovers_as_an_orphan_on_restart_child() {
+    let (name, project_id) = unique_project("Task5 orphan committed recovery");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    clear_annotation_fixture(&data_dir, &project_id, "demo_001");
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let sidecar_path = project_dir
+        .join("assets")
+        .join("original")
+        .join("labels")
+        .join("train")
+        .join("demo_001.txt");
+    let old_sidecar = fs::read(&sidecar_path).unwrap();
+    let uri = format!("/api/v1/projects/{project_id}/samples/demo_001/annotations");
+    let (status, _, saved) = router_json_request_with_headers(
+        &app,
+        Method::PUT,
+        &uri,
+        EDITOR_TOKEN,
+        &[],
+        bbox_annotation_body("orphan-committed", 0, "object"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let request_id = saved["requestId"].as_str().unwrap();
+    let operation_id: String = rusqlite::Connection::open(data_dir.join("server.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT operation_id FROM service_audit WHERE request_id = ?1",
+            [request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let managed_path = project_dir
+        .join("annotations")
+        .join("native")
+        .join("demo_001.json");
+    let new_sidecar = fs::read(&sidecar_path).unwrap();
+    let transaction_dir = project_dir
+        .join("annotations")
+        .join("transactions")
+        .join(sha256_hex_fixture(operation_id.as_bytes()));
+    fs::create_dir(&transaction_dir).unwrap();
+    fs::write(transaction_dir.join("sidecar.old"), old_sidecar).unwrap();
+    fs::write(transaction_dir.join("sidecar.new"), &new_sidecar).unwrap();
+    fs::write(
+        transaction_dir.join("journal.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "operationId": operation_id,
+            "projectId": project_id,
+            "imageId": "demo_001",
+            "imageRelativePath": "images/train/demo_001.png",
+            "sidecarRelativePath": "labels/train/demo_001.txt",
+            "expectedSourceVersion": "",
+            "managedHadOriginal": false,
+            "sidecarHadOriginal": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(&managed_path).unwrap();
+    fs::remove_file(&sidecar_path).unwrap();
+    rusqlite::Connection::open(annotation_project_sqlite(&data_dir, &project_id))
+        .unwrap()
+        .execute(
+            "UPDATE image_sources SET source_version = 'stale' WHERE image_id = 'demo_001'",
+            [],
+        )
+        .unwrap();
+    drop(app);
+
+    let restarted = build_router(config).unwrap();
+    assert_eq!(fs::read(&sidecar_path).unwrap(), new_sidecar);
+    let managed: Value = serde_json::from_slice(&fs::read(&managed_path).unwrap()).unwrap();
+    assert_eq!(managed["objects"][0]["id"], "orphan-committed");
+    let source_version: String =
+        rusqlite::Connection::open(annotation_project_sqlite(&data_dir, &project_id))
+            .unwrap()
+            .query_row(
+                "SELECT source_version FROM image_sources WHERE image_id = 'demo_001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(
+        source_version,
+        format!("sha256:{}", sha256_hex_fixture(&new_sidecar))
+    );
+    assert!(!transaction_dir.exists());
+    drop(restarted);
+}
+
 #[tokio::test]
 #[ignore]
 async fn annotation_completion_failure_recovers_from_project_evidence_child() {
@@ -6080,8 +6632,18 @@ async fn annotation_completion_failure_recovers_from_project_evidence_child() {
         .join("projects")
         .join(&project_id)
         .join("annotations")
+        .join("native")
         .join("demo_001.json");
+    let sidecar_path = data_dir
+        .join("projects")
+        .join(&project_id)
+        .join("assets")
+        .join("original")
+        .join("labels")
+        .join("train")
+        .join("demo_001.txt");
     fs::remove_file(&native_path).unwrap();
+    fs::remove_file(&sidecar_path).unwrap();
     let later_metadata = SampleMetadataFixture {
         split: "test".to_string(),
         status: "通过".to_string(),
@@ -6105,6 +6667,10 @@ async fn annotation_completion_failure_recovers_from_project_evidence_child() {
     let native: Value = serde_json::from_slice(&fs::read(native_path).unwrap()).unwrap();
     assert_eq!(native["objects"][0]["id"], "recoverable");
     assert_eq!(native["status"], "通过");
+    assert_eq!(
+        fs::read_to_string(sidecar_path).unwrap(),
+        "0 0.012500 0.019048 0.018750 0.023810\n"
+    );
     drop(restarted);
 }
 
@@ -6153,6 +6719,90 @@ fn pending_annotation_mutations_reconcile_only_from_bound_project_evidence() {
     run_ignored_test_in_subprocess(
         "pending_annotation_mutations_reconcile_only_from_bound_project_evidence_child",
     );
+}
+
+#[test]
+fn uncommitted_annotation_file_transaction_rolls_back_on_restart() {
+    run_ignored_test_in_subprocess(
+        "uncommitted_annotation_file_transaction_rolls_back_on_restart_child",
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn uncommitted_annotation_file_transaction_rolls_back_on_restart_child() {
+    let (name, project_id) = unique_project("Task5 uncommitted file recovery");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    clear_annotation_fixture(&data_dir, &project_id, "demo_001");
+    drop(app);
+
+    let operation_id =
+        insert_pending_annotation_operation(&data_dir, &project_id, "demo_001", "save_annotations");
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let sidecar_path = project_dir
+        .join("assets")
+        .join("original")
+        .join("labels")
+        .join("train")
+        .join("demo_001.txt");
+    let managed_path = project_dir
+        .join("annotations")
+        .join("native")
+        .join("demo_001.json");
+    let old_sidecar = fs::read(&sidecar_path).unwrap();
+    let new_sidecar = b"0 0.100000 0.100000 0.200000 0.200000\n";
+    let new_managed = br#"{"imageId":"demo_001","revision":"uncommitted"}"#;
+    let transaction_dir = project_dir
+        .join("annotations")
+        .join("transactions")
+        .join(sha256_hex_fixture(operation_id.as_bytes()));
+    fs::create_dir_all(&transaction_dir).unwrap();
+    fs::write(transaction_dir.join("sidecar.old"), &old_sidecar).unwrap();
+    fs::write(transaction_dir.join("sidecar.new"), new_sidecar).unwrap();
+    fs::write(transaction_dir.join("managed.new"), new_managed).unwrap();
+    fs::write(
+        transaction_dir.join("journal.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "operationId": operation_id,
+            "projectId": project_id,
+            "imageId": "demo_001",
+            "imageRelativePath": "images/train/demo_001.png",
+            "sidecarRelativePath": "labels/train/demo_001.txt",
+            "expectedSourceVersion": "",
+            "managedHadOriginal": false,
+            "sidecarHadOriginal": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(&sidecar_path, new_sidecar).unwrap();
+    fs::write(&managed_path, new_managed).unwrap();
+
+    let restarted = build_router(config).unwrap();
+    assert_eq!(fs::read(&sidecar_path).unwrap(), old_sidecar);
+    assert!(!managed_path.exists());
+    assert!(!transaction_dir.exists());
+    let annotation_count: u64 =
+        rusqlite::Connection::open(annotation_project_sqlite(&data_dir, &project_id))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM annotations WHERE image_id = 'demo_001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(annotation_count, 0);
+    assert_eq!(
+        operation_state(&data_dir, &operation_id).as_deref(),
+        Some("indeterminate")
+    );
+    drop(restarted);
 }
 
 #[tokio::test]
@@ -6253,7 +6903,8 @@ async fn annotation_native_storage_rejects_links_and_cleans_controlled_temps_chi
     let annotations_dir = data_dir
         .join("projects")
         .join(&project_id)
-        .join("annotations");
+        .join("annotations")
+        .join("native");
     let stale_temp = annotations_dir.join(".annotation-stale.tmp");
     let neighbor = annotations_dir.join("neighbor.tmp");
     fs::write(&stale_temp, b"stale").unwrap();

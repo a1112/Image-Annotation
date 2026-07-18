@@ -322,7 +322,7 @@ pub fn create_dataset_project_in(
 ) -> Result<domain::DatasetProject, String> {
     let project_id = project_id_from_name(name, demo_template);
     let format = match dataset_type {
-        "yolo-seg" => "yolo-seg",
+        "yolo-seg" | "voc-detect" | "labelme" => dataset_type,
         "image-classification" => "image-classification",
         _ => "yolo-detect",
     };

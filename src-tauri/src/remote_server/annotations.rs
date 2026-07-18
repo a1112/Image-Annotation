@@ -25,6 +25,8 @@ use super::{
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SaveAnnotationsRequest {
     objects: Vec<Value>,
+    #[serde(default)]
+    revision: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,7 +98,9 @@ async fn save_annotations(
         Ok(payload) => payload,
         Err(error) => return error.into_response(response_request_id),
     };
-    let expectation = match parse_if_match(&headers) {
+    let expectation = match parse_if_match(&headers).and_then(|expectation| {
+        merge_revision_expectation(expectation, payload.revision.as_deref())
+    }) {
         Ok(expectation) => expectation,
         Err(error) => return error.into_response(response_request_id),
     };
@@ -246,12 +250,7 @@ fn parse_if_match(headers: &HeaderMap) -> Result<AnnotationRevisionExpectation, 
             return Err(ApiError::validation());
         }
         let revision = &encoded[1..encoded.len() - 1];
-        if revision.is_empty()
-            || !revision.is_ascii()
-            || revision
-                .bytes()
-                .any(|byte| byte.is_ascii_control() || matches!(byte, b'"' | b'\\'))
-        {
+        if !valid_revision(revision) {
             return Err(ApiError::validation());
         }
         if !weak {
@@ -263,6 +262,42 @@ fn parse_if_match(headers: &HeaderMap) -> Result<AnnotationRevisionExpectation, 
     } else {
         Ok(AnnotationRevisionExpectation::Strong(strong))
     }
+}
+
+fn merge_revision_expectation(
+    header: AnnotationRevisionExpectation,
+    body_revision: Option<&str>,
+) -> Result<AnnotationRevisionExpectation, ApiError> {
+    let Some(body_revision) = body_revision else {
+        return Ok(header);
+    };
+    if !valid_revision(body_revision) {
+        return Err(ApiError::validation());
+    }
+    match header {
+        AnnotationRevisionExpectation::Missing => Ok(AnnotationRevisionExpectation::Strong(vec![
+            body_revision.to_string(),
+        ])),
+        AnnotationRevisionExpectation::Strong(revisions)
+            if revisions.iter().any(|revision| revision == body_revision) =>
+        {
+            Ok(AnnotationRevisionExpectation::Strong(vec![
+                body_revision.to_string()
+            ]))
+        }
+        AnnotationRevisionExpectation::AnyExisting
+        | AnnotationRevisionExpectation::Strong(_)
+        | AnnotationRevisionExpectation::Never => Err(ApiError::validation()),
+    }
+}
+
+fn valid_revision(revision: &str) -> bool {
+    !revision.is_empty()
+        && revision.len() <= 256
+        && revision.is_ascii()
+        && !revision
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b'"' | b'\\'))
 }
 
 fn extract_sample_path(

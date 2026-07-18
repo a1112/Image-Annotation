@@ -1,5 +1,8 @@
 use super::{
-    adapter::{source_version, verify_source_version, write_replacing, SourceSyncResult},
+    adapter::{
+        source_version, verify_source_version_for_prepare, write_replacing, PrepareSourceSyncError,
+        PreparedSourceSync, SourceSyncResult,
+    },
     yolo,
 };
 use crate::domain::AnnotationObject;
@@ -60,19 +63,34 @@ pub fn sync_annotations(
     objects: &[AnnotationObject],
     expected_version: Option<&str>,
 ) -> Result<SourceSyncResult, String> {
-    let label_path = annotation_path(root, image_path);
-    verify_source_version(&label_path, expected_version)?;
-    let (width, height) = image::image_dimensions(image_path).map_err(|err| err.to_string())?;
+    let prepared = prepare_annotations(root, image_path, format, objects, expected_version)
+        .map_err(|error| error.to_string())?;
+    write_replacing(&prepared.path, &prepared.data)
+}
+
+pub fn prepare_annotations(
+    root: &Path,
+    image_path: &Path,
+    format: &str,
+    objects: &[AnnotationObject],
+    expected_version: Option<&str>,
+) -> Result<PreparedSourceSync, PrepareSourceSyncError> {
+    let path = annotation_path(root, image_path);
+    verify_source_version_for_prepare(&path, expected_version)?;
+    let (width, height) = image::image_dimensions(image_path)
+        .map_err(|error| PrepareSourceSyncError::Storage(error.to_string()))?;
     let data = match format {
-        "yolo-detect" => yolo::annotations_to_yolo_lines(objects, width, height)?,
-        "yolo-seg" => yolo::annotations_to_yolo_polygon_lines(objects, width, height)?,
-        _ => {
-            return Err(format!(
-                "source synchronization is not implemented for {format}"
-            ))
-        }
-    };
-    write_replacing(&label_path, data.as_bytes())
+        "yolo-detect" => yolo::annotations_to_yolo_lines(objects, width, height),
+        "yolo-seg" => yolo::annotations_to_yolo_polygon_lines(objects, width, height),
+        _ => Err(format!(
+            "source synchronization is not implemented for {format}"
+        )),
+    }
+    .map_err(PrepareSourceSyncError::Storage)?;
+    Ok(PreparedSourceSync {
+        path,
+        data: data.into_bytes(),
+    })
 }
 
 pub fn current_source_version(root: &Path, image_path: &Path) -> String {
@@ -153,6 +171,43 @@ mod tests {
             fs::read_to_string(result.path).unwrap(),
             "2 0.100000 0.100000 0.800000 0.100000 0.500000 0.450000\n"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn yolo_prepare_reports_a_stale_precheck_as_a_conflict_without_writing() {
+        let root = temp_root("yolo-prepare-conflict");
+        let image_path = root.join("images").join("train").join("a.png");
+        let label_path = root.join("labels").join("train").join("a.txt");
+        fs::create_dir_all(image_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(label_path.parent().unwrap()).unwrap();
+        image::RgbaImage::new(100, 100).save(&image_path).unwrap();
+        fs::write(&label_path, "0 0.500000 0.500000 0.400000 0.200000\n").unwrap();
+        let expected = current_source_version(&root, &image_path);
+        fs::write(&label_path, "external edit\n").unwrap();
+        let object = AnnotationObject::bbox(
+            "new".to_string(),
+            0,
+            "defect".to_string(),
+            BBox {
+                x: 10.0,
+                y: 20.0,
+                width: 30.0,
+                height: 40.0,
+            },
+        );
+
+        let error = prepare_annotations(
+            &root,
+            &image_path,
+            "yolo-detect",
+            &[object],
+            Some(&expected),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PrepareSourceSyncError::Conflict);
+        assert_eq!(fs::read(&label_path).unwrap(), b"external edit\n");
         let _ = fs::remove_dir_all(root);
     }
 
