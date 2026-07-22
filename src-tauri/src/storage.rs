@@ -1347,7 +1347,14 @@ fn sample_filter_sql(filter: &StoredSampleFilter) -> (String, Vec<SqlValue>) {
         values.push(SqlValue::Text(qa_status.clone()));
     }
     if filter.class_id.is_some() || filter.label.is_some() {
-        let mut link_clauses = vec!["links.image_id = i.id".to_string()];
+        let mut link_clauses = vec![
+            "links.image_id = i.id".to_string(),
+            "NOT EXISTS (
+                SELECT 1 FROM annotations AS current_annotations
+                WHERE current_annotations.image_id = links.image_id
+            )"
+            .to_string(),
+        ];
         let mut annotation_clauses = vec![
             "annotations.image_id = i.id".to_string(),
             "json_type(objects.value, '$.classId') = 'integer'".to_string(),
@@ -1431,6 +1438,10 @@ fn attach_sample_classes(
             FROM sample_class_links AS links
             JOIN classes ON classes.id = links.class_id
             WHERE links.image_id IN ({placeholders})
+                AND NOT EXISTS (
+                    SELECT 1 FROM annotations AS current_annotations
+                    WHERE current_annotations.image_id = links.image_id
+                )
             UNION ALL
             SELECT
                 annotations.image_id,

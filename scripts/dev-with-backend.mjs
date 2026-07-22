@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import process from "node:process";
 
 const processes = [];
+const useRemoteServer = process.argv.includes("--remote-server");
 
 function start(name, command, args) {
   const child = spawn(command, args, {
@@ -30,11 +31,24 @@ function shutdown(code = 0) {
 process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
 
-start("rust-backend", "cargo", [
-  "run",
-  "--manifest-path",
-  "src-tauri/Cargo.toml",
-  "--example",
-  "image-annotation-backend",
-]);
+start(
+  useRemoteServer ? "remote-sample-server" : "rust-backend",
+  "cargo",
+  useRemoteServer
+    ? [
+        "run",
+        "--manifest-path",
+        "src-tauri/Cargo.toml",
+        "--bin",
+        "image-annotation-server",
+        "--",
+      ]
+    : [
+        "run",
+        "--manifest-path",
+        "src-tauri/Cargo.toml",
+        "--example",
+        "image-annotation-backend",
+      ],
+);
 start("vite", "vite", ["--host", "127.0.0.1", "--port", "1440"]);

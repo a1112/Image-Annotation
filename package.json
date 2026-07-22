@@ -5,8 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev-with-backend.mjs",
+    "dev:server": "node scripts/dev-with-backend.mjs --remote-server",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "server:dev": "cargo run --manifest-path src-tauri/Cargo.toml --bin image-annotation-server --",
+    "server:check": "cargo test --manifest-path src-tauri/Cargo.toml --test remote_server_live",
     "test": "vitest",
     "tauri": "tauri"
   },

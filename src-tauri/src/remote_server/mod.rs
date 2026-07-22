@@ -8,7 +8,7 @@ mod samples;
 mod service;
 mod storage;
 
-use std::sync::Arc;
+use std::{error::Error, future::Future, sync::Arc};
 
 use auth::TokenAuthenticator;
 use axum::{
@@ -29,12 +29,34 @@ use tower_http::{
     trace::TraceLayer,
 };
 
+use crate::project_fs;
+
 const DEFAULT_API_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 const MULTIPART_FRAMING_ALLOWANCE_BYTES: usize = 1024 * 1024;
 
 pub use auth::Role;
 pub use config::{ConfigError, ServerConfig};
 pub use error::ServerBuildError;
+
+pub async fn serve<F>(
+    listener: tokio::net::TcpListener,
+    config: ServerConfig,
+    shutdown: F,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    config.validate()?;
+    tokio::fs::create_dir_all(&config.data_dir).await?;
+    project_fs::configure_workspace_data_root(config.data_dir.clone())
+        .map_err(std::io::Error::other)?;
+    let app = build_router(config)?;
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    Ok(())
+}
 
 #[derive(Default)]
 pub struct PrivateRouteGroups {

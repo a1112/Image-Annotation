@@ -1,27 +1,19 @@
 use std::error::Error;
 
-use image_annotation_lib::{project_fs, remote_server};
+use image_annotation_lib::remote_server;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_tracing();
 
     let config = remote_server::ServerConfig::parse();
-    config.validate()?;
-    tokio::fs::create_dir_all(&config.data_dir).await?;
-    project_fs::configure_workspace_data_root(config.data_dir.clone())
-        .map_err(std::io::Error::other)?;
-
     let listener = TcpListener::bind(config.bind).await?;
     let local_addr = listener.local_addr()?;
-    let app = remote_server::build_router(config)?;
 
     tracing::info!(%local_addr, "remote sample server listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(remote_server::shutdown_signal())
-        .await?;
+    remote_server::serve(listener, config, remote_server::shutdown_signal()).await?;
 
     Ok(())
 }

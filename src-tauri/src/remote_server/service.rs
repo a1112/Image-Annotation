@@ -609,6 +609,8 @@ impl RemoteSampleService {
         );
         match result {
             Ok(()) => {
+                let context = self.sample_project_context(&record.project_id)?;
+                self.rebuild_sample_classes(&context)?;
                 self.storage
                     .complete_import(import_id)
                     .map_err(storage_failure)?;
@@ -4048,14 +4050,37 @@ impl RemoteSampleService {
     }
 
     fn refresh_sample_classes(&self, context: &SampleProjectContext) -> Result<(), ServiceError> {
-        if context.manifest.format != "image-classification"
-            || project_storage::has_sample_class_links(&context.sqlite).map_err(storage_failure)?
-        {
+        if project_storage::has_sample_class_links(&context.sqlite).map_err(storage_failure)? {
             return Ok(());
         }
-        let classification_links = self.classification_links(context)?;
-        project_storage::refresh_sample_class_links(&context.sqlite, &classification_links)
+        self.rebuild_sample_classes(context)
+    }
+
+    fn rebuild_sample_classes(&self, context: &SampleProjectContext) -> Result<(), ServiceError> {
+        let links = if context.manifest.format == "image-classification" {
+            self.classification_links(context)?
+        } else {
+            self.native_annotation_class_links(context)?
+        };
+        project_storage::refresh_sample_class_links(&context.sqlite, &links)
             .map_err(storage_failure)
+    }
+
+    fn native_annotation_class_links(
+        &self,
+        context: &SampleProjectContext,
+    ) -> Result<Vec<(String, u32)>, ServiceError> {
+        let images =
+            project_storage::read_images(&context.sqlite, None).map_err(storage_failure)?;
+        let mut links = Vec::new();
+        for image in images {
+            for object in self.load_native_annotation_objects(context, &image)? {
+                links.push((image.id.clone(), object.class_id));
+            }
+        }
+        links.sort();
+        links.dedup();
+        Ok(links)
     }
 
     fn classification_links(
