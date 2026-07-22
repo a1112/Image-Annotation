@@ -1,0 +1,35 @@
+services:
+  image-annotation-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    image: image-annotation-server:local
+    restart: unless-stopped
+    read_only: true
+    ports:
+      - "17311:17311"
+    environment:
+      IMAGE_ANNOTATION_BIND: 0.0.0.0:17311
+      IMAGE_ANNOTATION_DATA_DIR: /data
+      IMAGE_ANNOTATION_ADMIN_TOKEN: ${IMAGE_ANNOTATION_ADMIN_TOKEN:?set IMAGE_ANNOTATION_ADMIN_TOKEN in .env.server}
+      IMAGE_ANNOTATION_EDITOR_TOKEN: ${IMAGE_ANNOTATION_EDITOR_TOKEN:-}
+      IMAGE_ANNOTATION_READER_TOKEN: ${IMAGE_ANNOTATION_READER_TOKEN:-}
+      IMAGE_ANNOTATION_ALLOWED_ORIGINS: ${IMAGE_ANNOTATION_ALLOWED_ORIGINS:-http://127.0.0.1:1440}
+      IMAGE_ANNOTATION_MAX_UPLOAD_MIB: ${IMAGE_ANNOTATION_MAX_UPLOAD_MIB:-2048}
+      RUST_LOG: ${RUST_LOG:-image_annotation=info,tower_http=info}
+    volumes:
+      - server-data:/data
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:17311/api/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  server-data:
+    name: image-annotation-server-data

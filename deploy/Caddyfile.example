@@ -1,0 +1,4 @@
+{$IMAGE_ANNOTATION_DOMAIN:localhost} {
+    encode zstd gzip
+    reverse_proxy image-annotation-server:17311
+}

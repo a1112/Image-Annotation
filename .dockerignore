@@ -1,0 +1,9 @@
+.git
+.worktrees
+data
+dist
+node_modules
+src-tauri/target
+*.log
+.env
+.env.server

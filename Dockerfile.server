@@ -1,0 +1,46 @@
+FROM node:20-bookworm-slim AS frontend
+WORKDIR /build
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY index.html tsconfig.json vite.config.ts ./
+COPY src ./src
+RUN npm run build
+
+FROM rust:1.85-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libayatana-appindicator3-dev \
+    librsvg2-dev \
+    libssl-dev \
+    libwebkit2gtk-4.1-dev \
+    libxdo-dev \
+    patchelf \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY src-tauri ./src-tauri
+COPY --from=frontend /build/dist ./dist
+RUN cargo build --locked --manifest-path src-tauri/Cargo.toml --release --bin image-annotation-server
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    libayatana-appindicator3-1 \
+    librsvg2-2 \
+    libwebkit2gtk-4.1-0 \
+    libxdo3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 annotation \
+    && useradd --system --uid 10001 --gid annotation --home-dir /nonexistent --shell /usr/sbin/nologin annotation \
+    && mkdir /data \
+    && chown annotation:annotation /data
+COPY --from=builder /build/src-tauri/target/release/image-annotation-server /usr/local/bin/image-annotation-server
+
+ENV IMAGE_ANNOTATION_BIND=0.0.0.0:17311 \
+    IMAGE_ANNOTATION_DATA_DIR=/data \
+    RUST_LOG=image_annotation=info,tower_http=info
+EXPOSE 17311
+VOLUME ["/data"]
+USER annotation
+ENTRYPOINT ["/usr/local/bin/image-annotation-server"]
