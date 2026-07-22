@@ -66,6 +66,15 @@ pub struct ExportRecord {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ImportRecord {
+    pub id: String,
+    pub source_path: String,
+    pub status: String,
+    pub message: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TaskRecord {
     pub id: String,
     pub name: String,
@@ -704,6 +713,55 @@ pub fn list_export_records(path: &Path) -> Result<Vec<ExportRecord>, String> {
     Ok(rows)
 }
 
+pub fn record_import(
+    path: &Path,
+    source_path: &str,
+    status: &str,
+    message: &str,
+) -> Result<ImportRecord, String> {
+    initialize_project_database(path)?;
+    let record = ImportRecord {
+        id: unique_id("import"),
+        source_path: source_path.to_string(),
+        status: status.to_string(),
+        message: message.to_string(),
+        created_at: now_unix_string(),
+    };
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    connection
+        .execute(
+            "INSERT INTO imports (id, source_path, status, message, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![record.id, record.source_path, record.status, record.message, record.created_at],
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(record)
+}
+
+pub fn list_import_records(path: &Path) -> Result<Vec<ImportRecord>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    initialize_project_database(path)?;
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    let mut statement = connection
+        .prepare("SELECT id, source_path, status, message, created_at FROM imports ORDER BY created_at DESC")
+        .map_err(|err| err.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ImportRecord {
+                id: row.get(0)?,
+                source_path: row.get(1)?,
+                status: row.get(2)?,
+                message: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    Ok(rows)
+}
+
 pub fn create_annotation_task_record(
     path: &Path,
     name: &str,
@@ -745,7 +803,9 @@ pub fn list_task_records(path: &Path) -> Result<Vec<TaskRecord>, String> {
     initialize_project_database(path)?;
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
     let mut statement = connection
-        .prepare("SELECT id, name, status, created_at, updated_at FROM tasks ORDER BY created_at DESC")
+        .prepare(
+            "SELECT id, name, status, created_at, updated_at FROM tasks ORDER BY created_at DESC",
+        )
         .map_err(|err| err.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -869,6 +929,33 @@ mod tests {
     }
 
     #[test]
+    fn records_dataset_import_history() {
+        let path = std::env::temp_dir().join("image_annotation_import_history_test.sqlite");
+        let _ = std::fs::remove_file(&path);
+        initialize_project_database(&path).unwrap();
+
+        let record = record_import(
+            &path,
+            r"L:\data_tool\datas\lg\1580_2d\train",
+            "completed",
+            "已链接本机目录并索引 1580 张图片",
+        )
+        .unwrap();
+        let imports = list_import_records(&path).unwrap();
+
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].id, record.id);
+        assert_eq!(
+            imports[0].source_path,
+            r"L:\data_tool\datas\lg\1580_2d\train"
+        );
+        assert_eq!(imports[0].status, "completed");
+        assert!(imports[0].message.contains("1580"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn saves_annotation_revisions_and_rejects_stale_revision() {
         let path = std::env::temp_dir().join("image_annotation_revision_test.sqlite");
         let _ = std::fs::remove_file(&path);
@@ -877,12 +964,8 @@ mod tests {
         let first = save_annotation_payload(&path, "img-1", None, r#"[{"id":"a"}]"#).unwrap();
         assert!(!first.revision.is_empty());
 
-        let stale = save_annotation_payload(
-            &path,
-            "img-1",
-            Some("stale-revision"),
-            r#"[{"id":"b"}]"#,
-        );
+        let stale =
+            save_annotation_payload(&path, "img-1", Some("stale-revision"), r#"[{"id":"b"}]"#);
         assert!(stale.is_err());
 
         let second =
@@ -1058,7 +1141,9 @@ mod tests {
         let page = read_images_page(&path, None, 2, 2).unwrap();
 
         assert_eq!(
-            page.iter().map(|image| image.id.as_str()).collect::<Vec<_>>(),
+            page.iter()
+                .map(|image| image.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["img-3", "img-4"]
         );
         let _ = std::fs::remove_file(path);

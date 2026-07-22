@@ -1,7 +1,7 @@
 use image_annotation_lib::{
     datasets::builtin_datasets,
     domain::{AnnotationObject, BBox},
-    http_backend::{backend_bind_addr, backend_base_url, health_payload},
+    http_backend::{backend_base_url, backend_bind_addr, health_payload},
     importers::yolo::{annotations_to_yolo_lines, parse_yolo_bbox_line, parse_yolo_polygon_line},
     project_fs::{safe_extract_path, test_data_root, workspace_data_root},
     windows::{annotation_route, backend_tasks_route},
@@ -124,9 +124,10 @@ fn annotation_window_route_uses_hash_router() {
 
 #[test]
 fn annotation_window_reuse_script_jumps_to_requested_image() {
-    let script = image_annotation_lib::windows::annotation_navigation_script(
-        &annotation_route("coco128", Some("000000000009")),
-    );
+    let script = image_annotation_lib::windows::annotation_navigation_script(&annotation_route(
+        "coco128",
+        Some("000000000009"),
+    ));
 
     assert!(script.contains("window.location.hash"));
     assert!(script.contains("#/annotate/coco128/000000000009"));

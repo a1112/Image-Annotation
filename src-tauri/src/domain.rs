@@ -1,7 +1,14 @@
-use crate::{importers::{voc, yolo}, project_fs, storage};
+use crate::{
+    importers::{voc, yolo},
+    project_fs, storage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, fs, path::{Path, PathBuf}};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,15 +327,20 @@ impl SampleRepository {
                     .iter()
                     .filter(|image| image.qa_status == "驳回")
                     .count() as u32;
-                let annotation_types = if indexed_manifest.format == "yolo-seg" {
-                    vec!["Polygon".to_string(), "BBox".to_string()]
-                } else {
-                    vec!["BBox".to_string()]
+                let annotation_types = match indexed_manifest.format.as_str() {
+                    "yolo-seg" => vec!["Polygon".to_string(), "BBox".to_string()],
+                    "image-classification" => vec!["Classification".to_string()],
+                    _ => vec!["BBox".to_string()],
                 };
+                let is_local_linked = indexed_manifest.source_dataset_key == "local-linked";
                 DatasetProject {
                     id: indexed_manifest.id.clone(),
                     name: indexed_manifest.name.clone(),
-                    description: format!("真实 {} 测试数据集", indexed_manifest.source_dataset_key),
+                    description: if is_local_linked {
+                        format!("本机目录 {}", indexed_manifest.root_path)
+                    } else {
+                        format!("真实 {} 测试数据集", indexed_manifest.source_dataset_key)
+                    },
                     annotation_types,
                     image_count,
                     annotated_percent: if image_count > 0 {
@@ -346,7 +358,11 @@ impl SampleRepository {
                     tag_group_count: 3,
                     status: "已导入".to_string(),
                     tags: vec![
-                        "source: ultralytics".to_string(),
+                        if is_local_linked {
+                            "source: local-linked".to_string()
+                        } else {
+                            "source: ultralytics".to_string()
+                        },
                         format!("format: {}", indexed_manifest.format),
                         "split: train".to_string(),
                     ],
@@ -505,9 +521,7 @@ impl SampleRepository {
                     .objects
                     .into_iter()
                     .filter(|object| {
-                        class_id
-                            .map(|id| object.class_id == id)
-                            .unwrap_or(false)
+                        class_id.map(|id| object.class_id == id).unwrap_or(false)
                             || object.label == label
                     })
                     .count() as u32;
@@ -527,8 +541,13 @@ impl SampleRepository {
     ) -> Vec<DatasetImage> {
         let paths = project_fs::project_paths(project_id);
         let indexed_images = if let Some(limit) = limit {
-            storage::read_images_page(&paths.sqlite, group_id.as_deref(), offset.unwrap_or(0), limit)
-                .unwrap_or_default()
+            storage::read_images_page(
+                &paths.sqlite,
+                group_id.as_deref(),
+                offset.unwrap_or(0),
+                limit,
+            )
+            .unwrap_or_default()
         } else {
             storage::read_images(&paths.sqlite, group_id.as_deref()).unwrap_or_default()
         };
@@ -557,7 +576,9 @@ impl SampleRepository {
         for entry in WalkDir::new(&asset_root)
             .into_iter()
             .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file() && is_image_path(&entry.path().to_path_buf()))
+            .filter(|entry| {
+                entry.file_type().is_file() && is_image_path(&entry.path().to_path_buf())
+            })
         {
             let path = entry.path().to_path_buf();
             let split = split_for_path(&path);
@@ -952,9 +973,14 @@ impl SampleRepository {
             "imageCount": images.len(),
             "annotations": annotations,
         });
-        let manifest_json = serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?;
-        let record =
-            storage::create_snapshot_record(&paths.sqlite, name, &manifest_json, images.len() as u32)?;
+        let manifest_json =
+            serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?;
+        let record = storage::create_snapshot_record(
+            &paths.sqlite,
+            name,
+            &manifest_json,
+            images.len() as u32,
+        )?;
         let snapshot_dir = paths.snapshots.join(&record.id);
         fs::create_dir_all(&snapshot_dir).map_err(|err| err.to_string())?;
         let manifest_path = snapshot_dir.join("manifest.json");
@@ -997,8 +1023,7 @@ impl SampleRepository {
         let output_dir = paths.exports.join(format!("{snapshot_id}-{format}"));
         fs::create_dir_all(&output_dir).map_err(|err| err.to_string())?;
         let manifest_path = paths.snapshots.join(snapshot_id).join("manifest.json");
-        let manifest_json =
-            fs::read_to_string(&manifest_path).map_err(|err| err.to_string())?;
+        let manifest_json = fs::read_to_string(&manifest_path).map_err(|err| err.to_string())?;
         fs::write(output_dir.join("manifest.json"), &manifest_json)
             .map_err(|err| err.to_string())?;
         if format == "coco" {
@@ -1007,7 +1032,10 @@ impl SampleRepository {
         } else {
             fs::write(
                 output_dir.join("dataset.yaml"),
-                format!("path: {}\ntrain: images\nnames: []\n", paths.raw.to_string_lossy()),
+                format!(
+                    "path: {}\ntrain: images\nnames: []\n",
+                    paths.raw.to_string_lossy()
+                ),
             )
             .map_err(|err| err.to_string())?;
         }
@@ -1116,7 +1144,12 @@ fn yolo_label_path_for_image(project_id: &str, image_path: &Path) -> Option<Path
         .map(|manifest| PathBuf::from(manifest.root_path))
         .unwrap_or_else(|| project_fs::project_paths(project_id).raw);
 
-    label_path_for_image(&manifest_root, image_path).or_else(|| image_path.with_extension("txt").exists().then(|| image_path.with_extension("txt")))
+    label_path_for_image(&manifest_root, image_path).or_else(|| {
+        image_path
+            .with_extension("txt")
+            .exists()
+            .then(|| image_path.with_extension("txt"))
+    })
 }
 
 fn yolo_label_write_path_for_image(project_id: &str, image_path: &Path) -> PathBuf {
@@ -1326,7 +1359,10 @@ pub fn backend_design() -> BackendDesign {
             "list_builtin_datasets".to_string(),
             "download_test_dataset".to_string(),
             "create_project".to_string(),
+            "pick_data_source".to_string(),
+            "analyze_data_source".to_string(),
             "open_local_dataset".to_string(),
+            "import_files".to_string(),
             "import_images".to_string(),
             "import_yolo_dataset".to_string(),
             "list_dataset_projects".to_string(),

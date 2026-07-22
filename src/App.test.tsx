@@ -7,6 +7,7 @@ import App from "./App";
 const tauriState = vi.hoisted(() => ({
   backendAvailable: true,
   builtinDownloaded: true,
+  localOpened: false,
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -44,7 +45,7 @@ vi.mock("@tauri-apps/api/core", () => ({
       if (!tauriState.builtinDownloaded) {
         return [];
       }
-      return [
+      const projects = [
         {
           id: "coco128",
           name: "COCO128",
@@ -60,9 +61,49 @@ vi.mock("@tauri-apps/api/core", () => ({
           tags: ["source: ultralytics", "format: yolo-detect", "split: train"],
         },
       ];
+      if (tauriState.localOpened) {
+        projects.push({
+          id: "local-out",
+          name: "本机 out",
+          description: "本机目录 L:\\data_tool\\datas\\lg\\1580_2d\\train",
+          annotationTypes: ["BBox"],
+          imageCount: 128,
+          annotatedPercent: 100,
+          reviewCount: 0,
+          issueCount: 0,
+          classCount: 1,
+          tagGroupCount: 1,
+          status: "已导入",
+          tags: ["source: local-linked", "format: voc-detect", "split: train"],
+        });
+      }
+      return projects;
     }
 
     if (command === "get_project_detail") {
+      if (args?.projectId === "local-out") {
+        return {
+          project: {
+            id: "local-out",
+            name: "本机 out",
+            description: "本机目录 L:\\data_tool\\datas\\lg\\1580_2d\\train",
+            annotationTypes: ["BBox"],
+            imageCount: 128,
+            annotatedPercent: 100,
+            reviewCount: 0,
+            issueCount: 0,
+            classCount: 1,
+            tagGroupCount: 1,
+            status: "已导入",
+            tags: ["source: local-linked", "format: voc-detect", "split: train"],
+          },
+          tagGroups: [],
+          classes: [{ id: 0, label: "defect", color: "#cc54d8", count: 128, attributes: [] }],
+          tasks: [],
+          qualityChecks: [],
+          exportPresets: [],
+        };
+      }
       return {
         project: {
           id: "coco128",
@@ -293,7 +334,69 @@ vi.mock("@tauri-apps/api/core", () => ({
       };
     }
 
+    if (command === "pick_data_source") {
+      return ["L:\\data_tool\\datas\\lg\\1580_2d\\新建文件夹\\2D数据标注原始\\out"];
+    }
+
+    if (command === "analyze_data_source") {
+      return {
+        sourcePaths: args?.sourcePaths,
+        rootPath: "L:\\data_tool\\datas\\lg\\1580_2d\\新建文件夹\\2D数据标注原始\\out",
+        sourceKind: "folder",
+        detectedFormat: "voc-detect",
+        recommendedAction: "open-local",
+        imageCount: 128,
+        annotationCount: 128,
+        classCount: 1,
+        classes: ["defect"],
+        splitCount: 1,
+        warnings: [],
+        tree: [
+          {
+            name: "out",
+            path: "",
+            kind: "folder",
+            truncated: false,
+            children: [
+              {
+                name: "sample.jpg",
+                path: "sample.jpg",
+                kind: "file",
+                truncated: false,
+                children: [],
+              },
+              {
+                name: "sample.xml",
+                path: "sample.xml",
+                kind: "file",
+                truncated: false,
+                children: [],
+              },
+            ],
+          },
+        ],
+      };
+    }
+
+    if (command === "import_files") {
+      return {
+        id: args?.projectId,
+        name: "COCO128",
+        description: "真实 COCO128 测试数据集",
+        annotationTypes: ["BBox"],
+        imageCount: 130,
+        annotatedPercent: 100,
+        reviewCount: 0,
+        issueCount: 0,
+        classCount: 80,
+        tagGroupCount: 3,
+        status: "已导入",
+        tags: ["source: local-files", "format: yolo-detect", "split: train"],
+      };
+    }
+
     if (command === "open_local_dataset") {
+      tauriState.localOpened = true;
       return {
         id: "local-out",
         name: "本机 out",
@@ -333,10 +436,17 @@ vi.mock("@tauri-apps/api/core", () => ({
   }),
 }));
 
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({
+    onDragDropEvent: vi.fn(async () => vi.fn()),
+  }),
+}));
+
 beforeEach(() => {
   window.location.hash = "";
   tauriState.backendAvailable = true;
   tauriState.builtinDownloaded = true;
+  tauriState.localOpened = false;
   vi.stubGlobal(
     "fetch",
     vi.fn(async () => {
@@ -420,6 +530,27 @@ describe("desktop shell", () => {
     );
   });
 
+  it("新建数据集支持分类模型数据集类型", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "新建数据集" }));
+    await user.selectOptions(screen.getByLabelText("数据集类型"), "image-classification");
+
+    expect(screen.getByLabelText("数据集类型")).toHaveValue("image-classification");
+    expect(screen.getByLabelText("初始化模板")).toHaveValue("demo-classification");
+
+    await user.click(screen.getByRole("button", { name: "创建数据集" }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("create_dataset_project", {
+        name: "Demo BBox 数据集",
+        datasetType: "image-classification",
+        demoTemplate: "demo-classification",
+      }),
+    );
+  });
+
   it("主窗口后端任务按钮打开独立后台任务窗口", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -427,6 +558,101 @@ describe("desktop shell", () => {
     await user.click(screen.getByRole("button", { name: "后端任务" }));
 
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("open_backend_task_tray"));
+  });
+
+  it("主窗口顶部栏支持拖拽窗口且不抢占按钮操作", async () => {
+    render(<App />);
+
+    fireEvent.mouseDown(screen.getByRole("banner"), {
+      button: 0,
+    });
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("start_drag_window"));
+
+    vi.mocked(invoke).mockClear();
+    fireEvent.mouseDown(screen.getByRole("button", { name: "新建数据集" }), {
+      button: 0,
+    });
+
+    expect(invoke).not.toHaveBeenCalledWith("start_drag_window");
+  });
+
+  it("数据集详情页标题区域支持拖拽窗口", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    vi.mocked(invoke).mockClear();
+
+    fireEvent.mouseDown(within(screen.getByRole("banner")).getByText("COCO128"), {
+      button: 0,
+    });
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("start_drag_window"));
+
+    vi.mocked(invoke).mockClear();
+    fireEvent.mouseDown(within(screen.getByRole("banner")).getByRole("button", { name: "添加数据" }), {
+      button: 0,
+    });
+
+    expect(invoke).not.toHaveBeenCalledWith("start_drag_window");
+  });
+
+  it("顶部栏不显示应用文字标题", async () => {
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "新建数据集" })).toBeInTheDocument();
+    expect(screen.queryByText("Image Annotation")).not.toBeInTheDocument();
+  });
+
+  it("顶部栏不显示搜索框", async () => {
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "新建数据集" })).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("搜索数据集、标签、文件")).not.toBeInTheDocument();
+  });
+
+  it("顶部栏不显示工作区切换按钮", async () => {
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "新建数据集" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "数据生产工作区" })).not.toBeInTheDocument();
+  });
+
+  it("浏览器连接桌面后台时隐藏主窗口控制按钮", async () => {
+    tauriState.backendAvailable = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (url === "http://127.0.0.1:17310/api/health") {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              data: {
+                status: "ok",
+                service: "image-annotation-rust-backend",
+                version: "0.1.0",
+                runtime: "tauri-desktop",
+                capabilities: ["datasets", "assets", "annotations", "windows", "tray", "tasks"],
+              },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
+        return new Response(JSON.stringify({ ok: true, data: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByText("已连接桌面后台")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "最小化" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "最大化" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "关闭到托盘" })).not.toBeInTheDocument();
   });
 
   it("后台任务独立路由展示任务并可清理已完成任务", async () => {
@@ -463,6 +689,10 @@ describe("desktop shell", () => {
     await user.click(screen.getByRole("button", { name: "数据提交" }));
 
     expect(screen.getByRole("dialog", { name: "数据提交" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /选择文件夹/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /选择多个文件/ })).toBeInTheDocument();
+    expect(screen.getByText("内置下载", { selector: "summary" })).toBeInTheDocument();
+    await user.click(screen.getByText("内置下载", { selector: "summary" }));
     expect(screen.getByRole("heading", { name: "内置下载" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "下载 COCO128" })).toBeInTheDocument();
   });
@@ -487,6 +717,7 @@ describe("desktop shell", () => {
     render(<App />);
 
     await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(screen.getByText("内置下载", { selector: "summary" }));
     await user.click(await screen.findByRole("button", { name: "下载 COCO128" }));
 
     await waitFor(() =>
@@ -499,16 +730,59 @@ describe("desktop shell", () => {
     render(<App />);
 
     await user.click(screen.getByRole("button", { name: "数据提交" }));
-    await user.type(
-      screen.getByLabelText("本地路径"),
-      "L:\\data_tool\\datas\\lg\\1580_2d\\新建文件夹\\2D数据标注原始\\out",
-    );
-    await user.click(screen.getByRole("button", { name: "打开本机数据集" }));
+    await user.click(screen.getByRole("button", { name: /选择文件夹/ }));
+
+    expect(await screen.findByText("Pascal VOC BBox")).toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: "文件夹结构" })).toBeInTheDocument();
+    expect(screen.getByText("sample.xml")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "确认导入" }));
 
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("open_local_dataset", {
         sourcePath: "L:\\data_tool\\datas\\lg\\1580_2d\\新建文件夹\\2D数据标注原始\\out",
         datasetType: "voc-detect",
+      }),
+    );
+    expect(await screen.findByText("本机 out")).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/datasets/local-out");
+  });
+
+  it("数据提交弹窗选择来源后展示导入确认细节", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(screen.getByRole("button", { name: /选择文件夹/ }));
+
+    await waitFor(() => expect(screen.getAllByText("128").length).toBeGreaterThan(0));
+    expect(screen.getByLabelText("文件夹结构")).toHaveTextContent("sample.jpg");
+    expect(screen.getByRole("option", { name: "链接本机目录（原地写回标注）" })).toBeInTheDocument();
+  });
+
+  it("数据提交弹窗拖拽文件后进入同一个导入确认界面", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    const file = new File(["demo"], "sample.jpg", { type: "image/jpeg" });
+    Object.defineProperty(file, "path", {
+      value: "L:\\data_tool\\datas\\lg\\1580_2d\\新建文件夹\\2D数据标注原始\\out\\sample.jpg",
+    });
+
+    fireEvent.drop(screen.getByLabelText("拖拽添加数据"), {
+      dataTransfer: {
+        files: [file],
+        types: ["Files"],
+      },
+    });
+
+    expect(await screen.findByText("Pascal VOC BBox")).toBeInTheDocument();
+    expect(screen.getByLabelText("文件夹结构")).toHaveTextContent("sample.jpg");
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("analyze_data_source", {
+        sourcePaths: [
+          "L:\\data_tool\\datas\\lg\\1580_2d\\新建文件夹\\2D数据标注原始\\out\\sample.jpg",
+        ],
       }),
     );
   });
@@ -518,8 +792,9 @@ describe("desktop shell", () => {
     render(<App />);
 
     await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(screen.getByRole("button", { name: /选择文件夹/ }));
 
-    expect(screen.getByText(/保存时原地写回 XML 或 TXT/)).toBeInTheDocument();
+    expect(await screen.findByRole("option", { name: "链接本机目录（原地写回标注）" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "YOLO BBox TXT" })).toBeInTheDocument();
   });
 
@@ -571,7 +846,7 @@ describe("desktop shell", () => {
 
     await user.dblClick(await screen.findByRole("article", { name: "COCO128 数据集卡片" }));
 
-    expect(screen.getByRole("heading", { name: "COCO128" })).toBeInTheDocument();
+    expect(within(screen.getByRole("banner")).getByText("COCO128")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "数据分组" })).toBeInTheDocument();
   });
 
@@ -581,7 +856,7 @@ describe("desktop shell", () => {
 
     await user.click(await screen.findByRole("button", { name: "打开" }));
 
-    expect(screen.getByRole("heading", { name: "COCO128" })).toBeInTheDocument();
+    expect(within(screen.getByRole("banner")).getByText("COCO128")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "数据分组" })).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "数据分组" }));
@@ -595,6 +870,80 @@ describe("desktop shell", () => {
     await user.click(screen.getByRole("button", { name: "导出" }));
     expect(screen.getByText("导出预设")).toBeInTheDocument();
     expect(screen.getByText("暂无导出记录")).toBeInTheDocument();
+  });
+
+  it("数据集详情页顶部栏展示数据集内操作而不是全局操作", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+
+    const topbar = screen.getByRole("banner");
+    expect(within(topbar).getByRole("button", { name: "返回数据集列表" })).toBeInTheDocument();
+    expect(within(topbar).queryByRole("button", { name: "数据集" })).not.toBeInTheDocument();
+    expect(within(topbar).getByText("COCO128")).toBeInTheDocument();
+    expect(within(topbar).queryByRole("button", { name: "后端任务" })).not.toBeInTheDocument();
+    expect(within(topbar).queryByRole("button", { name: "数据提交" })).not.toBeInTheDocument();
+    expect(within(topbar).queryByRole("button", { name: "新建数据集" })).not.toBeInTheDocument();
+    expect(within(topbar).getByRole("button", { name: "开始标注" })).toBeInTheDocument();
+    expect(within(topbar).getByRole("button", { name: "独立窗口标注" })).toBeInTheDocument();
+    expect(within(topbar).getByRole("button", { name: "添加数据" })).toBeInTheDocument();
+    expect(within(topbar).getByRole("button", { name: "快照管理" })).toBeInTheDocument();
+    expect(document.querySelector(".project-header")).not.toBeInTheDocument();
+
+    await user.click(within(topbar).getByRole("button", { name: "导出数据集" }));
+
+    expect(await screen.findByText("导出预设")).toBeInTheDocument();
+  });
+
+  it("数据集详情页顶部栏返回按钮回到数据集列表", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(within(screen.getByRole("banner")).getByRole("button", { name: "返回数据集列表" }));
+
+    expect(await screen.findByRole("heading", { name: "数据集" })).toBeInTheDocument();
+    expect(screen.getByRole("article", { name: "COCO128 数据集卡片" })).toBeInTheDocument();
+  });
+
+  it("单数据集概览展示生产进度、工作队列、最近样本和类别分布", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+
+    expect(screen.getByRole("heading", { name: "生产进度" })).toBeInTheDocument();
+    expect(screen.getByText("128 / 128")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "工作队列" })).toHaveTextContent("标注已完成");
+    expect(screen.getByRole("region", { name: "最近样本" })).toBeInTheDocument();
+    expect(await within(screen.getByRole("region", { name: "最近样本" })).findByAltText("000000000009.jpg")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "类别分布" })).toHaveTextContent("person");
+    expect(screen.getByRole("region", { name: "数据集信息" })).toHaveTextContent("ultralytics");
+    expect(screen.getByRole("region", { name: "数据集信息" })).toHaveTextContent("yolo-detect");
+  });
+
+  it("概览快捷入口可以进入全部图片和选中类别样本", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(screen.getByRole("button", { name: "查看全部图片" }));
+    expect(screen.getByRole("heading", { name: "图片浏览" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "概览" }));
+    await user.click(screen.getByRole("button", { name: "查看 person 类别" }));
+
+    expect(await screen.findByRole("heading", { name: "person 样本" })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("list_class_samples", {
+        projectId: "coco128",
+        classId: 0,
+        label: "person",
+        offset: 0,
+        limit: 48,
+      }),
+    );
   });
 
   it("类别页可以按类别查看样本并打开预览", async () => {
@@ -701,7 +1050,7 @@ describe("desktop shell", () => {
         imageId: "000000000009",
       }),
     );
-    expect(screen.getByRole("heading", { name: "COCO128" })).toBeInTheDocument();
+    expect(within(screen.getByRole("banner")).getByText("COCO128")).toBeInTheDocument();
   });
 
   it("点击开始标注会请求 Tauri 打开独立标注窗口", async () => {
@@ -738,7 +1087,7 @@ describe("desktop shell", () => {
     expect(await screen.findByRole("heading", { name: "标注工作台" })).toBeInTheDocument();
     expect(screen.queryByRole("banner")).not.toBeInTheDocument();
     expect(screen.queryByRole("navigation", { name: "主导航" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "最小化标注工作台" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "最小化标注工作台" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "关闭标注工作台" })).toBeInTheDocument();
   });
 

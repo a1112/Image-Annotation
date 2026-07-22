@@ -1,8 +1,6 @@
 use crate::{
     datasets::{self, DownloadJob},
-    domain::{
-        AnnotationObject, BackendTask, DatasetProject, DatasetSnapshot, SampleRepository,
-    },
+    domain::{AnnotationObject, BackendTask, DatasetProject, DatasetSnapshot, SampleRepository},
     project_fs,
 };
 use serde_json::{json, Value};
@@ -29,13 +27,23 @@ pub fn backend_base_url() -> &'static str {
 }
 
 pub fn health_payload() -> Value {
-    health_payload_for("standalone-backend", &["datasets", "assets", "annotations", "tasks"])
+    health_payload_for(
+        "standalone-backend",
+        &["datasets", "assets", "annotations", "tasks"],
+    )
 }
 
 pub fn desktop_health_payload() -> Value {
     health_payload_for(
         "tauri-desktop",
-        &["datasets", "assets", "annotations", "tasks", "windows", "tray"],
+        &[
+            "datasets",
+            "assets",
+            "annotations",
+            "tasks",
+            "windows",
+            "tray",
+        ],
     )
 }
 
@@ -164,7 +172,9 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
 
     let header_text = String::from_utf8_lossy(&buffer[..header_end]).to_string();
     let mut lines = header_text.lines();
-    let request_line = lines.next().ok_or_else(|| "missing request line".to_string())?;
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "missing request line".to_string())?;
     let mut request_parts = request_line.split_whitespace();
     let method = request_parts
         .next()
@@ -212,7 +222,10 @@ fn route_request(request: HttpRequest, runtime: Arc<BackendRuntime>) -> HttpResp
             match serde_json::from_str::<Value>(&request.body) {
                 Ok(value) => value,
                 Err(error) => {
-                    return HttpResponse::json(400, json!({ "ok": false, "error": error.to_string() }))
+                    return HttpResponse::json(
+                        400,
+                        json!({ "ok": false, "error": error.to_string() }),
+                    )
                 }
             }
         };
@@ -227,11 +240,7 @@ fn route_request(request: HttpRequest, runtime: Arc<BackendRuntime>) -> HttpResp
     HttpResponse::json(404, json!({ "ok": false, "error": "not found" }))
 }
 
-fn dispatch_command(
-    runtime: &BackendRuntime,
-    command: &str,
-    args: Value,
-) -> Result<Value, String> {
+fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Result<Value, String> {
     match command {
         "backend_health" => Ok(runtime.health_payload()),
         "list_builtin_datasets" => {
@@ -287,7 +296,8 @@ fn dispatch_command(
         }
         "get_dataset_download_job" => {
             let dataset_key = string_arg(&args, "datasetKey")?;
-            serde_json::to_value(datasets::completed_job(&dataset_key)).map_err(|err| err.to_string())
+            serde_json::to_value(datasets::completed_job(&dataset_key))
+                .map_err(|err| err.to_string())
         }
         "list_dataset_projects" => {
             let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
@@ -307,8 +317,13 @@ fn dispatch_command(
             let offset = optional_u32_arg(&args, "offset");
             let limit = optional_u32_arg(&args, "limit");
             let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
-            serde_json::to_value(repository.project_images_paged(&project_id, group_id, offset, limit))
-                .map_err(|err| err.to_string())
+            serde_json::to_value(repository.project_images_paged(
+                &project_id,
+                group_id,
+                offset,
+                limit,
+            ))
+            .map_err(|err| err.to_string())
         }
         "list_class_samples" => {
             let project_id = string_arg(&args, "projectId")?;
@@ -317,8 +332,14 @@ fn dispatch_command(
             let offset = optional_u32_arg(&args, "offset");
             let limit = optional_u32_arg(&args, "limit");
             let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
-            serde_json::to_value(repository.class_samples(&project_id, class_id, &label, offset, limit))
-                .map_err(|err| err.to_string())
+            serde_json::to_value(repository.class_samples(
+                &project_id,
+                class_id,
+                &label,
+                offset,
+                limit,
+            ))
+            .map_err(|err| err.to_string())
         }
         "get_image_annotations" => {
             let project_id = string_arg(&args, "projectId")?;
@@ -338,13 +359,15 @@ fn dispatch_command(
             let project_id = string_arg(&args, "projectId")?;
             let image_id = string_arg(&args, "imageId")?;
             let revision = optional_string_arg(&args, "revision");
-            let objects: Vec<AnnotationObject> = serde_json::from_value(
-                args.get("objects").cloned().unwrap_or_else(|| json!([])),
-            )
-            .map_err(|err| err.to_string())?;
+            let objects: Vec<AnnotationObject> =
+                serde_json::from_value(args.get("objects").cloned().unwrap_or_else(|| json!([])))
+                    .map_err(|err| err.to_string())?;
             let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
             serde_json::to_value(repository.save_image_annotations_with_revision(
-                &project_id, &image_id, revision, objects,
+                &project_id,
+                &image_id,
+                revision,
+                objects,
             )?)
             .map_err(|err| err.to_string())
         }
@@ -372,8 +395,12 @@ fn dispatch_command(
         "create_project" => {
             let name = string_arg(&args, "name")?;
             let dataset_type = string_arg(&args, "datasetType")?;
-            serde_json::to_value(datasets::create_dataset_project(&name, &dataset_type, "empty"))
-                .map_err(|err| err.to_string())
+            serde_json::to_value(datasets::create_dataset_project(
+                &name,
+                &dataset_type,
+                "empty",
+            ))
+            .map_err(|err| err.to_string())
         }
         "import_images" => {
             let project_id = string_arg(&args, "projectId")?;
@@ -398,6 +425,29 @@ fn dispatch_command(
                 "yolo-import",
                 "正在导入 YOLO 数据集目录",
                 || datasets::import_yolo_dataset_into_project(&project_id, &source_path),
+            )?)
+            .map_err(|err| err.to_string())
+        }
+        "pick_data_source" => {
+            let selection_type = string_arg(&args, "selectionType")?;
+            serde_json::to_value(datasets::pick_data_source(&selection_type)?)
+                .map_err(|err| err.to_string())
+        }
+        "analyze_data_source" => {
+            let source_paths = string_vec_arg(&args, "sourcePaths")?;
+            serde_json::to_value(datasets::analyze_data_source(&source_paths)?)
+                .map_err(|err| err.to_string())
+        }
+        "import_files" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let source_paths = string_vec_arg(&args, "sourcePaths")?;
+            serde_json::to_value(with_dataset_task(
+                runtime,
+                format!("import-files-{project_id}"),
+                "选择文件导入".to_string(),
+                "file-import",
+                "正在复制选择的本机文件",
+                || datasets::import_files_into_project(&project_id, &source_paths),
             )?)
             .map_err(|err| err.to_string())
         }
@@ -427,7 +477,8 @@ fn dispatch_command(
         "list_snapshots" => {
             let project_id = string_arg(&args, "projectId")?;
             let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
-            serde_json::to_value(repository.dataset_snapshots(&project_id)).map_err(|err| err.to_string())
+            serde_json::to_value(repository.dataset_snapshots(&project_id))
+                .map_err(|err| err.to_string())
         }
         "create_dataset_snapshot" => {
             let project_id = string_arg(&args, "projectId")?;
@@ -439,7 +490,8 @@ fn dispatch_command(
         "list_exports" => {
             let project_id = string_arg(&args, "projectId")?;
             let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
-            serde_json::to_value(repository.dataset_exports(&project_id)).map_err(|err| err.to_string())
+            serde_json::to_value(repository.dataset_exports(&project_id))
+                .map_err(|err| err.to_string())
         }
         "export_dataset" => {
             let project_id = string_arg(&args, "projectId")?;
@@ -485,16 +537,12 @@ fn dispatch_command(
                 .ok_or_else(desktop_capability_unavailable)?;
             let project_id = string_arg(&args, "projectId")?;
             let image_id = optional_string_arg(&args, "imageId").or_else(|| {
-                runtime
-                    .repository
-                    .lock()
-                    .ok()
-                    .and_then(|repository| {
-                        repository
-                            .project_images(&project_id, None)
-                            .first()
-                            .map(|image| image.id.clone())
-                    })
+                runtime.repository.lock().ok().and_then(|repository| {
+                    repository
+                        .project_images(&project_id, None)
+                        .first()
+                        .map(|image| image.id.clone())
+                })
             });
             crate::windows::open_annotation_window(app, &project_id, image_id.as_deref())?;
             Ok(Value::Null)
@@ -605,11 +653,28 @@ fn string_arg(args: &Value, key: &str) -> Result<String, String> {
 }
 
 fn optional_string_arg(args: &Value, key: &str) -> Option<String> {
-    args.get(key).and_then(Value::as_str).map(ToString::to_string)
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn string_vec_arg(args: &Value, key: &str) -> Result<Vec<String>, String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .ok_or_else(|| format!("missing string array argument: {key}"))
 }
 
 fn optional_u32_arg(args: &Value, key: &str) -> Option<u32> {
-    args.get(key).and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok())
+    args.get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
 }
 
 fn slug(name: &str, fallback: &str) -> String {
@@ -654,7 +719,13 @@ fn percent_decode(value: &str) -> String {
 }
 
 fn content_type_for_path(path: &Path) -> &'static str {
-    match path.extension().and_then(|ext| ext.to_str()).unwrap_or_default().to_ascii_lowercase().as_str() {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
         "bmp" => "image/bmp",

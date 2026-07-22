@@ -8,11 +8,11 @@ pub mod project_fs;
 pub mod storage;
 pub mod windows;
 
-use datasets::{BuiltinDataset, DownloadJob};
+use datasets::{BuiltinDataset, DataSourceAnalysis, DownloadJob};
 use domain::{
     AnnotationObject, AnnotationSaveResult, AnnotationState, AnnotationTask, AnnotationVersion,
-    BackendDesign, BackendTask, ClassSample, DatasetExport, DatasetImage, DatasetProject, DatasetSnapshot,
-    ProjectDetail, SampleRepository, TaskItem,
+    BackendDesign, BackendTask, ClassSample, DatasetExport, DatasetImage, DatasetProject,
+    DatasetSnapshot, ProjectDetail, SampleRepository, TaskItem,
 };
 use platform::NativeBackdropStatus;
 use serde::Serialize;
@@ -365,7 +365,69 @@ fn import_yolo_dataset(
         Err(error) => {
             record_backend_task(
                 &tasks,
-                BackendTask::new(task_id, "YOLO 数据集导入", "yolo-import", "failed", 0, &error)
+                BackendTask::new(
+                    task_id,
+                    "YOLO 数据集导入",
+                    "yolo-import",
+                    "failed",
+                    0,
+                    &error,
+                )
+                .finished(),
+            )?;
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+fn pick_data_source(selection_type: String) -> Result<Option<Vec<String>>, String> {
+    datasets::pick_data_source(&selection_type)
+}
+
+#[tauri::command]
+fn analyze_data_source(source_paths: Vec<String>) -> Result<DataSourceAnalysis, String> {
+    datasets::analyze_data_source(&source_paths)
+}
+
+#[tauri::command]
+fn import_files(
+    tasks: State<'_, BackendTaskState>,
+    project_id: String,
+    source_paths: Vec<String>,
+) -> Result<DatasetProject, String> {
+    let task_id = format!("import-files-{project_id}");
+    record_backend_task(
+        &tasks,
+        BackendTask::new(
+            task_id.clone(),
+            "选择文件导入",
+            "file-import",
+            "running",
+            20,
+            "正在复制选择的本机文件",
+        ),
+    )?;
+    match datasets::import_files_into_project(&project_id, &source_paths) {
+        Ok(project) => {
+            record_backend_task(
+                &tasks,
+                BackendTask::new(
+                    task_id,
+                    "选择文件导入",
+                    "file-import",
+                    "completed",
+                    100,
+                    format!("已导入并索引 {} 张图片", project.image_count),
+                )
+                .finished(),
+            )?;
+            Ok(project)
+        }
+        Err(error) => {
+            record_backend_task(
+                &tasks,
+                BackendTask::new(task_id, "选择文件导入", "file-import", "failed", 0, &error)
                     .finished(),
             )?;
             Err(error)
@@ -410,8 +472,15 @@ fn open_local_dataset(
         Err(error) => {
             record_backend_task(
                 &tasks,
-                BackendTask::new(task_id, "打开本机数据集", "local-dataset-open", "failed", 0, &error)
-                    .finished(),
+                BackendTask::new(
+                    task_id,
+                    "打开本机数据集",
+                    "local-dataset-open",
+                    "failed",
+                    0,
+                    &error,
+                )
+                .finished(),
             )?;
             Err(error)
         }
@@ -776,6 +845,9 @@ pub fn run() {
                 create_project,
                 import_images,
                 import_yolo_dataset,
+                pick_data_source,
+                analyze_data_source,
+                import_files,
                 open_local_dataset,
                 rescan_project_assets,
                 generate_thumbnails,
@@ -847,6 +919,9 @@ pub fn run() {
             create_project,
             import_images,
             import_yolo_dataset,
+            pick_data_source,
+            analyze_data_source,
+            import_files,
             open_local_dataset,
             rescan_project_assets,
             generate_thumbnails,
@@ -914,8 +989,7 @@ fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
         true,
         None::<&str>,
     )?;
-    let tasks_item =
-        MenuItem::with_id(app, TRAY_MENU_TASKS_ID, "后台任务", true, None::<&str>)?;
+    let tasks_item = MenuItem::with_id(app, TRAY_MENU_TASKS_ID, "后台任务", true, None::<&str>)?;
     let export_item = MenuItem::with_id(app, TRAY_MENU_EXPORT_ID, "导出中心", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出应用", true, None::<&str>)?;
