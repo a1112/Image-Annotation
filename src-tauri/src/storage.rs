@@ -95,6 +95,16 @@ pub struct StoredImageSource {
     pub source_version: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleTrashRecord {
+    pub image_id: String,
+    pub state: String,
+    pub move_plan_json: String,
+    pub metadata_json: String,
+    pub operation_id: String,
+    pub trashed_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnnotationPayload {
     pub image_id: String,
@@ -279,6 +289,16 @@ pub fn initialize_project_database(path: &Path) -> Result<(), String> {
             );
             CREATE INDEX IF NOT EXISTS idx_sample_class_links_class
                 ON sample_class_links (class_id, image_id);
+            CREATE TABLE IF NOT EXISTS sample_trash (
+                image_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                move_plan_json TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                trashed_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sample_trash_state
+                ON sample_trash (state, image_id);
             CREATE TABLE IF NOT EXISTS annotation_versions (
                 id TEXT PRIMARY KEY,
                 image_id TEXT NOT NULL,
@@ -713,6 +733,189 @@ pub fn read_image_sources(path: &Path) -> Result<Vec<StoredImageSource>, String>
     Ok(sources)
 }
 
+pub fn sample_trash_record(
+    path: &Path,
+    image_id: &str,
+) -> Result<Option<SampleTrashRecord>, String> {
+    initialize_project_database(path)?;
+    let connection = open_project_database_read_only(path)?;
+    connection
+        .query_row(
+            "SELECT image_id, state, move_plan_json, metadata_json, operation_id, trashed_at
+             FROM sample_trash WHERE image_id = ?1",
+            [image_id],
+            sample_trash_from_row,
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
+pub fn sample_trash_records(path: &Path) -> Result<Vec<SampleTrashRecord>, String> {
+    initialize_project_database(path)?;
+    let connection = open_project_database_read_only(path)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT image_id, state, move_plan_json, metadata_json, operation_id, trashed_at
+             FROM sample_trash ORDER BY image_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], sample_trash_from_row)
+        .map_err(|error| error.to_string())?;
+    rows.map(|row| row.map_err(|error| error.to_string()))
+        .collect()
+}
+
+pub fn begin_sample_trash(
+    path: &Path,
+    image_id: &str,
+    move_plan_json: &str,
+    metadata_json: &str,
+    operation_id: &str,
+) -> Result<(), String> {
+    initialize_project_database(path)?;
+    let connection = open_project_database_writable(path)?;
+    connection
+        .execute(
+            "INSERT INTO sample_trash (
+                image_id, state, move_plan_json, metadata_json, operation_id, trashed_at
+             ) VALUES (?1, 'trashing', ?2, ?3, ?4, ?5)",
+            params![
+                image_id,
+                move_plan_json,
+                metadata_json,
+                operation_id,
+                now_unix_string()
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+pub fn complete_sample_trash(
+    path: &Path,
+    image_id: &str,
+    operation_id: &str,
+) -> Result<(), String> {
+    transition_sample_trash(path, image_id, operation_id, "trashing", "trashed")
+}
+
+pub fn rollback_sample_trash(
+    path: &Path,
+    image_id: &str,
+    operation_id: &str,
+) -> Result<(), String> {
+    delete_sample_trash(path, image_id, operation_id, "trashing")
+}
+
+pub fn begin_sample_restore(
+    path: &Path,
+    image_id: &str,
+    previous_operation_id: &str,
+    operation_id: &str,
+) -> Result<(), String> {
+    initialize_project_database(path)?;
+    let connection = open_project_database_writable(path)?;
+    let updated = connection
+        .execute(
+            "UPDATE sample_trash SET state = 'restoring', operation_id = ?1
+             WHERE image_id = ?2 AND operation_id = ?3 AND state = 'trashed'",
+            params![operation_id, image_id, previous_operation_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err("sample trash state did not match".to_string())
+    }
+}
+
+pub fn rollback_sample_restore(
+    path: &Path,
+    image_id: &str,
+    operation_id: &str,
+    previous_operation_id: &str,
+) -> Result<(), String> {
+    initialize_project_database(path)?;
+    let connection = open_project_database_writable(path)?;
+    let updated = connection
+        .execute(
+            "UPDATE sample_trash SET state = 'trashed', operation_id = ?1
+             WHERE image_id = ?2 AND operation_id = ?3 AND state = 'restoring'",
+            params![previous_operation_id, image_id, operation_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err("sample trash state did not match".to_string())
+    }
+}
+
+pub fn complete_sample_restore(
+    path: &Path,
+    image_id: &str,
+    operation_id: &str,
+) -> Result<(), String> {
+    delete_sample_trash(path, image_id, operation_id, "restoring")
+}
+
+fn transition_sample_trash(
+    path: &Path,
+    image_id: &str,
+    operation_id: &str,
+    expected: &str,
+    next: &str,
+) -> Result<(), String> {
+    initialize_project_database(path)?;
+    let connection = open_project_database_writable(path)?;
+    let updated = connection
+        .execute(
+            "UPDATE sample_trash SET state = ?1
+             WHERE image_id = ?2 AND operation_id = ?3 AND state = ?4",
+            params![next, image_id, operation_id, expected],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err("sample trash state did not match".to_string())
+    }
+}
+
+fn delete_sample_trash(
+    path: &Path,
+    image_id: &str,
+    operation_id: &str,
+    expected: &str,
+) -> Result<(), String> {
+    initialize_project_database(path)?;
+    let connection = open_project_database_writable(path)?;
+    let deleted = connection
+        .execute(
+            "DELETE FROM sample_trash
+             WHERE image_id = ?1 AND operation_id = ?2 AND state = ?3",
+            params![image_id, operation_id, expected],
+        )
+        .map_err(|error| error.to_string())?;
+    if deleted == 1 {
+        Ok(())
+    } else {
+        Err("sample trash state did not match".to_string())
+    }
+}
+
+fn sample_trash_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SampleTrashRecord> {
+    Ok(SampleTrashRecord {
+        image_id: row.get(0)?,
+        state: row.get(1)?,
+        move_plan_json: row.get(2)?,
+        metadata_json: row.get(3)?,
+        operation_id: row.get(4)?,
+        trashed_at: row.get(5)?,
+    })
+}
+
 pub fn read_images(path: &Path, split: Option<&str>) -> Result<Vec<StoredImage>, String> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -720,9 +923,9 @@ pub fn read_images(path: &Path, split: Option<&str>) -> Result<Vec<StoredImage>,
     initialize_project_database(path)?;
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
     let sql = if split.is_some() {
-        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images WHERE split = ?1 ORDER BY file_name"
+        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images WHERE split = ?1 AND NOT EXISTS (SELECT 1 FROM sample_trash AS trash WHERE trash.image_id = images.id) ORDER BY file_name"
     } else {
-        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images ORDER BY file_name"
+        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images WHERE NOT EXISTS (SELECT 1 FROM sample_trash AS trash WHERE trash.image_id = images.id) ORDER BY file_name"
     };
     let mut statement = connection.prepare(sql).map_err(|err| err.to_string())?;
     let rows = if let Some(split) = split {
@@ -754,9 +957,9 @@ pub fn read_images_page(
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
     let limit = limit.clamp(1, 500);
     let sql = if split.is_some() {
-        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images WHERE split = ?1 ORDER BY file_name LIMIT ?2 OFFSET ?3"
+        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images WHERE split = ?1 AND NOT EXISTS (SELECT 1 FROM sample_trash AS trash WHERE trash.image_id = images.id) ORDER BY file_name LIMIT ?2 OFFSET ?3"
     } else {
-        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images ORDER BY file_name LIMIT ?1 OFFSET ?2"
+        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images WHERE NOT EXISTS (SELECT 1 FROM sample_trash AS trash WHERE trash.image_id = images.id) ORDER BY file_name LIMIT ?1 OFFSET ?2"
     };
     let mut statement = connection.prepare(sql).map_err(|err| err.to_string())?;
     let rows = if let Some(split) = split {
@@ -1123,7 +1326,9 @@ fn open_project_database_read_only(path: &Path) -> Result<Connection, String> {
 }
 
 fn sample_filter_sql(filter: &StoredSampleFilter) -> (String, Vec<SqlValue>) {
-    let mut clauses = Vec::<String>::new();
+    let mut clauses = vec![
+        "NOT EXISTS (SELECT 1 FROM sample_trash AS trash WHERE trash.image_id = i.id)".to_string(),
+    ];
     let mut values = Vec::new();
     if let Some(sample_id) = &filter.sample_id {
         clauses.push("i.id = ?".to_string());
@@ -1197,11 +1402,7 @@ fn sample_filter_sql(filter: &StoredSampleFilter) -> (String, Vec<SqlValue>) {
         values.push(SqlValue::Text(pattern.clone()));
         values.push(SqlValue::Text(pattern));
     }
-    if clauses.is_empty() {
-        (String::new(), values)
-    } else {
-        (format!("WHERE {}", clauses.join(" AND ")), values)
-    }
+    (format!("WHERE {}", clauses.join(" AND ")), values)
 }
 
 fn attach_sample_classes(

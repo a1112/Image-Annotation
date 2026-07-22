@@ -87,6 +87,7 @@ pub fn build_router_with_private_routes(
             service.clone(),
         )))
         .with_editor(imports::editor_routes(service.clone(), max_upload_bytes))
+        .with_admin(with_api_body_limit(samples::admin_routes(service.clone())))
         .with_admin(with_api_body_limit(projects::admin_routes(service)));
     let private_routes = protect_private_route_groups(private_route_groups);
     let routes = Router::new()

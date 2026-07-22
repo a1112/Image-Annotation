@@ -331,6 +331,32 @@ pub(super) struct ImportView {
     updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SampleTrashMove {
+    source_path: String,
+    trash_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SampleTrashMetadata {
+    project_id: String,
+    image_id: String,
+    file_name: String,
+    split: String,
+    status: String,
+    qa_status: String,
+    review_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SampleLifecycleResult {
+    image_id: String,
+    status: &'static str,
+}
+
 #[derive(Debug)]
 pub(super) enum AssetSource {
     Bytes(Vec<u8>),
@@ -454,6 +480,9 @@ impl RemoteSampleService {
             .repair_project_manifests()
             .map_err(|_| ServerBuildError::initialization_failed())?;
         service
+            .reconcile_sample_trash()
+            .map_err(|_| ServerBuildError::initialization_failed())?;
+        service
             .reconcile_import_sessions()
             .map_err(|_| ServerBuildError::initialization_failed())?;
         Ok(service)
@@ -468,6 +497,7 @@ impl RemoteSampleService {
             .workspace_dataset_projects_from_manifests(manifests);
         for project in &mut projects {
             self.apply_description(project)?;
+            self.apply_active_sample_counts(project)?;
         }
         Ok(projects)
     }
@@ -654,6 +684,45 @@ impl RemoteSampleService {
         Ok(())
     }
 
+    fn reconcile_sample_trash(&self) -> Result<(), ServiceError> {
+        for manifest in self.validated_active_manifests()? {
+            let project_dir = self
+                .existing_project_dir(self.projects_dir.as_ref(), &manifest.id)?
+                .ok_or(ServiceError::Storage)?;
+            let sqlite = project_dir.join("project.sqlite");
+            for record in project_storage::sample_trash_records(&sqlite).map_err(storage_failure)? {
+                let moves: Vec<SampleTrashMove> =
+                    serde_json::from_str(&record.move_plan_json).map_err(storage_failure)?;
+                validate_sample_move_plan(&record.image_id, &moves)?;
+                match record.state.as_str() {
+                    "trashing" => {
+                        apply_sample_moves(&project_dir, &moves, false)?;
+                        project_storage::complete_sample_trash(
+                            &sqlite,
+                            &record.image_id,
+                            &record.operation_id,
+                        )
+                        .map_err(storage_failure)?;
+                    }
+                    "trashed" => {
+                        apply_sample_moves(&project_dir, &moves, false)?;
+                    }
+                    "restoring" => {
+                        apply_sample_moves(&project_dir, &moves, true)?;
+                        project_storage::complete_sample_restore(
+                            &sqlite,
+                            &record.image_id,
+                            &record.operation_id,
+                        )
+                        .map_err(storage_failure)?;
+                    }
+                    _ => return Err(ServiceError::Storage),
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn project_import_was_published(&self, record: &ImportRecord) -> Result<bool, ServiceError> {
         let project_dir =
             match self.existing_project_dir(self.projects_dir.as_ref(), &record.project_id)? {
@@ -794,6 +863,242 @@ impl RemoteSampleService {
             );
         }
         Ok(updated_sample)
+    }
+
+    pub(super) fn delete_sample(
+        &self,
+        project_id: &str,
+        sample_id: &str,
+        request_id: &str,
+        role: Role,
+    ) -> Result<SampleLifecycleResult, ServiceError> {
+        self.ensure_configured_root()?;
+        validate_project_id(project_id)?;
+        validate_sample_id(sample_id)?;
+        let _mutation_guard = mutation_guard();
+        let context = self.sample_project_context(project_id)?;
+        if let Some(record) = project_storage::sample_trash_record(&context.sqlite, sample_id)
+            .map_err(storage_failure)?
+        {
+            if record.state == "trashed" {
+                return Ok(sample_lifecycle_result(sample_id, "trashed"));
+            }
+            return Err(ServiceError::Conflict);
+        }
+        let sample = self.stored_sample(&context, sample_id)?;
+        let moves = self.sample_trash_moves(&context, &sample.image)?;
+        if moves.is_empty() {
+            return Err(ServiceError::Storage);
+        }
+        validate_sample_move_plan(sample_id, &moves)?;
+        let metadata = SampleTrashMetadata {
+            project_id: project_id.to_string(),
+            image_id: sample_id.to_string(),
+            file_name: sample.image.file_name.clone(),
+            split: sample.image.split.clone(),
+            status: sample.image.status.clone(),
+            qa_status: sample.image.qa_status.clone(),
+            review_note: sample.image.review_note.clone(),
+        };
+        let move_plan_json = serde_json::to_string(&moves).map_err(storage_failure)?;
+        let metadata_json = serde_json::to_string(&metadata).map_err(storage_failure)?;
+        let payload = serde_json::json!({
+            "projectId": project_id,
+            "imageId": sample_id,
+            "fileCount": moves.len()
+        })
+        .to_string();
+        let operation = self
+            .storage
+            .begin_audit(AuditEntry {
+                request_id,
+                role: role_name(role),
+                action: "delete_sample",
+                project_id: Some(project_id),
+                image_id: Some(sample_id),
+                message: "sample trash requested",
+                payload: &payload,
+            })
+            .map_err(storage_failure)?;
+        if let Err(error) = project_storage::begin_sample_trash(
+            &context.sqlite,
+            sample_id,
+            &move_plan_json,
+            &metadata_json,
+            &operation.operation_id,
+        ) {
+            self.fail_audit_best_effort(&operation, "sample trash intent could not be persisted");
+            return Err(storage_failure(error));
+        }
+        let project_dir = context.sqlite.parent().ok_or(ServiceError::Storage)?;
+        if let Err(error) = apply_sample_moves(project_dir, &moves, false) {
+            let _ = apply_sample_moves(project_dir, &moves, true);
+            let _ = project_storage::rollback_sample_trash(
+                &context.sqlite,
+                sample_id,
+                &operation.operation_id,
+            );
+            self.fail_audit_best_effort(&operation, failure_message(error));
+            return Err(error);
+        }
+        if let Err(error) = project_storage::complete_sample_trash(
+            &context.sqlite,
+            sample_id,
+            &operation.operation_id,
+        ) {
+            self.note_pending_audit_best_effort(
+                &operation,
+                "sample files moved; trash state requires startup reconciliation",
+            );
+            tracing::error!(%error, sample_id, "sample trash completion is pending");
+        } else {
+            self.complete_audit_best_effort(&operation, "sample moved to trash");
+        }
+        Ok(sample_lifecycle_result(sample_id, "trashed"))
+    }
+
+    pub(super) fn restore_sample(
+        &self,
+        project_id: &str,
+        sample_id: &str,
+        request_id: &str,
+        role: Role,
+    ) -> Result<SampleLifecycleResult, ServiceError> {
+        self.ensure_configured_root()?;
+        validate_project_id(project_id)?;
+        validate_sample_id(sample_id)?;
+        let _mutation_guard = mutation_guard();
+        let context = self.sample_project_context(project_id)?;
+        let record = project_storage::sample_trash_record(&context.sqlite, sample_id)
+            .map_err(storage_failure)?
+            .ok_or(ServiceError::NotFound)?;
+        if record.state != "trashed" {
+            return Err(ServiceError::Conflict);
+        }
+        let moves: Vec<SampleTrashMove> =
+            serde_json::from_str(&record.move_plan_json).map_err(storage_failure)?;
+        validate_sample_move_plan(sample_id, &moves)?;
+        let project_dir = context.sqlite.parent().ok_or(ServiceError::Storage)?;
+        validate_restore_targets(project_dir, &moves)?;
+        let payload = serde_json::json!({
+            "projectId": project_id,
+            "imageId": sample_id,
+            "fileCount": moves.len()
+        })
+        .to_string();
+        let operation = self
+            .storage
+            .begin_audit(AuditEntry {
+                request_id,
+                role: role_name(role),
+                action: "restore_sample",
+                project_id: Some(project_id),
+                image_id: Some(sample_id),
+                message: "sample restore requested",
+                payload: &payload,
+            })
+            .map_err(storage_failure)?;
+        if let Err(error) = project_storage::begin_sample_restore(
+            &context.sqlite,
+            sample_id,
+            &record.operation_id,
+            &operation.operation_id,
+        ) {
+            self.fail_audit_best_effort(&operation, "sample restore intent could not be persisted");
+            return Err(storage_failure(error));
+        }
+        if let Err(error) = apply_sample_moves(project_dir, &moves, true) {
+            let _ = apply_sample_moves(project_dir, &moves, false);
+            let _ = project_storage::rollback_sample_restore(
+                &context.sqlite,
+                sample_id,
+                &operation.operation_id,
+                &record.operation_id,
+            );
+            self.fail_audit_best_effort(&operation, failure_message(error));
+            return Err(error);
+        }
+        if let Err(error) = project_storage::complete_sample_restore(
+            &context.sqlite,
+            sample_id,
+            &operation.operation_id,
+        ) {
+            let files_rolled_back = apply_sample_moves(project_dir, &moves, false).is_ok();
+            let state_rolled_back = project_storage::rollback_sample_restore(
+                &context.sqlite,
+                sample_id,
+                &operation.operation_id,
+                &record.operation_id,
+            )
+            .is_ok();
+            if files_rolled_back && state_rolled_back {
+                self.fail_audit_best_effort(&operation, "sample restore persistence failed");
+            } else {
+                self.note_pending_audit_best_effort(
+                    &operation,
+                    "sample restore requires startup reconciliation",
+                );
+            }
+            tracing::error!(%error, sample_id, "sample restore completion failed");
+            return Err(ServiceError::Storage);
+        }
+        self.complete_audit_best_effort(&operation, "sample restored");
+        Ok(sample_lifecycle_result(sample_id, "restored"))
+    }
+
+    fn sample_trash_moves(
+        &self,
+        context: &SampleProjectContext,
+        image: &StoredImage,
+    ) -> Result<Vec<SampleTrashMove>, ServiceError> {
+        let project_dir = context.sqlite.parent().ok_or(ServiceError::Storage)?;
+        let mut sources = vec![self.resolve_sample_asset(context, &image.file_name)?];
+        if matches!(
+            context.manifest.format.as_str(),
+            "yolo-detect" | "yolo-seg" | "voc-detect" | "labelme"
+        ) {
+            let (_, annotation_path, _, _) = self.native_annotation_paths(context, image)?;
+            if self
+                .read_optional_managed_file(&context.original_dir, &annotation_path)?
+                .is_some()
+            {
+                sources.push(annotation_path);
+            }
+        }
+        let managed = context
+            .managed_annotations_dir
+            .join(format!("{}.json", image.id));
+        if self
+            .read_optional_managed_file(&context.managed_annotations_dir, &managed)?
+            .is_some()
+        {
+            sources.push(managed);
+        }
+        let thumbnail_prefix = format!("{}-", sha256_hex(image.id.as_bytes()));
+        for entry in fs::read_dir(&context.thumbnail_dir).map_err(storage_failure)? {
+            let entry = entry.map_err(storage_failure)?;
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with(&thumbnail_prefix) && file_name.ends_with(".jpg") {
+                self.validate_managed_asset_file(&context.thumbnail_dir, &entry.path())?;
+                sources.push(entry.path());
+            }
+        }
+        sources.sort();
+        sources.dedup();
+        sources
+            .into_iter()
+            .map(|source| {
+                let relative = relative_managed_path(project_dir, &source)?;
+                let trash = PathBuf::from("trash")
+                    .join("samples")
+                    .join(&image.id)
+                    .join(&relative);
+                Ok(SampleTrashMove {
+                    source_path: normalize_separator(&relative),
+                    trash_path: normalize_separator(&trash.to_string_lossy()),
+                })
+            })
+            .collect()
     }
 
     pub(super) fn annotation_state(
@@ -1651,6 +1956,8 @@ impl RemoteSampleService {
                 "create_project" => self.reconcile_pending_create(&record)?,
                 "update_project" => self.reconcile_pending_update(&record)?,
                 "update_sample_metadata" => self.reconcile_pending_sample_update(&record),
+                "delete_sample" => self.reconcile_pending_sample_lifecycle(&record, false)?,
+                "restore_sample" => self.reconcile_pending_sample_lifecycle(&record, true)?,
                 "save_annotations" => self.reconcile_pending_annotation_mutation(
                     &record,
                     "annotation.save",
@@ -1715,6 +2022,103 @@ impl RemoteSampleService {
             }
         }
         Ok(())
+    }
+
+    fn reconcile_pending_sample_lifecycle(
+        &self,
+        operation: &OperationRecord,
+        restore: bool,
+    ) -> Result<(), ServiceError> {
+        let project_id = operation
+            .project_id
+            .as_deref()
+            .ok_or(ServiceError::Storage)?;
+        let image_id = operation.image_id.as_deref().ok_or(ServiceError::Storage)?;
+        validate_project_id(project_id).map_err(|_| ServiceError::Storage)?;
+        validate_sample_id(image_id).map_err(|_| ServiceError::Storage)?;
+        let payload: serde_json::Value =
+            serde_json::from_str(&operation.payload).map_err(|_| ServiceError::Storage)?;
+        if payload.get("projectId").and_then(serde_json::Value::as_str) != Some(project_id)
+            || payload.get("imageId").and_then(serde_json::Value::as_str) != Some(image_id)
+        {
+            return Err(ServiceError::Storage);
+        }
+        let project_dir = self
+            .existing_project_dir(self.projects_dir.as_ref(), project_id)?
+            .ok_or(ServiceError::Storage)?;
+        let sqlite = project_dir.join("project.sqlite");
+        let trash =
+            project_storage::sample_trash_record(&sqlite, image_id).map_err(storage_failure)?;
+        let audit = AuditOperation {
+            operation_id: operation.operation_id.clone(),
+        };
+        match (restore, trash) {
+            (false, Some(record))
+                if record.operation_id == operation.operation_id
+                    && matches!(record.state.as_str(), "trashing" | "trashed") =>
+            {
+                let moves: Vec<SampleTrashMove> =
+                    serde_json::from_str(&record.move_plan_json).map_err(storage_failure)?;
+                validate_sample_move_plan(image_id, &moves)?;
+                apply_sample_moves(&project_dir, &moves, false)?;
+                if record.state == "trashing" {
+                    project_storage::complete_sample_trash(
+                        &sqlite,
+                        image_id,
+                        &operation.operation_id,
+                    )
+                    .map_err(storage_failure)?;
+                }
+                self.storage
+                    .complete_audit(&audit, "sample deletion reconciled")
+                    .map_err(storage_failure)
+            }
+            (true, Some(record))
+                if record.operation_id == operation.operation_id && record.state == "restoring" =>
+            {
+                let moves: Vec<SampleTrashMove> =
+                    serde_json::from_str(&record.move_plan_json).map_err(storage_failure)?;
+                validate_sample_move_plan(image_id, &moves)?;
+                apply_sample_moves(&project_dir, &moves, true)?;
+                project_storage::complete_sample_restore(
+                    &sqlite,
+                    image_id,
+                    &operation.operation_id,
+                )
+                .map_err(storage_failure)?;
+                self.storage
+                    .complete_audit(&audit, "sample restoration reconciled")
+                    .map_err(storage_failure)
+            }
+            (true, None) => {
+                let visible = project_storage::query_samples(
+                    &sqlite,
+                    &StoredSampleFilter {
+                        sample_id: Some(image_id.to_string()),
+                        ..StoredSampleFilter::default()
+                    },
+                    0,
+                    1,
+                )
+                .map_err(storage_failure)?
+                .total
+                    == 1;
+                if !visible {
+                    return Err(ServiceError::Storage);
+                }
+                self.storage
+                    .complete_audit(&audit, "sample restoration reconciled")
+                    .map_err(storage_failure)
+            }
+            (false, None) | (true, Some(_)) => self
+                .storage
+                .fail_audit(
+                    &audit,
+                    "sample lifecycle intent had no applied file transition",
+                )
+                .map_err(storage_failure),
+            _ => Err(ServiceError::Storage),
+        }
     }
 
     fn reconcile_orphan_annotation_file_transactions(&self) -> Result<(), ServiceError> {
@@ -3893,6 +4297,7 @@ impl RemoteSampleService {
             .next()
             .ok_or(ServiceError::Storage)?;
         self.apply_description(&mut project)?;
+        self.apply_active_sample_counts(&mut project)?;
         Ok(project)
     }
 
@@ -3904,6 +4309,30 @@ impl RemoteSampleService {
         {
             project.description = description;
         }
+        Ok(())
+    }
+
+    fn apply_active_sample_counts(&self, project: &mut DatasetProject) -> Result<(), ServiceError> {
+        let sqlite = self.projects_dir.join(&project.id).join("project.sqlite");
+        let images = project_storage::read_images(&sqlite, None).map_err(storage_failure)?;
+        project.image_count = images.len() as u32;
+        project.annotated_percent = if images.is_empty() {
+            0
+        } else {
+            let annotated = images
+                .iter()
+                .filter(|image| image.status != "未标注")
+                .count();
+            ((annotated * 100) / images.len()) as u8
+        };
+        project.review_count = images
+            .iter()
+            .filter(|image| image.qa_status == "待质检")
+            .count() as u32;
+        project.issue_count = images
+            .iter()
+            .filter(|image| image.qa_status == "驳回")
+            .count() as u32;
         Ok(())
     }
 
@@ -5284,6 +5713,137 @@ fn trashed_result(project_id: &str) -> ProjectLifecycleResult {
         project_id: project_id.to_string(),
         status: "trashed",
     }
+}
+
+fn sample_lifecycle_result(image_id: &str, status: &'static str) -> SampleLifecycleResult {
+    SampleLifecycleResult {
+        image_id: image_id.to_string(),
+        status,
+    }
+}
+
+fn validate_sample_move_plan(
+    image_id: &str,
+    moves: &[SampleTrashMove],
+) -> Result<(), ServiceError> {
+    if moves.is_empty() {
+        return Err(ServiceError::Storage);
+    }
+    let thumbnail_prefix = format!("{}-", sha256_hex(image_id.as_bytes()));
+    let managed_annotation = PathBuf::from("annotations")
+        .join("native")
+        .join(format!("{image_id}.json"));
+    let mut sources = HashSet::new();
+    for item in moves {
+        let source = validated_relative_asset_path(&item.source_path)?;
+        let trash = validated_relative_asset_path(&item.trash_path)?;
+        let is_original = source.starts_with(Path::new("assets").join("original"));
+        let is_thumbnail = source.starts_with(Path::new("assets").join("thumbnails"))
+            && source
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.starts_with(&thumbnail_prefix) && name.ends_with(".jpg"));
+        if !is_original && !is_thumbnail && source != managed_annotation {
+            return Err(ServiceError::Storage);
+        }
+        let expected_trash = PathBuf::from("trash")
+            .join("samples")
+            .join(image_id)
+            .join(&source);
+        if trash != expected_trash
+            || !sources.insert(normalize_separator(&source.to_string_lossy()))
+        {
+            return Err(ServiceError::Storage);
+        }
+    }
+    Ok(())
+}
+
+fn validate_restore_targets(
+    project_dir: &Path,
+    moves: &[SampleTrashMove],
+) -> Result<(), ServiceError> {
+    for item in moves {
+        let source = project_move_path(project_dir, &item.source_path)?;
+        let trash = project_move_path(project_dir, &item.trash_path)?;
+        if fs::symlink_metadata(&source).is_ok() {
+            return Err(ServiceError::Conflict);
+        }
+        validate_sample_move_file(project_dir, &trash)?;
+    }
+    Ok(())
+}
+
+fn apply_sample_moves(
+    project_dir: &Path,
+    moves: &[SampleTrashMove],
+    restore: bool,
+) -> Result<(), ServiceError> {
+    for item in moves {
+        let source = project_move_path(project_dir, &item.source_path)?;
+        let trash = project_move_path(project_dir, &item.trash_path)?;
+        let (from, to) = if restore {
+            (trash, source)
+        } else {
+            (source, trash)
+        };
+        let from_exists = fs::symlink_metadata(&from).is_ok();
+        let to_exists = fs::symlink_metadata(&to).is_ok();
+        match (from_exists, to_exists) {
+            (true, false) => {
+                validate_sample_move_file(project_dir, &from)?;
+                ensure_sample_move_parent(project_dir, &to)?;
+                fs::rename(&from, &to).map_err(storage_failure)?;
+                if let Some(parent) = from.parent() {
+                    sync_directory(parent)?;
+                }
+                if let Some(parent) = to.parent() {
+                    sync_directory(parent)?;
+                }
+            }
+            (false, true) => {
+                validate_sample_move_file(project_dir, &to)?;
+            }
+            (true, true) => return Err(ServiceError::Conflict),
+            (false, false) => return Err(ServiceError::Storage),
+        }
+    }
+    Ok(())
+}
+
+fn project_move_path(project_dir: &Path, relative: &str) -> Result<PathBuf, ServiceError> {
+    Ok(project_dir.join(validated_relative_asset_path(relative)?))
+}
+
+fn validate_sample_move_file(project_dir: &Path, path: &Path) -> Result<(), ServiceError> {
+    let metadata = fs::symlink_metadata(path).map_err(storage_failure)?;
+    if is_symlink_or_reparse(&metadata) || !metadata.is_file() {
+        return Err(ServiceError::Storage);
+    }
+    let canonical = canonical_existing(path).map_err(storage_failure)?;
+    if canonical_path_is_within(project_dir, &canonical) {
+        Ok(())
+    } else {
+        Err(ServiceError::Storage)
+    }
+}
+
+fn ensure_sample_move_parent(project_dir: &Path, path: &Path) -> Result<(), ServiceError> {
+    let relative = path
+        .parent()
+        .ok_or(ServiceError::Storage)?
+        .strip_prefix(project_dir)
+        .map_err(|_| ServiceError::Storage)?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value.to_str().ok_or(ServiceError::Storage),
+            _ => Err(ServiceError::Storage),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ensure_managed_subdirectory(project_dir, &components)
+        .map(|_| ())
+        .map_err(storage_failure)
 }
 
 fn storage_failure(error: impl std::fmt::Display) -> ServiceError {

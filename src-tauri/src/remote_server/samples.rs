@@ -8,7 +8,7 @@ use axum::{
     },
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::Response,
-    routing::{get, patch},
+    routing::{delete, get, patch, post},
     Extension, Json, Router,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -76,6 +76,19 @@ pub(super) fn editor_routes(service: RemoteSampleService) -> Router {
         .route(
             "/projects/{projectId}/samples/{sampleId}",
             patch(update_sample),
+        )
+        .with_state(service)
+}
+
+pub(super) fn admin_routes(service: RemoteSampleService) -> Router {
+    Router::new()
+        .route(
+            "/projects/{projectId}/samples/{sampleId}",
+            delete(delete_sample),
+        )
+        .route(
+            "/projects/{projectId}/samples/{sampleId}/restore",
+            post(restore_sample),
         )
         .with_state(service)
 }
@@ -158,6 +171,44 @@ async fn update_sample(
                 review_note: payload.review_note,
             },
         )
+    })
+    .await;
+    service_response(StatusCode::OK, result, response_request_id)
+}
+
+async fn delete_sample(
+    State(service): State<RemoteSampleService>,
+    Extension(role): Extension<Role>,
+    Extension(request_id): Extension<RequestId>,
+    path: Result<Path<(String, String)>, PathRejection>,
+) -> Response {
+    let response_request_id = request_id_value(&request_id);
+    let (project_id, sample_id) = match extract_sample_path(path) {
+        Ok(path) => path,
+        Err(error) => return ApiError::from(error).into_response(response_request_id),
+    };
+    let audit_request_id = response_request_id.clone();
+    let result = run_blocking(move || {
+        service.delete_sample(&project_id, &sample_id, &audit_request_id, role)
+    })
+    .await;
+    service_response(StatusCode::OK, result, response_request_id)
+}
+
+async fn restore_sample(
+    State(service): State<RemoteSampleService>,
+    Extension(role): Extension<Role>,
+    Extension(request_id): Extension<RequestId>,
+    path: Result<Path<(String, String)>, PathRejection>,
+) -> Response {
+    let response_request_id = request_id_value(&request_id);
+    let (project_id, sample_id) = match extract_sample_path(path) {
+        Ok(path) => path,
+        Err(error) => return ApiError::from(error).into_response(response_request_id),
+    };
+    let audit_request_id = response_request_id.clone();
+    let result = run_blocking(move || {
+        service.restore_sample(&project_id, &sample_id, &audit_request_id, role)
     })
     .await;
     service_response(StatusCode::OK, result, response_request_id)

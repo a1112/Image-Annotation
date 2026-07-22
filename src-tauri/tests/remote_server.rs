@@ -5933,6 +5933,276 @@ async fn remote_import_flow_indexes_voc_labelme_and_coco_datasets() {
 }
 
 #[tokio::test]
+async fn admin_can_trash_and_restore_a_sample_with_all_managed_files() {
+    let (name, project_id) = unique_project("Remote sample trash");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    seed_remote_sample_fixture(&data_dir, &project_id);
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let managed_annotation = project_dir
+        .join("annotations")
+        .join("native")
+        .join("demo_001.json");
+    fs::write(&managed_annotation, br#"{"imageId":"demo_001"}"#).unwrap();
+    let content_uri = format!("/api/v1/projects/{project_id}/samples/demo_001/content");
+    let thumbnail_uri = format!("/api/v1/projects/{project_id}/samples/demo_001/thumbnail");
+    let annotation_uri = format!("/api/v1/projects/{project_id}/samples/demo_001/annotations");
+    let sample_uri = format!("/api/v1/projects/{project_id}/samples/demo_001");
+    let restore_uri = format!("{sample_uri}/restore");
+    let (thumbnail_status, _, _) =
+        router_raw_request(&app, Method::GET, &thumbnail_uri, READER_TOKEN, &[]).await;
+    assert_eq!(thumbnail_status, StatusCode::OK);
+    let original_image = project_dir
+        .join("assets")
+        .join("original")
+        .join("images")
+        .join("train")
+        .join("demo_001.png");
+    let sidecar = project_dir
+        .join("assets")
+        .join("original")
+        .join("labels")
+        .join("train")
+        .join("demo_001.txt");
+    assert!(original_image.is_file());
+    assert!(sidecar.is_file());
+    assert!(managed_annotation.is_file());
+
+    let (editor_status, _, editor_response) =
+        router_request(&app, Method::DELETE, &sample_uri, EDITOR_TOKEN, None).await;
+    assert_eq!(editor_status, StatusCode::FORBIDDEN, "{editor_response}");
+
+    let (delete_status, _, deleted) =
+        router_request(&app, Method::DELETE, &sample_uri, ADMIN_TOKEN, None).await;
+    assert_eq!(delete_status, StatusCode::OK, "{deleted}");
+    assert_eq!(deleted["data"]["status"], "trashed");
+    let delete_request_id = deleted["requestId"].as_str().unwrap();
+    assert!(!original_image.exists());
+    assert!(!sidecar.exists());
+    assert!(!managed_annotation.exists());
+    let connection = rusqlite::Connection::open(project_dir.join("project.sqlite")).unwrap();
+    let (state, move_plan): (String, String) = connection
+        .query_row(
+            "SELECT state, move_plan_json FROM sample_trash WHERE image_id = 'demo_001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "trashed");
+    let move_plan: Value = serde_json::from_str(&move_plan).unwrap();
+    assert!(move_plan.as_array().unwrap().len() >= 4);
+    for item in move_plan.as_array().unwrap() {
+        assert!(project_dir
+            .join(item["trashPath"].as_str().unwrap())
+            .is_file());
+    }
+
+    let (list_status, _, list) = router_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}/samples"),
+        READER_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(list_status, StatusCode::OK, "{list}");
+    assert_eq!(list["data"]["total"], 2);
+    let (project_status, _, project) = router_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}"),
+        READER_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(project_status, StatusCode::OK, "{project}");
+    assert_eq!(project["data"]["imageCount"], 2);
+    for uri in [&content_uri, &thumbnail_uri, &annotation_uri] {
+        let (status, _, body) = router_raw_request(&app, Method::GET, uri, READER_TOKEN, &[]).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    let (repeat_status, _, repeated) =
+        router_request(&app, Method::DELETE, &sample_uri, ADMIN_TOKEN, None).await;
+    assert_eq!(repeat_status, StatusCode::OK, "{repeated}");
+    assert_eq!(repeated["data"]["status"], "trashed");
+    let (editor_restore_status, _, editor_restore) =
+        router_request(&app, Method::POST, &restore_uri, EDITOR_TOKEN, None).await;
+    assert_eq!(
+        editor_restore_status,
+        StatusCode::FORBIDDEN,
+        "{editor_restore}"
+    );
+
+    fs::create_dir_all(original_image.parent().unwrap()).unwrap();
+    fs::write(&original_image, b"occupied").unwrap();
+    let (conflict_status, _, conflict) =
+        router_request(&app, Method::POST, &restore_uri, ADMIN_TOKEN, None).await;
+    assert_eq!(conflict_status, StatusCode::CONFLICT, "{conflict}");
+    fs::remove_file(&original_image).unwrap();
+
+    let (restore_status, _, restored) =
+        router_request(&app, Method::POST, &restore_uri, ADMIN_TOKEN, None).await;
+    assert_eq!(restore_status, StatusCode::OK, "{restored}");
+    assert_eq!(restored["data"]["status"], "restored");
+    let restore_request_id = restored["requestId"].as_str().unwrap();
+    assert!(original_image.is_file());
+    assert!(sidecar.is_file());
+    assert!(managed_annotation.is_file());
+    let trash_count: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sample_trash WHERE image_id = 'demo_001'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(trash_count, 0);
+    let (restored_status, _, restored_sample) =
+        router_request(&app, Method::GET, &sample_uri, READER_TOKEN, None).await;
+    assert_eq!(restored_status, StatusCode::OK, "{restored_sample}");
+    assert_eq!(restored_sample["data"]["id"], "demo_001");
+    let (project_status, _, project) = router_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}"),
+        READER_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(project_status, StatusCode::OK, "{project}");
+    assert_eq!(project["data"]["imageCount"], 3);
+
+    let audit = rusqlite::Connection::open(data_dir.join("server.sqlite")).unwrap();
+    for (request_id, expected_action) in [
+        (delete_request_id, "delete_sample"),
+        (restore_request_id, "restore_sample"),
+    ] {
+        let (action, state, image_id): (String, String, Option<String>) = audit
+            .query_row(
+                "SELECT action, state, image_id FROM service_audit WHERE request_id = ?1",
+                [request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(action, expected_action);
+        assert_eq!(state, "completed");
+        assert_eq!(image_id.as_deref(), Some("demo_001"));
+    }
+}
+
+#[tokio::test]
+async fn startup_completes_an_interrupted_sample_restore() {
+    let (name, project_id) = unique_project("Interrupted sample restore");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let sample_uri = format!("/api/v1/projects/{project_id}/samples/demo_001");
+    let (delete_status, _, deleted) =
+        router_request(&app, Method::DELETE, &sample_uri, ADMIN_TOKEN, None).await;
+    assert_eq!(delete_status, StatusCode::OK, "{deleted}");
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let connection = rusqlite::Connection::open(project_dir.join("project.sqlite")).unwrap();
+    let move_plan: String = connection
+        .query_row(
+            "SELECT move_plan_json FROM sample_trash WHERE image_id = 'demo_001'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let move_plan: Value = serde_json::from_str(&move_plan).unwrap();
+    connection
+        .execute(
+            "UPDATE sample_trash SET state = 'restoring' WHERE image_id = 'demo_001'",
+            [],
+        )
+        .unwrap();
+    let first = &move_plan.as_array().unwrap()[0];
+    let source = project_dir.join(first["sourcePath"].as_str().unwrap());
+    let trash = project_dir.join(first["trashPath"].as_str().unwrap());
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::rename(&trash, &source).unwrap();
+    drop(connection);
+    drop(app);
+
+    let restarted = build_router(config).expect("interrupted sample restore must reconcile");
+    let connection = rusqlite::Connection::open(project_dir.join("project.sqlite")).unwrap();
+    let trash_count: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sample_trash WHERE image_id = 'demo_001'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(trash_count, 0);
+    for item in move_plan.as_array().unwrap() {
+        assert!(project_dir
+            .join(item["sourcePath"].as_str().unwrap())
+            .is_file());
+        assert!(!project_dir
+            .join(item["trashPath"].as_str().unwrap())
+            .exists());
+    }
+    let (status, _, sample) =
+        router_request(&restarted, Method::GET, &sample_uri, READER_TOKEN, None).await;
+    assert_eq!(status, StatusCode::OK, "{sample}");
+}
+
+#[tokio::test]
+async fn startup_rejects_a_tampered_sample_trash_move_plan() {
+    let (name, project_id) = unique_project("Tampered sample trash plan");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    create_demo_project(&app, &name, &project_id, "yolo-detect", "demo-bbox").await;
+    let sample_uri = format!("/api/v1/projects/{project_id}/samples/demo_001");
+    let (delete_status, _, deleted) =
+        router_request(&app, Method::DELETE, &sample_uri, ADMIN_TOKEN, None).await;
+    assert_eq!(delete_status, StatusCode::OK, "{deleted}");
+
+    let project_dir = data_dir.join("projects").join(&project_id);
+    let sqlite = project_dir.join("project.sqlite");
+    let connection = rusqlite::Connection::open(&sqlite).unwrap();
+    connection
+        .execute(
+            "UPDATE sample_trash
+             SET state = 'trashing', move_plan_json = ?1
+             WHERE image_id = 'demo_001'",
+            [serde_json::json!([{
+                "sourcePath": "project.sqlite",
+                "trashPath": "trash/samples/demo_001/project.sqlite"
+            }])
+            .to_string()],
+        )
+        .unwrap();
+    drop(connection);
+    drop(app);
+
+    let failed_start = build_router(config);
+    assert!(failed_start.is_err());
+    assert!(sqlite.is_file());
+    assert!(!project_dir
+        .join("trash")
+        .join("samples")
+        .join("demo_001")
+        .join("project.sqlite")
+        .exists());
+    drop(failed_start);
+}
+
+#[tokio::test]
 async fn analyzed_import_becomes_inspectable_failed_session_after_restart() {
     const BOUNDARY: &str = "remote-import-restart-boundary";
     let (name, project_id) = unique_project("Remote import restart");
