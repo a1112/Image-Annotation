@@ -74,6 +74,21 @@ pub(super) struct TrashRecord {
     pub operation_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ImportRecord {
+    pub id: String,
+    pub project_id: String,
+    pub state: String,
+    pub staging_path: String,
+    pub detected_format: Option<String>,
+    pub analysis_json: Option<String>,
+    pub bytes_received: u64,
+    pub file_count: u32,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 impl ServerStorage {
     pub(super) fn initialize(data_dir: &Path) -> Result<Self, String> {
         let storage = Self {
@@ -195,6 +210,189 @@ impl ServerStorage {
             )
             .optional()
             .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn create_import(&self, record: &ImportRecord) -> Result<(), String> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO import_sessions (
+                    id, project_id, status, staging_path, detected_format,
+                    analysis_json, bytes_received, file_count, error_message,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    record.id,
+                    record.project_id,
+                    record.state,
+                    record.staging_path,
+                    record.detected_format,
+                    record.analysis_json,
+                    record.bytes_received,
+                    record.file_count,
+                    record.error_message,
+                    record.created_at,
+                    record.updated_at,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn import(&self, import_id: &str) -> Result<Option<ImportRecord>, String> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT id, project_id, status, staging_path, detected_format,
+                        analysis_json, bytes_received, file_count, error_message,
+                        created_at, updated_at
+                 FROM import_sessions WHERE id = ?1",
+                [import_id],
+                import_record_from_row,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn imports(&self) -> Result<Vec<ImportRecord>, String> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, project_id, status, staging_path, detected_format,
+                        analysis_json, bytes_received, file_count, error_message,
+                        created_at, updated_at
+                 FROM import_sessions ORDER BY created_at, id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], import_record_from_row)
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string()))
+            .collect()
+    }
+
+    pub(super) fn finish_import_analysis(
+        &self,
+        import_id: &str,
+        detected_format: &str,
+        analysis_json: &str,
+        bytes_received: u64,
+        file_count: u32,
+    ) -> Result<(), String> {
+        self.transition_import(
+            import_id,
+            "staged",
+            "analyzed",
+            Some(detected_format),
+            Some(analysis_json),
+            Some(bytes_received),
+            Some(file_count),
+            None,
+        )
+    }
+
+    pub(super) fn begin_import_commit(&self, import_id: &str) -> Result<(), String> {
+        self.transition_import(
+            import_id,
+            "analyzed",
+            "committing",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub(super) fn complete_import(&self, import_id: &str) -> Result<(), String> {
+        self.transition_import(
+            import_id,
+            "committing",
+            "completed",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub(super) fn fail_import(&self, import_id: &str, message: &str) -> Result<(), String> {
+        let connection = self.connection()?;
+        let updated = connection
+            .execute(
+                "UPDATE import_sessions
+                 SET status = 'failed', error_message = ?1, updated_at = ?2
+                 WHERE id = ?3 AND status NOT IN ('completed', 'cancelled')",
+                params![message, now_unix_string(), import_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err("import session cannot transition to failed".to_string())
+        }
+    }
+
+    pub(super) fn cancel_import(&self, import_id: &str) -> Result<(), String> {
+        let connection = self.connection()?;
+        let updated = connection
+            .execute(
+                "UPDATE import_sessions
+                 SET status = 'cancelled', updated_at = ?1
+                 WHERE id = ?2 AND status IN ('staged', 'analyzed', 'failed')",
+                params![now_unix_string(), import_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err("import session cannot be cancelled".to_string())
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transition_import(
+        &self,
+        import_id: &str,
+        expected: &str,
+        next: &str,
+        detected_format: Option<&str>,
+        analysis_json: Option<&str>,
+        bytes_received: Option<u64>,
+        file_count: Option<u32>,
+        error_message: Option<&str>,
+    ) -> Result<(), String> {
+        let connection = self.connection()?;
+        let updated = connection
+            .execute(
+                "UPDATE import_sessions SET
+                    status = ?1,
+                    detected_format = COALESCE(?2, detected_format),
+                    analysis_json = COALESCE(?3, analysis_json),
+                    bytes_received = COALESCE(?4, bytes_received),
+                    file_count = COALESCE(?5, file_count),
+                    error_message = ?6,
+                    updated_at = ?7
+                 WHERE id = ?8 AND status = ?9",
+                params![
+                    next,
+                    detected_format,
+                    analysis_json,
+                    bytes_received,
+                    file_count,
+                    error_message,
+                    now_unix_string(),
+                    import_id,
+                    expected,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err("import session state did not match".to_string())
+        }
     }
 
     pub(super) fn begin_audit(&self, entry: AuditEntry<'_>) -> Result<AuditOperation, String> {
@@ -597,7 +795,13 @@ fn schema_is_current(connection: &Connection) -> Result<bool, String> {
         && column_exists(connection, "service_audit", "payload")?
         && column_exists(connection, "service_audit", "updated_at")?
         && column_exists(connection, "trashed_projects", "state")?
-        && column_exists(connection, "trashed_projects", "operation_id")?)
+        && column_exists(connection, "trashed_projects", "operation_id")?
+        && column_exists(connection, "import_sessions", "staging_path")?
+        && column_exists(connection, "import_sessions", "detected_format")?
+        && column_exists(connection, "import_sessions", "analysis_json")?
+        && column_exists(connection, "import_sessions", "bytes_received")?
+        && column_exists(connection, "import_sessions", "file_count")?
+        && column_exists(connection, "import_sessions", "error_message")?)
 }
 
 fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
@@ -637,8 +841,14 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
 
             CREATE TABLE IF NOT EXISTS import_sessions (
                 id TEXT PRIMARY KEY,
-                project_id TEXT,
+                project_id TEXT NOT NULL,
                 status TEXT NOT NULL,
+                staging_path TEXT NOT NULL DEFAULT '',
+                detected_format TEXT,
+                analysis_json TEXT,
+                bytes_received INTEGER NOT NULL DEFAULT 0,
+                file_count INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -670,6 +880,24 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
             "TEXT NOT NULL DEFAULT 'trashed'",
         ),
         ("trashed_projects", "operation_id", "TEXT"),
+        (
+            "import_sessions",
+            "staging_path",
+            "TEXT NOT NULL DEFAULT ''",
+        ),
+        ("import_sessions", "detected_format", "TEXT"),
+        ("import_sessions", "analysis_json", "TEXT"),
+        (
+            "import_sessions",
+            "bytes_received",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "import_sessions",
+            "file_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("import_sessions", "error_message", "TEXT"),
     ] {
         if !column_exists(&transaction, table, column)? {
             transaction
@@ -685,6 +913,13 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
             "UPDATE service_audit
              SET operation_id = 'legacy-' || id
              WHERE operation_id IS NULL OR operation_id = ''",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM import_sessions
+             WHERE project_id IS NULL OR project_id = '' OR staging_path = ''",
             [],
         )
         .map_err(|error| error.to_string())?;
@@ -793,6 +1028,22 @@ fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<b
         }
     }
     Ok(false)
+}
+
+fn import_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImportRecord> {
+    Ok(ImportRecord {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        state: row.get(2)?,
+        staging_path: row.get(3)?,
+        detected_format: row.get(4)?,
+        analysis_json: row.get(5)?,
+        bytes_received: row.get(6)?,
+        file_count: row.get(7)?,
+        error_message: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
 }
 
 fn insert_operation(

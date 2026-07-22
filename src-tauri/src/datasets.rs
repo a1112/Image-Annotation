@@ -3,7 +3,7 @@ use crate::{
     importers::{coco, detect, labelme, voc, voc_adapter, yolo_adapter},
     project_fs, storage,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet},
     fs,
@@ -36,7 +36,7 @@ pub struct BuiltinDataset {
     pub project_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataSourceTreeNode {
     pub name: String,
@@ -46,7 +46,7 @@ pub struct DataSourceTreeNode {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InspectionProblem {
     pub severity: String,
@@ -56,7 +56,7 @@ pub struct InspectionProblem {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataSourceAnalysis {
     pub source_paths: Vec<String>,
@@ -440,6 +440,111 @@ pub fn import_yolo_dataset_into_project(
         &format!("已复制 YOLO 数据集并索引 {} 张图片", project.image_count),
     )?;
     Ok(project)
+}
+
+pub fn import_staged_dataset_into_project(
+    data_root: &Path,
+    project_id: &str,
+    staged_root: &Path,
+    format: &str,
+    import_id: &str,
+) -> Result<(), String> {
+    if !staged_root.is_dir() {
+        return Err("staged dataset directory does not exist".to_string());
+    }
+    let paths = project_fs::workspace_project_paths_from(data_root, project_id);
+    if !paths.root.is_dir() || !paths.manifest.is_file() || !paths.sqlite.is_file() {
+        return Err("target project does not exist".to_string());
+    }
+    let old_manifest: project_fs::ProjectManifest =
+        serde_json::from_slice(&fs::read(&paths.manifest).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    let old_images = storage::read_images(&paths.sqlite, None)?;
+    let old_classes = storage::read_classes(&paths.sqlite)?;
+    let old_source = storage::read_dataset_source(&paths.sqlite)?;
+    let old_mappings = storage::read_image_sources(&paths.sqlite)?;
+
+    let pending = paths.imports.join(format!(".pending-{import_id}"));
+    let backup = paths.imports.join(format!(".backup-{import_id}"));
+    if pending.exists() || backup.exists() {
+        return Err("import publication workspace already exists".to_string());
+    }
+    fs::create_dir_all(&pending).map_err(|error| error.to_string())?;
+    if let Err(error) = copy_dir_contents(staged_root, &pending) {
+        let _ = fs::remove_dir_all(&pending);
+        return Err(error);
+    }
+    analyze_data_source_with_override(&[pending.to_string_lossy().to_string()], Some(format))?;
+
+    fs::rename(&paths.raw, &backup).map_err(|error| error.to_string())?;
+    if let Err(error) = fs::rename(&pending, &paths.raw) {
+        let _ = fs::rename(&backup, &paths.raw);
+        return Err(error.to_string());
+    }
+
+    let publish = (|| {
+        let (images, labels, coco_metadata) = if format == "coco" {
+            let annotation_path = coco::find_annotation_path(&paths.raw)?;
+            let dataset = coco::inspect_dataset(&paths.raw, &annotation_path)?;
+            let labels = dataset
+                .categories
+                .iter()
+                .map(|category| category.label.clone())
+                .collect();
+            (
+                indexed_coco_images(&dataset),
+                labels,
+                Some((annotation_path, dataset)),
+            )
+        } else {
+            (
+                indexed_local_images(&paths.raw, format),
+                local_labels_for_format(&paths.raw, format),
+                None,
+            )
+        };
+        if images.is_empty() {
+            return Err("staged dataset does not contain importable images".to_string());
+        }
+        let classes = classes_from_labels(labels);
+        let mut manifest = old_manifest.clone();
+        manifest.source_dataset_key = "remote-upload".to_string();
+        manifest.format = format.to_string();
+        manifest.root_path = paths.root.to_string_lossy().to_string();
+        manifest.image_count = images.len() as u32;
+        manifest.class_count = classes.len() as u32;
+        project_fs::write_manifest_to_path(&manifest, &paths.manifest)?;
+        storage::upsert_project_index(&paths.sqlite, &manifest, &images, &classes)?;
+        persist_copied_source_mappings(
+            &paths.sqlite,
+            &paths.raw,
+            format,
+            &images,
+            coco_metadata.as_ref(),
+        )?;
+        storage::record_import(
+            &paths.sqlite,
+            import_id,
+            "completed",
+            &format!("remote import published {} images", images.len()),
+        )?;
+        Ok(())
+    })();
+
+    if let Err(error) = publish {
+        let _ = fs::remove_dir_all(&paths.raw);
+        let _ = fs::rename(&backup, &paths.raw);
+        let _ = project_fs::write_manifest_to_path(&old_manifest, &paths.manifest);
+        let _ =
+            storage::upsert_project_index(&paths.sqlite, &old_manifest, &old_images, &old_classes);
+        if let Some(source) = old_source {
+            let _ = storage::write_dataset_source(&paths.sqlite, &source);
+        }
+        let _ = storage::replace_image_sources(&paths.sqlite, &old_mappings);
+        return Err(error);
+    }
+    let _ = fs::remove_dir_all(&backup);
+    Ok(())
 }
 
 pub fn import_files_into_project(
@@ -1176,6 +1281,86 @@ fn persist_local_source_mappings(
                         .to_string_lossy()
                         .replace('\\', "/"),
                 ),
+                source_version,
+            }
+        })
+        .collect::<Vec<_>>();
+    storage::replace_image_sources(sqlite, &mappings)
+}
+
+fn persist_copied_source_mappings(
+    sqlite: &Path,
+    root: &Path,
+    format: &str,
+    images: &[storage::StoredImage],
+    coco_metadata: Option<&(PathBuf, coco::CocoDataset)>,
+) -> Result<(), String> {
+    let relative_coco_annotation = coco_metadata.map(|(path, _)| {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    });
+    storage::write_dataset_source(
+        sqlite,
+        &storage::StoredDatasetSource {
+            format: format.to_string(),
+            mode: "copied".to_string(),
+            root_path: root.to_string_lossy().to_string(),
+            annotation_path: relative_coco_annotation.clone(),
+            options_json: "{}".to_string(),
+        },
+    )?;
+    let external_ids = coco_metadata
+        .map(|(_, dataset)| {
+            dataset
+                .images
+                .iter()
+                .map(|image| {
+                    (
+                        image.file_name.replace('\\', "/"),
+                        image.external_id.clone(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let mappings = images
+        .iter()
+        .map(|image| {
+            let image_path = root.join(&image.file_name);
+            let annotation_path = match format {
+                "voc-detect" => Some(voc_adapter::annotation_path(root, &image_path)),
+                "yolo-detect" | "yolo-seg" => {
+                    Some(yolo_adapter::annotation_path(root, &image_path))
+                }
+                "labelme" => Some(labelme::annotation_path(root, &image_path)),
+                "coco" => None,
+                _ => None,
+            };
+            let source_version = match format {
+                "voc-detect" => voc_adapter::current_source_version(root, &image_path),
+                "yolo-detect" | "yolo-seg" => {
+                    yolo_adapter::current_source_version(root, &image_path)
+                }
+                "labelme" => labelme::current_source_version(root, &image_path),
+                "coco" => coco_metadata
+                    .map(|(_, dataset)| dataset.source_version.clone())
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            storage::StoredImageSource {
+                image_id: image.id.clone(),
+                relative_path: image.file_name.clone(),
+                external_id: external_ids.get(&image.file_name).cloned(),
+                annotation_path: relative_coco_annotation.clone().or_else(|| {
+                    annotation_path.map(|path| {
+                        path.strip_prefix(root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    })
+                }),
                 source_version,
             }
         })

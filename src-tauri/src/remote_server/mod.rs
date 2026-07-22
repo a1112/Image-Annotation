@@ -2,6 +2,7 @@ mod annotations;
 mod auth;
 mod config;
 mod error;
+mod imports;
 mod projects;
 mod samples;
 mod service;
@@ -71,6 +72,7 @@ pub fn build_router_with_private_routes(
 
     let authenticator = Arc::new(TokenAuthenticator::from_config(&config));
     let service = RemoteSampleService::initialize(&config)?;
+    let max_upload_bytes = config.max_upload_bytes;
     let private_route_groups = private_route_groups
         .with_reader(with_api_body_limit(projects::reader_routes(
             service.clone(),
@@ -79,10 +81,12 @@ pub fn build_router_with_private_routes(
         .with_reader(with_api_body_limit(annotations::reader_routes(
             service.clone(),
         )))
+        .with_reader(with_api_body_limit(imports::reader_routes(service.clone())))
         .with_editor(with_api_body_limit(samples::editor_routes(service.clone())))
         .with_editor(with_api_body_limit(annotations::editor_routes(
             service.clone(),
         )))
+        .with_editor(imports::editor_routes(service.clone(), max_upload_bytes))
         .with_admin(with_api_body_limit(projects::admin_routes(service)));
     let private_routes = protect_private_route_groups(private_route_groups);
     let routes = Router::new()
@@ -137,7 +141,10 @@ fn with_api_body_limit(router: Router) -> Router {
         ))
 }
 
-pub fn with_upload_body_limit(router: Router, max_upload_bytes: usize) -> Router {
+pub fn with_upload_body_limit<S>(router: Router<S>, max_upload_bytes: usize) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     let extractor_limit = max_upload_bytes.saturating_add(MULTIPART_FRAMING_ALLOWANCE_BYTES);
     router.layer(DefaultBodyLimit::max(extractor_limit))
 }

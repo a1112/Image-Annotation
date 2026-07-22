@@ -42,7 +42,8 @@ use super::{
     config::ServerConfig,
     error::ServerBuildError,
     storage::{
-        AuditEntry, AuditOperation, OperationRecord, ServerStorage, TrashRecord, TrashState,
+        AuditEntry, AuditOperation, ImportRecord, OperationRecord, ServerStorage, TrashRecord,
+        TrashState,
     },
     Role,
 };
@@ -63,6 +64,7 @@ static PROJECT_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static DATA_ROOT_LEASES: OnceLock<Mutex<HashMap<PathBuf, Weak<DataRootLease>>>> = OnceLock::new();
 static CREATE_OWNERSHIP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static ANNOTATION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static IMPORT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 struct DataRootLease {
@@ -302,6 +304,33 @@ pub(super) struct SamplePage {
     items: Vec<SampleView>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct ImportUploadTarget {
+    pub id: String,
+    pub payload_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ImportView {
+    id: String,
+    project_id: String,
+    state: String,
+    detected_format: Option<String>,
+    image_count: u32,
+    annotation_count: u32,
+    class_count: u32,
+    classes: Vec<String>,
+    warnings: Vec<String>,
+    problems: Vec<datasets::InspectionProblem>,
+    tree: Vec<datasets::DataSourceTreeNode>,
+    bytes_received: u64,
+    file_count: u32,
+    error_message: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
 #[derive(Debug)]
 pub(super) enum AssetSource {
     Bytes(Vec<u8>),
@@ -424,6 +453,9 @@ impl RemoteSampleService {
         service
             .repair_project_manifests()
             .map_err(|_| ServerBuildError::initialization_failed())?;
+        service
+            .reconcile_import_sessions()
+            .map_err(|_| ServerBuildError::initialization_failed())?;
         Ok(service)
     }
 
@@ -438,6 +470,201 @@ impl RemoteSampleService {
             self.apply_description(project)?;
         }
         Ok(projects)
+    }
+
+    pub(super) fn begin_import(
+        &self,
+        project_id: &str,
+    ) -> Result<ImportUploadTarget, ServiceError> {
+        self.ensure_configured_root()?;
+        validate_project_id(project_id)?;
+        let _mutation_guard = mutation_guard();
+        let project_dir = self
+            .existing_project_dir(self.projects_dir.as_ref(), project_id)?
+            .ok_or(ServiceError::NotFound)?;
+        self.ensure_project_manifest(&project_dir, true)?;
+
+        let sequence = IMPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let id = format!(
+            "import-{}-{sequence}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(storage_failure)?
+                .as_millis()
+        );
+        let relative = PathBuf::from("staging").join("imports").join(&id);
+        let session_dir = self.data_dir.join(&relative);
+        let payload_dir = session_dir.join("payload");
+        fs::create_dir_all(&payload_dir).map_err(storage_failure)?;
+        let now = import_now_string();
+        let record = ImportRecord {
+            id: id.clone(),
+            project_id: project_id.to_string(),
+            state: "staged".to_string(),
+            staging_path: relative.to_string_lossy().replace('\\', "/"),
+            detected_format: None,
+            analysis_json: None,
+            bytes_received: 0,
+            file_count: 0,
+            error_message: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        if let Err(error) = self.storage.create_import(&record) {
+            let _ = fs::remove_dir_all(&session_dir);
+            return Err(storage_failure(error));
+        }
+        Ok(ImportUploadTarget { id, payload_dir })
+    }
+
+    pub(super) fn analyze_import(
+        &self,
+        import_id: &str,
+        bytes_received: u64,
+        file_count: u32,
+    ) -> Result<ImportView, ServiceError> {
+        let record = self.import_record(import_id)?;
+        if record.state != "staged" {
+            return Err(ServiceError::Conflict);
+        }
+        let payload_dir = self.import_payload_dir(&record)?;
+        let source = payload_dir.to_string_lossy().to_string();
+        let analysis = datasets::analyze_data_source_with_override(&[source], None)
+            .map_err(|_| ServiceError::Validation)?;
+        let analysis_json = serde_json::to_string(&analysis).map_err(storage_failure)?;
+        self.storage
+            .finish_import_analysis(
+                import_id,
+                &analysis.detected_format,
+                &analysis_json,
+                bytes_received,
+                file_count,
+            )
+            .map_err(storage_failure)?;
+        self.get_import(import_id)
+    }
+
+    pub(super) fn fail_import(&self, import_id: &str, message: &str) {
+        let _ = self.storage.fail_import(import_id, message);
+    }
+
+    pub(super) fn get_import(&self, import_id: &str) -> Result<ImportView, ServiceError> {
+        let record = self.import_record(import_id)?;
+        import_view(record)
+    }
+
+    pub(super) fn commit_import(
+        &self,
+        import_id: &str,
+        format: &str,
+    ) -> Result<ImportView, ServiceError> {
+        validate_import_format(format)?;
+        let _mutation_guard = mutation_guard();
+        let record = self.import_record(import_id)?;
+        if record.state != "analyzed" {
+            return Err(ServiceError::Conflict);
+        }
+        self.existing_project_dir(self.projects_dir.as_ref(), &record.project_id)?
+            .ok_or(ServiceError::NotFound)?;
+        let payload_dir = self.import_payload_dir(&record)?;
+        self.storage
+            .begin_import_commit(import_id)
+            .map_err(storage_failure)?;
+        let result = datasets::import_staged_dataset_into_project(
+            self.data_dir.as_ref(),
+            &record.project_id,
+            &payload_dir,
+            format,
+            import_id,
+        );
+        match result {
+            Ok(()) => {
+                self.storage
+                    .complete_import(import_id)
+                    .map_err(storage_failure)?;
+                let _ = fs::remove_dir_all(self.import_session_dir(&record)?);
+                self.get_import(import_id)
+            }
+            Err(message) => {
+                let _ = self.storage.fail_import(import_id, &message);
+                Err(ServiceError::Storage)
+            }
+        }
+    }
+
+    pub(super) fn cancel_import(&self, import_id: &str) -> Result<ImportView, ServiceError> {
+        let _mutation_guard = mutation_guard();
+        let record = self.import_record(import_id)?;
+        self.storage
+            .cancel_import(import_id)
+            .map_err(|_| ServiceError::Conflict)?;
+        let session_dir = self.import_session_dir(&record)?;
+        match fs::remove_dir_all(&session_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(storage_failure(error)),
+        }
+        self.get_import(import_id)
+    }
+
+    fn import_record(&self, import_id: &str) -> Result<ImportRecord, ServiceError> {
+        validate_import_id(import_id)?;
+        self.storage
+            .import(import_id)
+            .map_err(storage_failure)?
+            .ok_or(ServiceError::NotFound)
+    }
+
+    fn import_session_dir(&self, record: &ImportRecord) -> Result<PathBuf, ServiceError> {
+        let expected = PathBuf::from("staging").join("imports").join(&record.id);
+        if Path::new(&record.staging_path) != expected.as_path() {
+            return Err(ServiceError::Storage);
+        }
+        Ok(self.data_dir.join(expected))
+    }
+
+    fn import_payload_dir(&self, record: &ImportRecord) -> Result<PathBuf, ServiceError> {
+        Ok(self.import_session_dir(record)?.join("payload"))
+    }
+
+    fn reconcile_import_sessions(&self) -> Result<(), ServiceError> {
+        for record in self.storage.imports().map_err(storage_failure)? {
+            let session_dir = self.import_session_dir(&record)?;
+            match record.state.as_str() {
+                "committing" if self.project_import_was_published(&record)? => {
+                    self.storage
+                        .complete_import(&record.id)
+                        .map_err(storage_failure)?;
+                    let _ = fs::remove_dir_all(&session_dir);
+                }
+                "staged" | "analyzed" | "committing" => {
+                    self.storage
+                        .fail_import(&record.id, "server restarted before import completed")
+                        .map_err(storage_failure)?;
+                }
+                "completed" | "cancelled" => match fs::remove_dir_all(&session_dir) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(storage_failure(error)),
+                },
+                "failed" => {}
+                _ => return Err(ServiceError::Storage),
+            }
+        }
+        Ok(())
+    }
+
+    fn project_import_was_published(&self, record: &ImportRecord) -> Result<bool, ServiceError> {
+        let project_dir =
+            match self.existing_project_dir(self.projects_dir.as_ref(), &record.project_id)? {
+                Some(path) => path,
+                None => return Ok(false),
+            };
+        let records = project_storage::list_import_records(&project_dir.join("project.sqlite"))
+            .map_err(storage_failure)?;
+        Ok(records
+            .iter()
+            .any(|item| item.source_path == record.id && item.status == "completed"))
     }
 
     pub(super) fn get_project(&self, project_id: &str) -> Result<DatasetProject, ServiceError> {
@@ -2513,10 +2740,19 @@ impl RemoteSampleService {
             .and_then(|name| name.to_str())
             .ok_or(ServiceError::Storage)?;
         if manifest.id != project_id
-            || manifest.source_dataset_key != "local-demo"
+            || !matches!(
+                manifest.source_dataset_key.as_str(),
+                "local-demo" | "remote-upload"
+            )
             || !matches!(
                 manifest.format.as_str(),
-                "yolo-detect" | "yolo-seg" | "voc-detect" | "labelme" | "image-classification"
+                "yolo-detect"
+                    | "yolo-seg"
+                    | "voc-detect"
+                    | "labelme"
+                    | "coco"
+                    | "image-directory"
+                    | "image-classification"
             )
         {
             return Err(ServiceError::Storage);
@@ -4850,6 +5086,72 @@ fn validate_project_id(project_id: &str) -> Result<(), ServiceError> {
     } else {
         Err(ServiceError::Validation)
     }
+}
+
+fn validate_import_id(import_id: &str) -> Result<(), ServiceError> {
+    if import_id.starts_with("import-")
+        && import_id.len() <= 96
+        && import_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        Ok(())
+    } else {
+        Err(ServiceError::Validation)
+    }
+}
+
+fn validate_import_format(format: &str) -> Result<(), ServiceError> {
+    if matches!(
+        format,
+        "voc-detect" | "yolo-detect" | "yolo-seg" | "coco" | "labelme" | "image-directory"
+    ) {
+        Ok(())
+    } else {
+        Err(ServiceError::Validation)
+    }
+}
+
+fn import_now_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+fn import_view(record: ImportRecord) -> Result<ImportView, ServiceError> {
+    let analysis = record
+        .analysis_json
+        .as_deref()
+        .map(serde_json::from_str::<datasets::DataSourceAnalysis>)
+        .transpose()
+        .map_err(storage_failure)?;
+    Ok(ImportView {
+        id: record.id,
+        project_id: record.project_id,
+        state: record.state,
+        detected_format: record.detected_format,
+        image_count: analysis.as_ref().map_or(0, |value| value.image_count),
+        annotation_count: analysis.as_ref().map_or(0, |value| value.annotation_count),
+        class_count: analysis.as_ref().map_or(0, |value| value.class_count),
+        classes: analysis
+            .as_ref()
+            .map_or_else(Vec::new, |value| value.classes.clone()),
+        warnings: analysis
+            .as_ref()
+            .map_or_else(Vec::new, |value| value.warnings.clone()),
+        problems: analysis
+            .as_ref()
+            .map_or_else(Vec::new, |value| value.problems.clone()),
+        tree: analysis
+            .as_ref()
+            .map_or_else(Vec::new, |value| value.tree.clone()),
+        bytes_received: record.bytes_received,
+        file_count: record.file_count,
+        error_message: record.error_message,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    })
 }
 
 fn validate_project_name(name: &str) -> Result<&str, ServiceError> {

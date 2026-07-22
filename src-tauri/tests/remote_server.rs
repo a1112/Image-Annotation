@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     future::Future,
+    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
@@ -1395,6 +1396,34 @@ fn multipart_body(boundary: &str, payload_bytes: usize) -> Vec<u8> {
     body.extend(std::iter::repeat_n(b'x', payload_bytes));
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     body
+}
+
+fn dataset_multipart_body(boundary: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (name, bytes) in files {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+fn zip_fixture(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let output = std::io::Cursor::new(Vec::new());
+    let mut archive = zip::ZipWriter::new(output);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, bytes) in entries {
+        archive.start_file(*name, options).unwrap();
+        archive.write_all(bytes).unwrap();
+    }
+    archive.finish().unwrap().into_inner()
 }
 
 #[test]
@@ -5465,6 +5494,515 @@ async fn upload_limit_leaves_room_for_multipart_framing() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn dataset_import_is_analyzed_before_explicit_commit_and_can_be_cancelled() {
+    const BOUNDARY: &str = "remote-dataset-import-boundary";
+    let (name, project_id) = unique_project("Remote dataset import");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_empty_project(&app, &name, &project_id).await;
+
+    let png = png_fixture_bytes([31, 127, 223]);
+    let yaml = b"path: .\ntrain: images/train\nnames:\n  0: object\n";
+    let label = b"0 0.5 0.5 0.4 0.4\n";
+    let upload_body = dataset_multipart_body(
+        BOUNDARY,
+        &[
+            ("images/train/sample.png", png.as_slice()),
+            ("labels/train/sample.txt", label),
+            ("data.yaml", yaml),
+        ],
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/projects/{project_id}/imports"))
+                .header(header::AUTHORIZATION, format!("Bearer {EDITOR_TOKEN}"))
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .body(Body::from(upload_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let upload_status = response.status();
+    let upload_headers = response.headers().clone();
+    let upload: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(upload_status, StatusCode::CREATED, "{upload}");
+    assert_request_id(&upload_headers, &upload);
+    assert_eq!(upload["data"]["state"], "analyzed");
+    assert_eq!(upload["data"]["detectedFormat"], "yolo-detect");
+    assert_eq!(upload["data"]["imageCount"], 1);
+    assert_eq!(upload["data"]["annotationCount"], 1);
+    assert!(!upload["data"]["tree"].as_array().unwrap().is_empty());
+    assert!(!upload["data"]["tree"][0]["children"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let import_id = upload["data"]["id"].as_str().unwrap();
+    assert!(data_dir
+        .join("staging")
+        .join("imports")
+        .join(import_id)
+        .join("payload")
+        .is_dir());
+
+    let (before_status, _, before) = router_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}/samples"),
+        READER_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(before_status, StatusCode::OK, "{before}");
+    assert_eq!(before["data"]["total"], 0);
+
+    let (get_status, _, fetched) = router_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/imports/{import_id}"),
+        READER_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(get_status, StatusCode::OK, "{fetched}");
+    assert_eq!(fetched["data"]["state"], "analyzed");
+
+    let (commit_status, _, committed) = router_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/imports/{import_id}/commit"),
+        EDITOR_TOKEN,
+        Some(serde_json::json!({ "format": "yolo-detect" })),
+    )
+    .await;
+    assert_eq!(commit_status, StatusCode::OK, "{committed}");
+    assert_eq!(committed["data"]["state"], "completed");
+    assert_eq!(committed["data"]["imageCount"], 1);
+
+    let (after_status, _, after) = router_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}/samples"),
+        READER_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(after_status, StatusCode::OK, "{after}");
+    assert_eq!(after["data"]["total"], 1);
+
+    let cancel_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/projects/{project_id}/imports"))
+                .header(header::AUTHORIZATION, format!("Bearer {EDITOR_TOKEN}"))
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .body(Body::from(upload_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let pending: Value = serde_json::from_slice(
+        &cancel_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    let cancelled_id = pending["data"]["id"].as_str().unwrap();
+    let (cancel_status, _, cancelled) = router_request(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/imports/{cancelled_id}"),
+        EDITOR_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(cancel_status, StatusCode::OK, "{cancelled}");
+    assert_eq!(cancelled["data"]["state"], "cancelled");
+    assert!(!data_dir
+        .join("staging")
+        .join("imports")
+        .join(cancelled_id)
+        .exists());
+}
+
+#[tokio::test]
+async fn dataset_import_rejects_parent_traversal_without_writing_outside_payload() {
+    const BOUNDARY: &str = "remote-import-traversal-boundary";
+    let (name, project_id) = unique_project("Remote import traversal");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_empty_project(&app, &name, &project_id).await;
+    let png = png_fixture_bytes([220, 32, 64]);
+    let body = dataset_multipart_body(BOUNDARY, &[("../escape.png", png.as_slice())]);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/projects/{project_id}/imports"))
+                .header(header::AUTHORIZATION, format!("Bearer {EDITOR_TOKEN}"))
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let response_body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response_body}");
+    assert_eq!(response_body["error"]["code"], "validation");
+    assert!(!data_dir
+        .join("staging")
+        .join("imports")
+        .join("escape.png")
+        .exists());
+    assert!(!data_dir.join("staging").join("escape.png").exists());
+}
+
+#[tokio::test]
+async fn dataset_import_never_accepts_server_paths_or_disallowed_extensions() {
+    const BOUNDARY: &str = "remote-import-invalid-source-boundary";
+    let (name, project_id) = unique_project("Remote import invalid source");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_empty_project(&app, &name, &project_id).await;
+
+    let (path_status, _, path_response) = router_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/imports"),
+        EDITOR_TOKEN,
+        Some(serde_json::json!({
+            "path": "L:\\data_tool\\datas\\lg\\1580_2d\\train"
+        })),
+    )
+    .await;
+    assert_eq!(path_status, StatusCode::BAD_REQUEST, "{path_response}");
+    assert_eq!(path_response["error"]["code"], "validation");
+
+    let body = dataset_multipart_body(BOUNDARY, &[("payload.exe", b"not allowed")]);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/projects/{project_id}/imports"))
+                .header(header::AUTHORIZATION, format!("Bearer {EDITOR_TOKEN}"))
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let response_body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response_body}");
+    assert_eq!(response_body["error"]["code"], "validation");
+    assert!(!data_dir.join("payload.exe").exists());
+}
+
+#[tokio::test]
+async fn dataset_import_enforces_limit_against_decompressed_zip_bytes() {
+    const BOUNDARY: &str = "remote-import-zip-limit-boundary";
+    let (name, project_id) = unique_project("Remote import zip limit");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    config.max_upload_bytes = 1_024;
+    let app = build_router(config).unwrap();
+    create_empty_project(&app, &name, &project_id).await;
+    let expanded = vec![b'x'; 4_096];
+    let archive = zip_fixture(&[("labels/train/large.txt", expanded.as_slice())]);
+    assert!(
+        archive.len() < 1_024,
+        "fixture must exercise decompression limit"
+    );
+    let body = dataset_multipart_body(BOUNDARY, &[("dataset.zip", archive.as_slice())]);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/projects/{project_id}/imports"))
+                .header(header::AUTHORIZATION, format!("Bearer {EDITOR_TOKEN}"))
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let response_body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{response_body}");
+    assert_eq!(response_body["error"]["code"], "payload_too_large");
+}
+
+#[tokio::test]
+async fn dataset_import_rejects_parent_traversal_inside_zip() {
+    const BOUNDARY: &str = "remote-import-zip-traversal-boundary";
+    let (name, project_id) = unique_project("Remote import zip traversal");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config).unwrap();
+    create_empty_project(&app, &name, &project_id).await;
+    let archive = zip_fixture(&[("../escape.txt", b"outside")]);
+    let body = dataset_multipart_body(BOUNDARY, &[("dataset.zip", archive.as_slice())]);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/projects/{project_id}/imports"))
+                .header(header::AUTHORIZATION, format!("Bearer {EDITOR_TOKEN}"))
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let response_body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response_body}");
+    assert_eq!(response_body["error"]["code"], "validation");
+    assert!(!data_dir
+        .join("staging")
+        .join("imports")
+        .join("escape.txt")
+        .exists());
+}
+
+#[tokio::test]
+async fn remote_import_flow_indexes_voc_labelme_and_coco_datasets() {
+    let png = png_fixture_bytes([72, 104, 184]);
+    let voc = br#"<annotation><filename>sample.png</filename><size><width>8</width><height>8</height><depth>3</depth></size><object><name>defect</name><bndbox><xmin>1</xmin><ymin>1</ymin><xmax>6</xmax><ymax>6</ymax></bndbox></object></annotation>"#.to_vec();
+    let labelme = serde_json::to_vec(&serde_json::json!({
+        "version": "5.4.1",
+        "flags": {},
+        "shapes": [{
+            "label": "defect",
+            "points": [[1.0, 1.0], [6.0, 6.0]],
+            "group_id": null,
+            "shape_type": "rectangle",
+            "flags": {}
+        }],
+        "imagePath": "sample.png",
+        "imageData": null,
+        "imageHeight": 8,
+        "imageWidth": 8
+    }))
+    .unwrap();
+    let coco = serde_json::to_vec(&serde_json::json!({
+        "images": [{"id": 1, "file_name": "images/sample.png", "width": 8, "height": 8}],
+        "categories": [{"id": 1, "name": "defect"}],
+        "annotations": [{
+            "id": 1,
+            "image_id": 1,
+            "category_id": 1,
+            "bbox": [1.0, 1.0, 5.0, 5.0],
+            "area": 25.0,
+            "iscrowd": 0
+        }]
+    }))
+    .unwrap();
+    let cases = [
+        (
+            "voc-detect",
+            vec![("sample.png", png.clone()), ("sample.xml", voc)],
+        ),
+        (
+            "labelme",
+            vec![("sample.png", png.clone()), ("sample.json", labelme)],
+        ),
+        (
+            "coco",
+            vec![
+                ("images/sample.png", png),
+                ("annotations/instances.json", coco),
+            ],
+        ),
+    ];
+
+    for (index, (format, files)) in cases.into_iter().enumerate() {
+        let (name, project_id) = unique_project(&format!("Remote {format} import"));
+        let mut config = test_config(Ipv4Addr::LOCALHOST);
+        config.reader_token = Some(READER_TOKEN.to_string());
+        config.editor_token = Some(EDITOR_TOKEN.to_string());
+        config.admin_token = Some(ADMIN_TOKEN.to_string());
+        let app = build_router(config).unwrap();
+        create_empty_project(&app, &name, &project_id).await;
+        let boundary = format!("remote-format-import-boundary-{index}");
+        let file_refs = files
+            .iter()
+            .map(|(path, bytes)| (*path, bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let body = dataset_multipart_body(&boundary, &file_refs);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/projects/{project_id}/imports"))
+                    .header(header::AUTHORIZATION, format!("Bearer {EDITOR_TOKEN}"))
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let upload_status = response.status();
+        let uploaded: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(upload_status, StatusCode::CREATED, "{format}: {uploaded}");
+        assert_eq!(uploaded["data"]["detectedFormat"], format);
+        assert_eq!(uploaded["data"]["imageCount"], 1);
+        assert_eq!(uploaded["data"]["annotationCount"], 1);
+        let import_id = uploaded["data"]["id"].as_str().unwrap();
+
+        let (commit_status, _, committed) = router_request(
+            &app,
+            Method::POST,
+            &format!("/api/v1/imports/{import_id}/commit"),
+            EDITOR_TOKEN,
+            Some(serde_json::json!({ "format": format })),
+        )
+        .await;
+        assert_eq!(commit_status, StatusCode::OK, "{format}: {committed}");
+        let (sample_status, _, samples) = router_request(
+            &app,
+            Method::GET,
+            &format!("/api/v1/projects/{project_id}/samples"),
+            READER_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(sample_status, StatusCode::OK, "{format}: {samples}");
+        assert_eq!(samples["data"]["total"], 1, "{format}: {samples}");
+    }
+}
+
+#[tokio::test]
+async fn analyzed_import_becomes_inspectable_failed_session_after_restart() {
+    const BOUNDARY: &str = "remote-import-restart-boundary";
+    let (name, project_id) = unique_project("Remote import restart");
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.editor_token = Some(EDITOR_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let data_dir = config.data_dir.clone();
+    let app = build_router(config.clone()).unwrap();
+    create_empty_project(&app, &name, &project_id).await;
+    let png = png_fixture_bytes([30, 180, 90]);
+    let body = dataset_multipart_body(
+        BOUNDARY,
+        &[
+            ("images/train/restart.png", png.as_slice()),
+            ("labels/train/restart.txt", b"0 0.5 0.5 0.2 0.2\n"),
+            ("data.yaml", b"names:\n  0: object\n"),
+        ],
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/projects/{project_id}/imports"))
+                .header(header::AUTHORIZATION, format!("Bearer {EDITOR_TOKEN}"))
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let uploaded: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let import_id = uploaded["data"]["id"].as_str().unwrap().to_string();
+    let staging_dir = data_dir.join("staging").join("imports").join(&import_id);
+    assert!(staging_dir.is_dir());
+    drop(app);
+
+    let restarted = build_router(config).expect("stale import must not block restart");
+    let (get_status, _, fetched) = router_request(
+        &restarted,
+        Method::GET,
+        &format!("/api/v1/imports/{import_id}"),
+        READER_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(get_status, StatusCode::OK, "{fetched}");
+    assert_eq!(fetched["data"]["state"], "failed");
+    assert!(fetched["data"]["errorMessage"]
+        .as_str()
+        .unwrap()
+        .contains("restarted"));
+    assert!(staging_dir.is_dir(), "failed staging remains inspectable");
+
+    let (cancel_status, _, cancelled) = router_request(
+        &restarted,
+        Method::DELETE,
+        &format!("/api/v1/imports/{import_id}"),
+        EDITOR_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(cancel_status, StatusCode::OK, "{cancelled}");
+    assert_eq!(cancelled["data"]["state"], "cancelled");
+    assert!(!staging_dir.exists());
 }
 
 #[tokio::test]
