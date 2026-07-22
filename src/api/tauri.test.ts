@@ -2,13 +2,18 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
+  BackendRevisionConflictError,
   detectBackendConnection,
   getFileAssetUrl,
   listClassSamples,
   listDatasetProjects,
   openAnnotationWindow,
   syncDatasetSource,
+  saveImageAnnotations,
+  uploadRemoteImport,
+  commitRemoteImport,
 } from "./tauri";
+import { connectRemoteBackend, disconnectRemoteBackend } from "./backend-profile";
 import { invoke } from "@tauri-apps/api/core";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -20,8 +25,135 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 describe("backend fallback", () => {
   beforeEach(() => {
+    disconnectRemoteBackend();
     vi.clearAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it("远程 profile 使用 REST、Bearer token 与远程资源地址", async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const createObjectUrl = vi.fn(() => "blob:remote-image");
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: createObjectUrl,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        requests.push({ url, init });
+        if (url.endsWith("/session")) {
+          return new Response(JSON.stringify({ ok: true, data: { role: "reader" } }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (url.endsWith("/projects")) {
+          return new Response(JSON.stringify({ ok: true, data: [] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response("asset", { status: 200 });
+      }),
+    );
+    await connectRemoteBackend("https://samples.example.com", "reader-token");
+
+    expect(await listDatasetProjects()).toEqual([]);
+    expect(await getFileAssetUrl("project one", "image/1")).toBe("blob:remote-image");
+    expect(requests[1].url).toBe("https://samples.example.com/api/v1/projects");
+    expect(new Headers(requests[1].init?.headers).get("Authorization")).toBe(
+      "Bearer reader-token",
+    );
+    expect(requests[2].url).toBe(
+      "https://samples.example.com/api/v1/projects/project%20one/samples/image%2F1/content",
+    );
+    expect(new Headers(requests[2].init?.headers).get("Authorization")).toBe(
+      "Bearer reader-token",
+    );
+    expect(invoke).not.toHaveBeenCalledWith("list_dataset_projects");
+  });
+
+  it("远程注释版本冲突转换为专用错误", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (url.endsWith("/session")) {
+          return new Response(JSON.stringify({ ok: true, data: { role: "editor" } }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            error: { code: "revision_conflict", message: "annotation revision has changed" },
+            requestId: "request-conflict",
+          }),
+          { status: 409, headers: { "Content-Type": "application/json" } },
+        );
+      }),
+    );
+    await connectRemoteBackend("https://samples.example.com", "editor-token");
+
+    await expect(saveImageAnnotations("project", "sample", "revision-1", [])).rejects.toBeInstanceOf(
+      BackendRevisionConflictError,
+    );
+  });
+
+  it("远程导入使用 multipart 分析并显式确认格式", async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        requests.push({ url, init });
+        if (url.endsWith("/session")) {
+          return new Response(JSON.stringify({ ok: true, data: { role: "editor" } }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            data: {
+              id: "import-1",
+              projectId: "project-1",
+              state: url.endsWith("/commit") ? "completed" : "analyzed",
+              detectedFormat: "yolo-detect",
+              imageCount: 1,
+              annotationCount: 1,
+              classCount: 1,
+              classes: ["object"],
+              warnings: [],
+              problems: [],
+              tree: [],
+              bytesReceived: 12,
+              fileCount: 2,
+              errorMessage: null,
+              createdAt: "now",
+              updatedAt: "now",
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }),
+    );
+    await connectRemoteBackend("https://samples.example.com", "editor-token");
+    const image = new File(["image"], "sample.png", { type: "image/png" });
+
+    const analyzed = await uploadRemoteImport("project-1", [image]);
+    const committed = await commitRemoteImport(analyzed.id, "yolo-detect");
+
+    expect(requests[1].url).toBe(
+      "https://samples.example.com/api/v1/projects/project-1/imports",
+    );
+    expect(requests[1].init?.body).toBeInstanceOf(FormData);
+    expect(new Headers(requests[1].init?.headers).has("Content-Type")).toBe(false);
+    expect(requests[2].url).toBe(
+      "https://samples.example.com/api/v1/imports/import-1/commit",
+    );
+    expect(JSON.parse(String(requests[2].init?.body))).toEqual({ format: "yolo-detect" });
+    expect(committed.state).toBe("completed");
   });
 
   it("按类别样本查询调用真实后端命令", async () => {

@@ -245,3 +245,22 @@ export type ProjectManifest = {
   classCount: number;
   imageCount: number;
 };
+
+export type RemoteImport = {
+  id: string;
+  projectId: string;
+  state: string;
+  detectedFormat: DatasetFormat | "unknown" | null;
+  imageCount: number;
+  annotationCount: number;
+  classCount: number;
+  classes: string[];
+  warnings: string[];
+  problems: InspectionProblem[];
+  tree: DataSourceTreeNode[];
+  bytesReceived: number;
+  fileCount: number;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+};

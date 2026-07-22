@@ -65,8 +65,17 @@ import {
   saveImageAnnotations,
   submitImageAnnotations,
   syncDatasetSource,
+  uploadRemoteImport,
+  commitRemoteImport,
+  cancelRemoteImport,
 } from "./api/tauri";
 import type { BackendConnection } from "./api/tauri";
+import {
+  connectRemoteBackend,
+  disconnectRemoteBackend,
+  getBackendProfile,
+} from "./api/backend-profile";
+import type { BackendProfile } from "./api/backend-profile";
 import type {
   AnnotationObject,
   BackendTask,
@@ -82,6 +91,7 @@ import type {
   DataSourceTreeNode,
   ExportOptions,
   ProjectDetail,
+  RemoteImport,
 } from "./types/domain";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -188,10 +198,13 @@ function useImageAssetUrls(projectId: string | undefined, images: DatasetImage[]
     }
 
     let cancelled = false;
+    const objectUrls: string[] = [];
     Promise.all(
       images.slice(0, limit).map(async (image) => {
         try {
-          return [image.id, await getFileAssetUrl(projectId, image.id)] as const;
+          const url = await getFileAssetUrl(projectId, image.id);
+          if (url.startsWith("blob:")) objectUrls.push(url);
+          return [image.id, url] as const;
         } catch {
           return null;
         }
@@ -204,6 +217,9 @@ function useImageAssetUrls(projectId: string | undefined, images: DatasetImage[]
 
     return () => {
       cancelled = true;
+      if (typeof URL.revokeObjectURL === "function") {
+        objectUrls.forEach((url) => URL.revokeObjectURL(url));
+      }
     };
   }, [projectId, images, limit]);
 
@@ -575,12 +591,14 @@ function DatasetCard({
   onOpen,
   onAnnotate,
   onOpenWindow,
+  allowDesktopWindow,
 }: {
   dataset: DatasetProject;
   previewImages: DatasetImage[];
   onOpen: () => void;
   onAnnotate: () => void;
   onOpenWindow: () => void;
+  allowDesktopWindow: boolean;
 }) {
   const previewUrls = useImageAssetUrls(dataset.id, previewImages, 3);
 
@@ -659,9 +677,11 @@ function DatasetCard({
           <button type="button" onClick={onAnnotate}>
             标注
           </button>
-          <button type="button" onClick={onOpenWindow}>
-            独立窗口标注
-          </button>
+          {allowDesktopWindow ? (
+            <button type="button" onClick={onOpenWindow}>
+              独立窗口标注
+            </button>
+          ) : null}
         </div>
       </div>
     </article>
@@ -725,6 +745,9 @@ function TopBar({
   onProjectTab: (projectId: string, tab: ProjectTab) => void;
 }) {
   const showWindowControls = backendConnection.mode === "tauri";
+  const isRemote = backendConnection.mode === "remote";
+  const canRemoteEdit = !isRemote || backendConnection.role !== "reader";
+  const canRemoteAdmin = !isRemote || backendConnection.role === "admin";
   const isProjectScope = Boolean(activeProjectId);
   const activeProject = activeProjectContext?.project ?? null;
   const canSyncSource = activeProject?.tags.includes("format: coco") ?? false;
@@ -759,45 +782,47 @@ function TopBar({
                   <Play size={16} />
                   开始标注
                 </button>
-                <button type="button" onClick={() => onProjectOpenWindow(activeProject)}>
-                  <Layers3 size={16} />
-                  独立窗口标注
-                </button>
+                {!isRemote ? (
+                  <button type="button" onClick={() => onProjectOpenWindow(activeProject)}>
+                    <Layers3 size={16} />
+                    独立窗口标注
+                  </button>
+                ) : null}
               </>
             ) : null}
-            <button type="button" onClick={onDataSubmit}>
+            {canRemoteEdit ? <button type="button" onClick={onDataSubmit}>
               <Plus size={16} />
               添加数据
-            </button>
-            {canSyncSource ? (
+            </button> : null}
+            {!isRemote && canSyncSource ? (
               <button type="button" onClick={() => onProjectSync(activeProjectId)}>
                 <RefreshCw size={16} />
                 同步源标注
               </button>
             ) : null}
-            <button type="button" onClick={() => onProjectTab(activeProjectId, "快照")}>
+            {!isRemote ? <button type="button" onClick={() => onProjectTab(activeProjectId, "快照")}>
               <Save size={16} />
               快照管理
-            </button>
-            <button className="primary" type="button" onClick={() => onProjectTab(activeProjectId, "导出")}>
+            </button> : null}
+            {!isRemote ? <button className="primary" type="button" onClick={() => onProjectTab(activeProjectId, "导出")}>
               <Download size={16} />
               导出数据集
-            </button>
+            </button> : null}
           </>
         ) : (
           <>
-            <button type="button" onClick={onBackendTasks}>
+            {!isRemote ? <button type="button" onClick={onBackendTasks}>
               <ClipboardCheck size={16} />
               后端任务
-            </button>
-            <button type="button" onClick={onDataSubmit}>
+            </button> : null}
+            {canRemoteEdit ? <button type="button" onClick={onDataSubmit}>
               <Upload size={16} />
               数据提交
-            </button>
-            <button type="button" className="primary" onClick={onCreateDataset}>
+            </button> : null}
+            {canRemoteAdmin ? <button type="button" className="primary" onClick={onCreateDataset}>
               <Plus size={16} />
               新建数据集
-            </button>
+            </button> : null}
           </>
         )}
         <span className={`sync-state ${backendConnection.mode}`}>
@@ -822,19 +847,117 @@ function TopBar({
   );
 }
 
-function IconRail() {
+function IconRail({ onSettings }: { onSettings: () => void }) {
   return (
     <nav className="icon-rail" aria-label="主导航">
       {navItems.map((item) => {
         const Icon = item.icon;
         const active = item.label === "数据集";
         return (
-          <button aria-label={item.label} aria-pressed={active} className={active ? "active" : ""} key={item.label} title={item.label} type="button">
+          <button
+            aria-label={item.label}
+            aria-pressed={active}
+            className={active ? "active" : ""}
+            key={item.label}
+            onClick={item.label === "设置" ? onSettings : undefined}
+            title={item.label}
+            type="button"
+          >
             <Icon size={20} />
           </button>
         );
       })}
     </nav>
+  );
+}
+
+function BackendConnectionDialog({
+  profile,
+  onClose,
+  onConnect,
+  onDisconnect,
+}: {
+  profile: BackendProfile;
+  onClose: () => void;
+  onConnect: (baseUrl: string, token: string) => Promise<void>;
+  onDisconnect: () => Promise<void>;
+}) {
+  const [baseUrl, setBaseUrl] = useState(profile.mode === "remote" ? profile.baseUrl : "");
+  const [token, setToken] = useState("");
+  const [state, setState] = useState<"idle" | "connecting">("idle");
+  const [message, setMessage] = useState<string | null>(null);
+
+  async function connect() {
+    setState("connecting");
+    setMessage(null);
+    try {
+      await onConnect(baseUrl, token);
+      setToken("");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setState("idle");
+    }
+  }
+
+  return (
+    <div className="modal-backdrop">
+      <section aria-labelledby="backend-connection-title" className="dataset-dialog connection-dialog" role="dialog">
+        <div className="dialog-title-row">
+          <div>
+            <span className="eyebrow">服务配置</span>
+            <h2 id="backend-connection-title">后端连接</h2>
+          </div>
+          <button aria-label="关闭后端连接" type="button" onClick={onClose}>
+            <X size={16} />
+          </button>
+        </div>
+        {profile.mode === "remote" ? (
+          <div className="connection-current">
+            <ServerConnectionStatus profile={profile} />
+            <button type="button" onClick={onDisconnect}>断开远程服务</button>
+          </div>
+        ) : (
+          <>
+            <label>
+              远程服务地址
+              <input
+                autoComplete="url"
+                onChange={(event) => setBaseUrl(event.target.value)}
+                placeholder="https://samples.example.com"
+                type="url"
+                value={baseUrl}
+              />
+            </label>
+            <label>
+              访问令牌
+              <input
+                autoComplete="off"
+                onChange={(event) => setToken(event.target.value)}
+                type="password"
+                value={token}
+              />
+            </label>
+            {message ? <p className="form-error" role="alert">{message}</p> : null}
+            <div className="dialog-actions">
+              <button type="button" onClick={onClose}>取消</button>
+              <button className="primary" disabled={state === "connecting"} type="button" onClick={connect}>
+                {state === "connecting" ? "正在验证..." : "连接远程服务"}
+              </button>
+            </div>
+          </>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function ServerConnectionStatus({ profile }: { profile: Extract<BackendProfile, { mode: "remote" }> }) {
+  return (
+    <div>
+      <strong>{profile.baseUrl}</strong>
+      <span>当前角色：{profile.role}</span>
+    </div>
   );
 }
 
@@ -847,6 +970,7 @@ function DatasetHome({
   onInfo,
   onAnnotate,
   onOpenWindow,
+  allowDesktopWindow,
 }: {
   projects: DatasetProject[];
   projectImages: Record<string, DatasetImage[]>;
@@ -856,6 +980,7 @@ function DatasetHome({
   onInfo: () => void;
   onAnnotate: (project: DatasetProject) => void;
   onOpenWindow: (project: DatasetProject) => void;
+  allowDesktopWindow: boolean;
 }) {
   const totals = useMemo(
     () => ({
@@ -936,6 +1061,7 @@ function DatasetHome({
               <div className="dataset-grid">
                 {projects.map((dataset) => (
                   <DatasetCard
+                    allowDesktopWindow={allowDesktopWindow}
                     dataset={dataset}
                     key={dataset.id}
                     onAnnotate={() => onAnnotate(dataset)}
@@ -1029,6 +1155,11 @@ function DataSubmitDialog({
   onImportYolo,
   onOpenLocal,
   onPickSource,
+  onUploadRemote,
+  onCommitRemote,
+  onCancelRemote,
+  remoteMode,
+  preferredProjectId,
 }: {
   datasets: BuiltinDataset[];
   projects: DatasetProject[];
@@ -1043,14 +1174,42 @@ function DataSubmitDialog({
   onImportYolo: (projectId: string, sourcePath: string) => void;
   onOpenLocal: (sourcePath: string, datasetType: string) => void;
   onPickSource: (selectionType: "folder" | "files") => Promise<string[] | null>;
+  onUploadRemote: (projectId: string, files: File[]) => Promise<RemoteImport>;
+  onCommitRemote: (importId: string, format: DatasetFormat) => Promise<void>;
+  onCancelRemote: (importId: string) => Promise<void>;
+  remoteMode: boolean;
+  preferredProjectId?: string;
 }) {
-  const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
+  const [projectId, setProjectId] = useState(preferredProjectId ?? projects[0]?.id ?? "");
   const [analysis, setAnalysis] = useState<DataSourceAnalysis | null>(null);
   const [datasetType, setDatasetType] = useState<ImportDatasetFormat>("voc-detect");
   const [importAction, setImportAction] = useState<DataImportAction>("open-local");
   const [analyzeState, setAnalyzeState] = useState<"idle" | "loading" | "error">("idle");
   const [message, setMessage] = useState<string | null>(null);
   const [dropActive, setDropActive] = useState(false);
+  const [remoteImportId, setRemoteImportId] = useState<string | null>(null);
+
+  const analyzeRemoteFiles = useCallback(async (files: File[]) => {
+    if (!files.length || !projectId) return;
+    setAnalyzeState("loading");
+    setMessage(null);
+    try {
+      if (remoteImportId) {
+        await onCancelRemote(remoteImportId);
+        setRemoteImportId(null);
+      }
+      const remoteImport = await onUploadRemote(projectId, files);
+      setRemoteImportId(remoteImport.id);
+      const nextAnalysis = remoteImportAnalysis(remoteImport);
+      setAnalysis(nextAnalysis);
+      setDatasetType(normalizeDetectedDatasetType(nextAnalysis.detectedFormat));
+      setImportAction("copy-images");
+      setAnalyzeState("idle");
+    } catch (error) {
+      setAnalyzeState("error");
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  }, [onCancelRemote, onUploadRemote, projectId, remoteImportId]);
 
   const analyzeSourcePaths = useCallback(async (
     sourcePaths: string[],
@@ -1072,6 +1231,7 @@ function DataSubmitDialog({
   }, [onAnalyzeSource]);
 
   useEffect(() => {
+    if (remoteMode) return;
     let disposed = false;
     let unlisten: (() => void) | null = null;
     getCurrentWebview()
@@ -1102,7 +1262,7 @@ function DataSubmitDialog({
       disposed = true;
       unlisten?.();
     };
-  }, [analyzeSourcePaths]);
+  }, [analyzeSourcePaths, remoteMode]);
 
   async function chooseSource(selectionType: "folder" | "files") {
     setAnalyzeState("loading");
@@ -1140,6 +1300,10 @@ function DataSubmitDialog({
   function handleDrop(event: DragEvent<HTMLElement>) {
     event.preventDefault();
     setDropActive(false);
+    if (remoteMode) {
+      void analyzeRemoteFiles(Array.from(event.dataTransfer.files));
+      return;
+    }
     const sourcePaths = pathsFromDrop(event.dataTransfer);
     if (!sourcePaths.length) {
       setAnalyzeState("error");
@@ -1149,8 +1313,20 @@ function DataSubmitDialog({
     void analyzeSourcePaths(sourcePaths);
   }
 
-  function confirmImport() {
+  async function confirmImport() {
     if (!analysis) return;
+    if (remoteMode) {
+      if (!remoteImportId || datasetType === "image-directory") return;
+      setAnalyzeState("loading");
+      setMessage(null);
+      try {
+        await onCommitRemote(remoteImportId, datasetType);
+      } catch (error) {
+        setAnalyzeState("error");
+        setMessage(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
     if (importAction === "open-local") {
       onOpenLocal(analysis.rootPath, datasetType === "image-directory" ? "voc-detect" : datasetType);
       return;
@@ -1164,6 +1340,28 @@ function DataSubmitDialog({
       return;
     }
     onImportImages(projectId, analysis.rootPath);
+  }
+
+  async function closeDialog() {
+    if (remoteImportId) {
+      try {
+        await onCancelRemote(remoteImportId);
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : String(error));
+        return;
+      }
+    }
+    onCancel();
+  }
+
+  async function resetAnalysis() {
+    try {
+      if (remoteImportId) await onCancelRemote(remoteImportId);
+      setAnalysis(null);
+      setRemoteImportId(null);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
   }
 
   const problems = analysis?.problems
@@ -1180,7 +1378,7 @@ function DataSubmitDialog({
     analysis
       && analysis.imageCount > 0
       && !hasBlockingProblems
-      && (importAction === "open-local" || projectId),
+      && (remoteMode ? Boolean(remoteImportId && projectId && datasetType !== "image-directory") : importAction === "open-local" || projectId),
   );
 
   return (
@@ -1191,10 +1389,45 @@ function DataSubmitDialog({
             <span className="eyebrow">数据入口</span>
             <h2 id="data-submit-title">数据提交</h2>
           </div>
-          <button aria-label="关闭数据提交" type="button" onClick={onCancel}>
+          <button aria-label="关闭数据提交" type="button" onClick={() => void closeDialog()}>
             <X size={16} />
           </button>
         </div>
+        {remoteMode ? (
+          <section className="source-picker">
+            <label className="source-upload-button">
+              <Files size={18} />
+              <div>
+                <strong>选择上传文件</strong>
+                <span>上传后先由远程服务分析</span>
+              </div>
+              <input
+                aria-label="选择上传文件"
+                className="visually-hidden"
+                disabled={!projectId || analyzeState === "loading"}
+                multiple
+                onChange={(event) => void analyzeRemoteFiles(Array.from(event.target.files ?? []))}
+                type="file"
+              />
+            </label>
+            <label className="source-upload-button">
+              <FolderOpen size={18} />
+              <div>
+                <strong>选择上传文件夹</strong>
+                <span>保留目录结构进行格式识别</span>
+              </div>
+              <input
+                {...({ webkitdirectory: "" } as Record<string, string>)}
+                aria-label="选择上传文件夹"
+                className="visually-hidden"
+                disabled={!projectId || analyzeState === "loading"}
+                multiple
+                onChange={(event) => void analyzeRemoteFiles(Array.from(event.target.files ?? []))}
+                type="file"
+              />
+            </label>
+          </section>
+        ) : (
         <section className="source-picker">
           <button type="button" onClick={() => chooseSource("folder")} disabled={analyzeState === "loading"}>
             <FolderOpen size={18} />
@@ -1211,6 +1444,7 @@ function DataSubmitDialog({
             </div>
           </button>
         </section>
+        )}
         <section
           aria-label="拖拽添加数据"
           className={`drop-source ${dropActive ? "active" : ""}`}
@@ -1221,7 +1455,7 @@ function DataSubmitDialog({
         >
           <Upload size={20} />
           <div>
-            <strong>{dropActive ? "松开后分析数据" : "拖拽文件夹或多个文件到这里"}</strong>
+            <strong>{dropActive ? "松开后分析数据" : remoteMode ? "拖拽文件到这里上传" : "拖拽文件夹或多个文件到这里"}</strong>
             <span>不会立即导入，系统会先展开导入确认界面。</span>
           </div>
         </section>
@@ -1246,6 +1480,7 @@ function DataSubmitDialog({
                 ) : null}
               </div>
               <div className="import-settings">
+                {!remoteMode ? (
                 <label>
                   <span>导入方式</span>
                   <select aria-label="导入方式" value={importAction} onChange={(event) => setImportAction(event.target.value as DataImportAction)}>
@@ -1254,6 +1489,7 @@ function DataSubmitDialog({
                     {analysis.detectedFormat === "yolo-detect" ? <option value="copy-yolo">复制完整 YOLO 数据集到目标项目</option> : null}
                   </select>
                 </label>
+                ) : null}
                 <label>
                   <span>数据格式</span>
                   <select
@@ -1273,7 +1509,7 @@ function DataSubmitDialog({
                     <option value="image-directory">仅图片目录</option>
                   </select>
                 </label>
-                {importAction !== "open-local" ? (
+                {!remoteMode && importAction !== "open-local" ? (
                   <label>
                     <span>目标项目</span>
                     <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
@@ -1293,8 +1529,8 @@ function DataSubmitDialog({
               ) : null}
               {problems.length ? <ImportProblems problems={problems} /> : null}
               <div className="dialog-actions">
-                <button type="button" onClick={() => setAnalysis(null)}>重新选择</button>
-                <button className="primary" type="button" onClick={confirmImport} disabled={!canConfirm}>
+                <button type="button" onClick={() => void resetAnalysis()}>重新选择</button>
+                <button className="primary" type="button" onClick={() => void confirmImport()} disabled={!canConfirm || analyzeState === "loading"}>
                   确认导入
                 </button>
               </div>
@@ -1386,6 +1622,24 @@ function normalizeDetectedDatasetType(format: DataSourceAnalysis["detectedFormat
     return format;
   }
   return "image-directory";
+}
+
+function remoteImportAnalysis(remoteImport: RemoteImport): DataSourceAnalysis {
+  return {
+    sourcePaths: [],
+    rootPath: `已上传 ${remoteImport.fileCount} 个文件 / ${formatNumber(remoteImport.bytesReceived)} 字节`,
+    sourceKind: "files",
+    detectedFormat: remoteImport.detectedFormat ?? "unknown",
+    recommendedAction: "copy-images",
+    imageCount: remoteImport.imageCount,
+    annotationCount: remoteImport.annotationCount,
+    classCount: remoteImport.classCount,
+    classes: remoteImport.classes,
+    splitCount: 1,
+    warnings: remoteImport.warnings,
+    problems: remoteImport.problems,
+    tree: remoteImport.tree,
+  };
 }
 
 function defaultImportAction(analysis: DataSourceAnalysis): DataImportAction {
@@ -3041,6 +3295,8 @@ export default function App() {
   const [runtimeMessage, setRuntimeMessage] = useState<string | null>(null);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [dataSubmitOpen, setDataSubmitOpen] = useState(false);
+  const [connectionDialogOpen, setConnectionDialogOpen] = useState(false);
+  const [backendProfile, setBackendProfile] = useState<BackendProfile>(() => getBackendProfile());
   const [projectInfoOpen, setProjectInfoOpen] = useState(false);
   const [createForm, setCreateForm] = useState<DatasetCreationForm>(defaultDatasetCreationForm);
   const [taskTrayOpen, setTaskTrayOpen] = useState(false);
@@ -3272,6 +3528,34 @@ export default function App() {
     }
   }
 
+  async function handleUploadRemoteImport(projectId: string, files: File[]) {
+    return uploadRemoteImport(projectId, files);
+  }
+
+  async function handleCommitRemoteImport(importId: string, format: DatasetFormat) {
+    await commitRemoteImport(importId, format);
+    setDataSubmitOpen(false);
+    await refreshDatasets({ autoDownload: false });
+  }
+
+  async function handleCancelRemoteImport(importId: string) {
+    await cancelRemoteImport(importId);
+  }
+
+  async function handleConnectRemote(baseUrl: string, token: string) {
+    const profile = await connectRemoteBackend(baseUrl, token);
+    setBackendProfile(profile);
+    setBackendConnection(await detectBackendConnection());
+    await refreshDatasets({ autoDownload: false });
+  }
+
+  async function handleDisconnectRemote() {
+    disconnectRemoteBackend();
+    setBackendProfile(getBackendProfile());
+    setBackendConnection(await detectBackendConnection());
+    await refreshDatasets({ autoDownload: false });
+  }
+
   if (route.name === "backendTasks") {
     return (
       <BackendTaskTray
@@ -3306,9 +3590,10 @@ export default function App() {
         onProjectTab={openProjectTab}
       />
       <div className="app-body">
-        <IconRail />
+        <IconRail onSettings={() => setConnectionDialogOpen(true)} />
         {route.name === "datasets" && (
           <DatasetHome
+            allowDesktopWindow={backendProfile.mode !== "remote"}
             onAnnotate={annotateProject}
             onDownload={handleDownload}
             onInfo={() => setProjectInfoOpen(true)}
@@ -3347,9 +3632,22 @@ export default function App() {
           onImportYolo={handleImportYolo}
           onOpenLocal={handleOpenLocalDataset}
           onPickSource={handlePickDataSource}
+          onUploadRemote={handleUploadRemoteImport}
+          onCommitRemote={handleCommitRemoteImport}
+          onCancelRemote={handleCancelRemoteImport}
+          remoteMode={backendProfile.mode === "remote"}
+          preferredProjectId={route.name === "project" ? route.projectId : undefined}
         />
       ) : null}
       {projectInfoOpen ? <ProjectInfoDialog onClose={() => setProjectInfoOpen(false)} /> : null}
+      {connectionDialogOpen ? (
+        <BackendConnectionDialog
+          onClose={() => setConnectionDialogOpen(false)}
+          onConnect={handleConnectRemote}
+          onDisconnect={handleDisconnectRemote}
+          profile={backendProfile}
+        />
+      ) : null}
       {taskTrayOpen ? (
         <BackendTaskTray
           message={taskTrayMessage}

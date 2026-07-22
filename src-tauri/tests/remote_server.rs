@@ -1961,6 +1961,22 @@ async fn authenticated_private_route_wrong_method_is_not_allowed() {
 }
 
 #[tokio::test]
+async fn authenticated_session_reports_the_effective_role() {
+    let mut config = test_config(Ipv4Addr::LOCALHOST);
+    config.reader_token = Some(READER_TOKEN.to_string());
+    config.admin_token = Some(ADMIN_TOKEN.to_string());
+    let app = build_router(config).unwrap();
+
+    for (token, expected_role) in [(READER_TOKEN, "reader"), (ADMIN_TOKEN, "admin")] {
+        let (status, headers, body) =
+            router_request(&app, Method::GET, "/api/v1/session", token, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["role"], expected_role);
+        assert_request_id(&headers, &body);
+    }
+}
+
+#[tokio::test]
 async fn reader_can_list() {
     let mut config = test_config(Ipv4Addr::LOCALHOST);
     config.reader_token = Some(READER_TOKEN.to_string());

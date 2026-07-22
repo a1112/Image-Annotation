@@ -17,7 +17,7 @@ use axum::{
     middleware::{self, Next},
     response::Response,
     routing::get,
-    Router,
+    Extension, Router,
 };
 use error::{is_error_envelope, request_id, success, ApiError, RequestIdGenerator};
 use serde_json::json;
@@ -74,6 +74,7 @@ pub fn build_router_with_private_routes(
     let service = RemoteSampleService::initialize(&config)?;
     let max_upload_bytes = config.max_upload_bytes;
     let private_route_groups = private_route_groups
+        .with_reader(Router::new().route("/session", get(session)))
         .with_reader(with_api_body_limit(projects::reader_routes(
             service.clone(),
         )))
@@ -179,6 +180,16 @@ async fn health(request: Request) -> Response {
         }),
         request_id,
     )
+}
+
+async fn session(Extension(role): Extension<Role>, request: Request) -> Response {
+    let request_id = request_id(request.extensions());
+    let role = match role {
+        Role::Reader => "reader",
+        Role::Editor => "editor",
+        Role::Admin => "admin",
+    };
+    success(StatusCode::OK, json!({ "role": role }), request_id)
 }
 
 async fn authenticate_private_api(

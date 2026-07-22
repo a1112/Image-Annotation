@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
+import { disconnectRemoteBackend } from "./api/backend-profile";
 
 const tauriState = vi.hoisted(() => ({
   backendAvailable: true,
@@ -464,6 +465,7 @@ vi.mock("@tauri-apps/api/webview", () => ({
 }));
 
 beforeEach(() => {
+  disconnectRemoteBackend();
   window.location.hash = "";
   tauriState.backendAvailable = true;
   tauriState.builtinDownloaded = true;
@@ -502,6 +504,117 @@ beforeEach(() => {
 });
 
 describe("desktop shell", () => {
+  it("通过设置连接远程服务、显示角色并可断开", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === "https://samples.example.com/api/v1/session") {
+        return new Response(JSON.stringify({ ok: true, data: { role: "editor" } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url === "https://samples.example.com/api/v1/projects") {
+        return new Response(JSON.stringify({ ok: true, data: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true, data: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "设置" }));
+    expect(screen.getByRole("dialog", { name: "后端连接" })).toBeInTheDocument();
+    await user.type(screen.getByLabelText("远程服务地址"), "https://samples.example.com");
+    await user.type(screen.getByLabelText("访问令牌"), "editor-token");
+    await user.click(screen.getByRole("button", { name: "连接远程服务" }));
+
+    expect(await screen.findByText("远程服务 · editor")).toBeInTheDocument();
+    expect(screen.getByText("当前角色：editor")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "断开远程服务" }));
+    await waitFor(() => expect(screen.queryByText("远程服务 · editor")).not.toBeInTheDocument());
+  });
+
+  it("远程模式上传文件并在二次确认后提交导入", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith("/session")) {
+        return new Response(JSON.stringify({ ok: true, data: { role: "editor" } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.endsWith("/projects")) {
+        return new Response(JSON.stringify({ ok: true, data: [{
+          id: "remote-project",
+          name: "远程项目",
+          description: "",
+          annotationTypes: ["BBox"],
+          imageCount: 0,
+          annotatedPercent: 0,
+          reviewCount: 0,
+          issueCount: 0,
+          classCount: 0,
+          tagGroupCount: 0,
+          status: "已创建",
+          tags: ["format: yolo-detect"],
+        }] }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (url.includes("/samples?")) {
+        return new Response(JSON.stringify({ ok: true, data: { offset: 0, limit: 3, total: 0, items: [] } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.endsWith("/imports") || url.endsWith("/commit")) {
+        return new Response(JSON.stringify({ ok: true, data: {
+          id: "import-1",
+          projectId: "remote-project",
+          state: url.endsWith("/commit") ? "completed" : "analyzed",
+          detectedFormat: "yolo-detect",
+          imageCount: 1,
+          annotationCount: 1,
+          classCount: 1,
+          classes: ["object"],
+          warnings: [],
+          problems: [],
+          tree: [{ name: "sample.png", path: "sample.png", kind: "file", children: [], truncated: false }],
+          bytesReceived: 5,
+          fileCount: 1,
+          errorMessage: null,
+          createdAt: "now",
+          updatedAt: "now",
+        } }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+    await user.click(screen.getByRole("button", { name: "设置" }));
+    await user.type(screen.getByLabelText("远程服务地址"), "https://samples.example.com");
+    await user.type(screen.getByLabelText("访问令牌"), "editor-token");
+    await user.click(screen.getByRole("button", { name: "连接远程服务" }));
+    await screen.findByText("远程服务 · editor");
+    await user.click(screen.getByRole("button", { name: "关闭后端连接" }));
+
+    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    const file = new File(["image"], "sample.png", { type: "image/png" });
+    await user.upload(screen.getByLabelText("选择上传文件"), file);
+
+    expect(await screen.findByText("YOLO BBox")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "确认导入" }));
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://samples.example.com/api/v1/imports/import-1/commit",
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+  });
+
   it("后端可用但 COCO128 未下载时会自动下载真实测试数据", async () => {
     tauriState.builtinDownloaded = false;
 
