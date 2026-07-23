@@ -4,6 +4,8 @@ data/
 .worktrees/
 src-tauri/target/
 src-tauri/gen/
+server/target/
+server/.env
 *.log
 .DS_Store
 Thumbs.db

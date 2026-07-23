@@ -1,4 +1,4 @@
-use crate::project_fs::ProjectManifest;
+use crate::{hybrid, project_fs::ProjectManifest};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -95,7 +95,10 @@ pub struct TaskItemRecord {
 }
 
 pub fn initialize_project_database(path: &Path) -> Result<(), String> {
-    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    hybrid::prepare_database(path)
+        .map_err(|err| format!("prepare database {}: {err}", path.display()))?;
+    let mut connection = Connection::open(path)
+        .map_err(|err| format!("open database {}: {err}", path.display()))?;
     connection
         .execute_batch(
             r#"
@@ -202,21 +205,9 @@ pub fn initialize_project_database(path: &Path) -> Result<(), String> {
             );
             "#,
         )
-        .map_err(|err| err.to_string())?;
-    for statement in [
-        "ALTER TABLE projects ADD COLUMN root_path TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE projects ADD COLUMN class_count INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE projects ADD COLUMN image_count INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE projects ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE images ADD COLUMN qa_status TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE images ADD COLUMN review_note TEXT",
-        "ALTER TABLE classes ADD COLUMN shortcut TEXT",
-        "ALTER TABLE classes ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
-        "ALTER TABLE annotations ADD COLUMN revision TEXT NOT NULL DEFAULT ''",
-    ] {
-        let _ = connection.execute(statement, []);
-    }
-    Ok(())
+        .map_err(|err| format!("create base schema {}: {err}", path.display()))?;
+    hybrid::migrate_database(&mut connection)
+        .map_err(|err| format!("migrate database {}: {err}", path.display()))
 }
 
 pub fn upsert_project_index(
@@ -225,9 +216,11 @@ pub fn upsert_project_index(
     images: &[StoredImage],
     classes: &[StoredClass],
 ) -> Result<(), String> {
-    let mut connection = Connection::open(path).map_err(|err| err.to_string())?;
-    initialize_project_database(path)?;
-    let transaction = connection.transaction().map_err(|err| err.to_string())?;
+    let mut connection = Connection::open(path)
+        .map_err(|err| format!("open project index {}: {err}", path.display()))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|err| format!("begin project index transaction {}: {err}", path.display()))?;
     transaction
         .execute(
             r#"
@@ -253,13 +246,13 @@ pub fn upsert_project_index(
                 manifest.created_at,
             ],
         )
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format!("upsert project index {}: {err}", path.display()))?;
     transaction
         .execute("DELETE FROM images", [])
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format!("clear image index {}: {err}", path.display()))?;
     transaction
         .execute("DELETE FROM classes", [])
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format!("clear class index {}: {err}", path.display()))?;
 
     for image in images {
         transaction
@@ -276,7 +269,7 @@ pub fn upsert_project_index(
                     image.review_note,
                 ],
             )
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| format!("write image index {}: {err}", path.display()))?;
     }
 
     for class in classes {
@@ -285,10 +278,12 @@ pub fn upsert_project_index(
                 "INSERT INTO classes (id, label, color) VALUES (?1, ?2, ?3)",
                 params![class.id, class.label, class.color],
             )
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| format!("write class index {}: {err}", path.display()))?;
     }
 
-    transaction.commit().map_err(|err| err.to_string())
+    transaction
+        .commit()
+        .map_err(|err| format!("commit project index {}: {err}", path.display()))
 }
 
 pub fn read_project_manifest(path: &Path) -> Result<Option<ProjectManifest>, String> {
@@ -467,6 +462,18 @@ pub fn save_annotation_payload(
             params![audit_event_id, image_id, saved_at],
         )
         .map_err(|err| err.to_string())?;
+    hybrid::mark_annotation_pending(
+        &transaction,
+        path,
+        image_id,
+        None,
+        serde_json::json!({
+            "imageId": image_id,
+            "revision": revision,
+            "objects": serde_json::from_str::<serde_json::Value>(object_json)
+                .unwrap_or(serde_json::Value::Null)
+        }),
+    )?;
     transaction.commit().map_err(|err| err.to_string())?;
 
     Ok(AnnotationSaveResult {
@@ -534,33 +541,35 @@ pub fn read_annotation_versions(
 
 pub fn submit_image_for_review(path: &Path, image_id: &str) -> Result<(), String> {
     initialize_project_database(path)?;
-    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    let mut connection = Connection::open(path).map_err(|err| err.to_string())?;
     let now = now_unix_string();
     let audit_event_id = unique_id("audit");
-    connection
+    let transaction = connection.transaction().map_err(|err| err.to_string())?;
+    transaction
         .execute(
             "UPDATE images SET status = '待质检', qa_status = '待质检', review_note = NULL WHERE id = ?1",
             params![image_id],
         )
         .map_err(|err| err.to_string())?;
-    connection
+    transaction
         .execute(
             "UPDATE task_items SET status = '待质检', qa_status = '待质检', review_note = NULL WHERE image_id = ?1",
             params![image_id],
         )
         .map_err(|err| err.to_string())?;
-    connection
+    transaction
         .execute(
             "INSERT INTO audit_events (id, action, image_id, message, created_at) VALUES (?1, 'annotation.submit', ?2, '提交质检', ?3)",
             params![audit_event_id, image_id, now],
         )
         .map_err(|err| err.to_string())?;
-    Ok(())
+    hybrid::mark_submission_pending(&transaction, path, image_id)?;
+    transaction.commit().map_err(|err| err.to_string())
 }
 
 pub fn review_image(path: &Path, image_id: &str, decision: &str, note: &str) -> Result<(), String> {
     initialize_project_database(path)?;
-    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    let mut connection = Connection::open(path).map_err(|err| err.to_string())?;
     let (status, qa_status, message) = match decision {
         "approved" | "通过" => ("通过", "通过", "质检通过"),
         "rejected" | "驳回" => ("草稿", "驳回", "质检驳回"),
@@ -569,31 +578,33 @@ pub fn review_image(path: &Path, image_id: &str, decision: &str, note: &str) -> 
     let now = now_unix_string();
     let review_id = unique_id("review");
     let audit_event_id = unique_id("audit");
-    connection
+    let transaction = connection.transaction().map_err(|err| err.to_string())?;
+    transaction
         .execute(
             "UPDATE images SET status = ?2, qa_status = ?3, review_note = ?4 WHERE id = ?1",
             params![image_id, status, qa_status, note],
         )
         .map_err(|err| err.to_string())?;
-    connection
+    transaction
         .execute(
             "UPDATE task_items SET status = ?2, qa_status = ?3, review_note = ?4 WHERE image_id = ?1",
             params![image_id, status, qa_status, note],
         )
         .map_err(|err| err.to_string())?;
-    connection
+    transaction
         .execute(
             "INSERT INTO qa_reviews (id, image_id, decision, note, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![review_id, image_id, qa_status, note, now],
         )
         .map_err(|err| err.to_string())?;
-    connection
+    transaction
         .execute(
             "INSERT INTO audit_events (id, action, image_id, message, created_at) VALUES (?1, 'qa.review', ?2, ?3, ?4)",
             params![audit_event_id, image_id, message, now],
         )
         .map_err(|err| err.to_string())?;
-    Ok(())
+    hybrid::record_review_operation(&transaction, path, image_id, decision, note)?;
+    transaction.commit().map_err(|err| err.to_string())
 }
 
 pub fn read_review_queue(path: &Path) -> Result<Vec<StoredImage>, String> {
@@ -611,6 +622,80 @@ pub fn read_review_queue(path: &Path) -> Result<Vec<StoredImage>, String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| err.to_string())?;
     Ok(rows)
+}
+
+pub fn list_issue_records(
+    path: &Path,
+    project_id: &str,
+    include_closed: bool,
+) -> Result<Vec<hybrid::IssueRecord>, String> {
+    initialize_project_database(path)?;
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    hybrid::list_issues(&connection, project_id, include_closed)
+}
+
+pub fn create_issue_record(
+    path: &Path,
+    project_id: &str,
+    image_id: &str,
+    annotation_object_id: Option<&str>,
+    title: &str,
+    description: &str,
+    severity: &str,
+    assignee_id: Option<&str>,
+) -> Result<hybrid::IssueRecord, String> {
+    initialize_project_database(path)?;
+    let mut connection = Connection::open(path).map_err(|err| err.to_string())?;
+    hybrid::create_issue(
+        &mut connection,
+        project_id,
+        image_id,
+        annotation_object_id,
+        title,
+        description,
+        severity,
+        assignee_id,
+    )
+}
+
+pub fn transition_issue_record(
+    path: &Path,
+    project_id: &str,
+    issue_id: &str,
+    next_status: &str,
+) -> Result<hybrid::IssueRecord, String> {
+    initialize_project_database(path)?;
+    let mut connection = Connection::open(path).map_err(|err| err.to_string())?;
+    hybrid::transition_issue(&mut connection, project_id, issue_id, next_status)
+}
+
+pub fn add_issue_comment_record(
+    path: &Path,
+    project_id: &str,
+    issue_id: &str,
+    content: &str,
+) -> Result<hybrid::IssueCommentRecord, String> {
+    initialize_project_database(path)?;
+    let mut connection = Connection::open(path).map_err(|err| err.to_string())?;
+    hybrid::add_issue_comment(&mut connection, project_id, issue_id, content)
+}
+
+pub fn list_issue_comment_records(
+    path: &Path,
+    issue_id: &str,
+) -> Result<Vec<hybrid::IssueCommentRecord>, String> {
+    initialize_project_database(path)?;
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    hybrid::list_issue_comments(&connection, issue_id)
+}
+
+pub fn read_sync_summary(
+    path: &Path,
+    project_id: &str,
+) -> Result<hybrid::SyncSummary, String> {
+    initialize_project_database(path)?;
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    hybrid::sync_summary(&connection, project_id)
 }
 
 pub fn create_snapshot_record(

@@ -2,6 +2,9 @@ use serde::Serialize;
 #[cfg(not(mobile))]
 use tauri::WebviewWindow;
 
+#[cfg(all(not(mobile), target_os = "macos"))]
+const MACOS_WINDOW_CORNER_RADIUS: f64 = 10.0;
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeBackdropStatus {
@@ -84,6 +87,31 @@ fn apply_platform_chrome(window: &WebviewWindow) {
     if let Err(error) = window.set_decorations(false) {
         eprintln!("failed to apply frameless chrome: {error}");
     }
+
+    if let Err(error) = apply_macos_window_corners(window) {
+        eprintln!("failed to apply macOS window corners: {error}");
+    }
+}
+
+#[cfg(all(not(mobile), target_os = "macos"))]
+fn apply_macos_window_corners(window: &WebviewWindow) -> Result<(), String> {
+    use objc2_app_kit::NSWindow;
+
+    let ns_window = window.ns_window().map_err(|error| error.to_string())?;
+    let ns_window = unsafe { &*(ns_window as *const NSWindow) };
+    let content_view = ns_window
+        .contentView()
+        .ok_or_else(|| "window content view is unavailable".to_string())?;
+
+    content_view.setWantsLayer(true);
+    let layer = content_view
+        .layer()
+        .ok_or_else(|| "window content layer is unavailable".to_string())?;
+    layer.setCornerRadius(MACOS_WINDOW_CORNER_RADIUS);
+    layer.setMasksToBounds(true);
+    ns_window.invalidateShadow();
+
+    Ok(())
 }
 
 #[cfg(all(not(mobile), not(any(target_os = "windows", target_os = "macos"))))]
@@ -139,7 +167,7 @@ fn apply_native_backdrop(window: &WebviewWindow) -> NativeBackdropStatus {
         window,
         NSVisualEffectMaterial::UnderWindowBackground,
         Some(NSVisualEffectState::Active),
-        Some(8.0),
+        Some(MACOS_WINDOW_CORNER_RADIUS),
     ) {
         Ok(_) => NativeBackdropStatus::applied("macOS", "Vibrancy"),
         Err(error) => NativeBackdropStatus::unavailable("macOS", error.to_string()),

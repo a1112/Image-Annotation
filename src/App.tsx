@@ -39,6 +39,8 @@ import {
   clearCompletedBackendTasks,
   createDatasetProject,
   createDatasetSnapshot,
+  createProjectFolder,
+  deleteProjectFolder,
   detectBackendConnection,
   downloadTestDataset,
   exportDataset,
@@ -56,12 +58,16 @@ import {
   listDatasetProjects,
   listExports,
   listProjectImages,
+  listProjectFolders,
   listSnapshots,
   openAnnotationWindow,
   openBackendTaskTray,
   openLocalDataset,
   pickDataSource,
   saveImageAnnotations,
+  migrateLegacyProjectFolders,
+  moveImageToProjectFolder,
+  renameProjectFolder,
   submitImageAnnotations,
 } from "./api/tauri";
 import type { BackendConnection } from "./api/tauri";
@@ -78,9 +84,11 @@ import type {
   DataSourceAnalysis,
   DataSourceTreeNode,
   ProjectDetail,
+  FolderWorkspace,
 } from "./types/domain";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { HybridProjectPanel } from "./HybridProjectPanel";
 
 type ProjectTab = "概览" | "数据分组" | "图片" | "类别" | "任务" | "质检" | "快照" | "导出";
 type ToolMode = "select" | "bbox" | "polygon" | "pan";
@@ -124,6 +132,16 @@ const defaultTestDatasetKey = "coco128";
 const datasetPreviewLimit = 3;
 const projectImagePageSize = 48;
 const annotationImagePageSize = 120;
+const annotationPalette = [
+  "#0b84f3",
+  "#18a77c",
+  "#e58a12",
+  "#d14fd7",
+  "#e14f5a",
+  "#5969e8",
+  "#00a5b8",
+  "#8a62d3",
+];
 const defaultDatasetCreationForm: DatasetCreationForm = {
   name: "Demo BBox 数据集",
   datasetType: "yolo-detect",
@@ -275,6 +293,10 @@ function ThumbnailAnnotationOverlay({
           aria-label={`${image.fileName} 标注框 ${object.label}`}
           className="thumbnail-annotation-box"
           key={object.id}
+          style={{
+            fill: `${annotationColor(object.label)}20`,
+            stroke: annotationColor(object.label),
+          }}
           x={object.bbox.x}
           y={object.bbox.y}
           width={object.bbox.width}
@@ -286,6 +308,10 @@ function ThumbnailAnnotationOverlay({
           className="thumbnail-annotation-polygon"
           key={object.id}
           points={object.polygon.map((point) => `${point.x},${point.y}`).join(" ")}
+          style={{
+            fill: `${annotationColor(object.label)}26`,
+            stroke: annotationColor(object.label),
+          }}
         />
       ) : null)}
     </svg>
@@ -308,33 +334,60 @@ function ReadOnlyAnnotationOverlay({
   }
 
   return (
-    <svg
-      aria-label={`${image.fileName} 标注预览`}
-      className="preview-annotations"
-      preserveAspectRatio="none"
-      viewBox={`0 0 ${image.width || 640} ${image.height || 480}`}
-    >
-      {visibleObjects.map((object) => object.type === "bbox" && object.bbox ? (
-        <g key={object.id}>
+    <div className="preview-annotation-layer">
+      <svg
+        aria-label={`${image.fileName} 标注预览`}
+        className="preview-annotations"
+        preserveAspectRatio="none"
+        viewBox={`0 0 ${image.width || 640} ${image.height || 480}`}
+      >
+        {visibleObjects.map((object) => object.type === "bbox" && object.bbox ? (
           <rect
             aria-label={`${image.fileName} 标注框 ${object.label}`}
             className="preview-annotation-box"
+            key={object.id}
+            style={{
+              fill: `${annotationColor(object.label)}20`,
+              stroke: annotationColor(object.label),
+            }}
             x={object.bbox.x}
             y={object.bbox.y}
             width={object.bbox.width}
             height={object.bbox.height}
           />
-          <text x={object.bbox.x + 6} y={Math.max(18, object.bbox.y - 6)}>{object.label}</text>
-        </g>
-      ) : object.polygon ? (
-        <polygon
-          aria-label={`${image.fileName} 多边形标注 ${object.label}`}
-          className="preview-annotation-polygon"
-          key={object.id}
-          points={object.polygon.map((point) => `${point.x},${point.y}`).join(" ")}
-        />
-      ) : null)}
-    </svg>
+        ) : object.polygon ? (
+          <polygon
+            aria-label={`${image.fileName} 多边形标注 ${object.label}`}
+            className="preview-annotation-polygon"
+            key={object.id}
+            points={object.polygon.map((point) => `${point.x},${point.y}`).join(" ")}
+            style={{
+              fill: `${annotationColor(object.label)}26`,
+              stroke: annotationColor(object.label),
+            }}
+          />
+        ) : null)}
+      </svg>
+      <div className="preview-annotation-labels" aria-hidden="true">
+        {visibleObjects.map((object) => {
+          const anchor = object.bbox
+            ? { x: object.bbox.x, y: object.bbox.y }
+            : object.polygon?.[0];
+          if (!anchor) return null;
+          return (
+            <span
+              key={object.id}
+              style={{
+                left: `${Math.max(0, Math.min(100, anchor.x / (image.width || 640) * 100))}%`,
+                top: `${Math.max(0, Math.min(96, anchor.y / (image.height || 480) * 100))}%`,
+              }}
+            >
+              {object.label}
+            </span>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -347,6 +400,14 @@ function normalizeBox(start: { x: number; y: number }, end: { x: number; y: numb
     width: Number(Math.abs(end.x - start.x).toFixed(1)),
     height: Number(Math.abs(end.y - start.y).toFixed(1)),
   };
+}
+
+function annotationColor(label: string) {
+  let hash = 0;
+  for (let index = 0; index < label.length; index += 1) {
+    hash = (hash * 31 + label.charCodeAt(index)) >>> 0;
+  }
+  return annotationPalette[hash % annotationPalette.length];
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -854,16 +915,6 @@ function DatasetHome({
   onAnnotate: (project: DatasetProject) => void;
   onOpenWindow: (project: DatasetProject) => void;
 }) {
-  const totals = useMemo(
-    () => ({
-      images: projects.reduce((sum, project) => sum + project.imageCount, 0),
-      classes: projects.reduce((sum, project) => sum + project.classCount, 0),
-      review: projects.reduce((sum, project) => sum + project.reviewCount, 0),
-      issues: projects.reduce((sum, project) => sum + project.issueCount, 0),
-    }),
-    [projects],
-  );
-
   return (
     <main className="content">
       <section className="dataset-main">
@@ -882,28 +933,6 @@ function DatasetHome({
               </button>
             ))}
           </div>
-        </div>
-        <div className="overview-strip">
-          <span>
-            <strong>{formatNumber(totals.images)}</strong>
-            图片总数
-          </span>
-          <span>
-            <strong>{projects.length}</strong>
-            项目
-          </span>
-          <span>
-            <strong>{formatNumber(totals.review)}</strong>
-            待审核
-          </span>
-          <span>
-            <strong>{totals.classes}</strong>
-            类别
-          </span>
-          <span>
-            <strong>{formatNumber(totals.issues)}</strong>
-            问题
-          </span>
         </div>
         {runtimeState === "backend-unavailable" ? (
           <RuntimeStatePanel
@@ -1530,65 +1559,226 @@ function BackendTaskTray({
 function ImagePreviewDialog({
   image,
   imageUrl,
+  images,
+  imageUrls,
   objects,
   onAnnotate,
   onClose,
+  onSelectImage,
 }: {
   image: DatasetImage;
   imageUrl: string | undefined;
+  images: DatasetImage[];
+  imageUrls: Record<string, string>;
   objects: AnnotationObject[] | undefined;
   onAnnotate: () => void;
   onClose: () => void;
+  onSelectImage: (imageId: string) => void;
 }) {
+  const [renderedSize, setRenderedSize] = useState<CanvasSize | null>(null);
+  const [hoveredObjectId, setHoveredObjectId] = useState<string | null>(null);
+  const [hiddenLabels, setHiddenLabels] = useState<Set<string>>(new Set());
+  const visibleObjects = (objects ?? []).filter(
+    (object) => (object.type === "bbox" && object.bbox) || (object.type === "polygon" && object.polygon?.length),
+  );
+  const enabledObjects = visibleObjects.filter((object) => !hiddenLabels.has(object.label));
+  const focusedObject = enabledObjects.find((object) => object.id === hoveredObjectId);
+  const classStats = Array.from(
+    visibleObjects.reduce((stats, object) => {
+      stats.set(object.label, (stats.get(object.label) ?? 0) + 1);
+      return stats;
+    }, new Map<string, number>()),
+  );
+  const activeImageIndex = images.findIndex((candidate) => candidate.id === image.id);
+  const filmstripStart = Math.max(0, Math.min(activeImageIndex - 3, images.length - 7));
+  const filmstripImages = images.slice(filmstripStart, filmstripStart + 7);
+
+  useEffect(() => {
+    setRenderedSize(null);
+    setHoveredObjectId(null);
+    setHiddenLabels(new Set());
+  }, [image.id]);
+
+  useEffect(() => {
+    function closeOnEscape(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
   return (
-    <div className="modal-backdrop">
-      <section aria-labelledby="image-preview-title" className="dataset-dialog image-preview-dialog" role="dialog">
-        <div className="detail-header">
+    <div className="modal-backdrop preview-backdrop" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <section aria-labelledby="image-preview-title" aria-modal="true" className="dataset-dialog image-preview-dialog" role="dialog">
+        <div className="detail-header preview-dialog-header">
           <div>
-            <span className="eyebrow">查看弹窗</span>
-            <h2 id="image-preview-title">图像预览</h2>
+            <span className="eyebrow">IMAGE INSPECTOR</span>
+            <h2 id="image-preview-title">{image.fileName}</h2>
           </div>
-          <button aria-label="关闭图像预览" type="button" onClick={onClose}>
-            <X size={16} />
-          </button>
+          <div className="preview-header-actions">
+            <button className="preview-edit-action primary" type="button" onClick={onAnnotate}>
+              <Tags size={15} />
+              <span>编辑标注</span>
+            </button>
+            <span className={`preview-status ${image.status === "已标注" ? "complete" : ""}`}>{image.status}</span>
+            <button aria-label="关闭图像预览" type="button" onClick={onClose}>
+              <X size={17} />
+            </button>
+          </div>
         </div>
         <div className="image-preview-body">
-          <div
-            className="image-preview-stage"
-            style={{ aspectRatio: `${image.width || 640} / ${image.height || 480}` }}
-          >
-            {imageUrl ? <img alt={`预览 ${image.fileName}`} src={imageUrl} /> : <div className="road-scene" />}
-            <ReadOnlyAnnotationOverlay image={image} objects={objects} />
+          <div className="image-preview-main">
+            <div className="image-preview-stage">
+              <div className="image-preview-media">
+                {imageUrl ? (
+                  <img
+                    alt={`预览 ${image.fileName}`}
+                    decoding="async"
+                    onLoad={(event) => setRenderedSize({
+                      width: event.currentTarget.naturalWidth,
+                      height: event.currentTarget.naturalHeight,
+                    })}
+                    src={imageUrl}
+                  />
+                ) : <div className="road-scene" />}
+                <div className={focusedObject ? "preview-annotation-muted" : ""}>
+                  <ReadOnlyAnnotationOverlay image={image} objects={enabledObjects} />
+                </div>
+                {focusedObject ? (
+                  <div className="preview-annotation-focus">
+                    <ReadOnlyAnnotationOverlay image={image} objects={[focusedObject]} />
+                  </div>
+                ) : null}
+              </div>
+            </div>
+            <div className="preview-filmstrip" aria-label="图像切换">
+              <button
+                aria-label="上一张图像"
+                className="preview-filmstrip-nav"
+                disabled={activeImageIndex <= 0}
+                type="button"
+                onClick={() => onSelectImage(images[activeImageIndex - 1].id)}
+              >
+                ‹
+              </button>
+              <div className="preview-filmstrip-track">
+                {filmstripImages.map((candidate) => (
+                  <button
+                    aria-current={candidate.id === image.id ? "true" : undefined}
+                    className={candidate.id === image.id ? "active" : ""}
+                    key={candidate.id}
+                    title={candidate.fileName}
+                    type="button"
+                    onClick={() => onSelectImage(candidate.id)}
+                  >
+                    {imageUrls[candidate.id] ? <img alt="" src={imageUrls[candidate.id]} /> : <span />}
+                    <small>{candidate.fileName}</small>
+                  </button>
+                ))}
+              </div>
+              <button
+                aria-label="下一张图像"
+                className="preview-filmstrip-nav"
+                disabled={activeImageIndex < 0 || activeImageIndex >= images.length - 1}
+                type="button"
+                onClick={() => onSelectImage(images[activeImageIndex + 1].id)}
+              >
+                ›
+              </button>
+            </div>
           </div>
           <aside className="image-preview-meta" aria-label="图像信息">
-            <h3>{image.fileName}</h3>
-            <dl>
-              <dt>尺寸</dt>
-              <dd>{image.width} x {image.height}</dd>
-              <dt>状态</dt>
-              <dd>{image.status}</dd>
-              <dt>分组</dt>
-              <dd>{image.split}</dd>
-              <dt>对象数</dt>
-              <dd>{objects?.length ?? 0}</dd>
-            </dl>
-            <div className="tag-list compact">
-              {image.tags.map((tag) => (
-                <span key={tag}>{tag}</span>
-              ))}
+            <div className="preview-stat-grid">
+              <div><span>尺寸</span><strong>{renderedSize?.width ?? image.width} × {renderedSize?.height ?? image.height}</strong></div>
+              <div><span>对象</span><strong>{enabledObjects.length} / {visibleObjects.length}</strong></div>
+              <div><span>分组</span><strong>{image.split}</strong></div>
+              <div><span>质检</span><strong>{image.qaStatus || "未质检"}</strong></div>
             </div>
+            <div className="preview-object-panel">
+              <div className="preview-object-heading">
+                <strong>标注对象</strong>
+                <span>{visibleObjects.length}</span>
+              </div>
+              {visibleObjects.length > 0 ? (
+                <div className="preview-object-list">
+                  {visibleObjects.slice(0, 8).map((object, index) => (
+                    <button
+                      className={hiddenLabels.has(object.label) ? "hidden" : ""}
+                      key={object.id}
+                      type="button"
+                      onMouseEnter={() => {
+                        if (!hiddenLabels.has(object.label)) setHoveredObjectId(object.id);
+                      }}
+                      onMouseLeave={() => setHoveredObjectId(null)}
+                    >
+                      <i style={{ backgroundColor: ["#36a3ff", "#20b486", "#f59e0b", "#d45ce0"][index % 4] }} />
+                      <strong>{object.label}</strong>
+                      <small>{object.type === "bbox" ? "边界框" : "多边形"}</small>
+                    </button>
+                  ))}
+                </div>
+              ) : <p>当前图片没有可见标注对象。</p>}
+            </div>
+            <div className="preview-class-panel">
+              <div className="preview-object-heading">
+                <strong>类别显示</strong>
+                <span>{classStats.length}</span>
+              </div>
+              <div className="preview-class-tags">
+                {classStats.map(([label, count], index) => {
+                  const color = ["#36a3ff", "#20b486", "#f59e0b", "#d45ce0"][index % 4];
+                  const hidden = hiddenLabels.has(label);
+                  return (
+                    <button
+                      aria-pressed={!hidden}
+                      className={hidden ? "hidden" : ""}
+                      key={label}
+                      style={{ borderColor: color, color }}
+                      type="button"
+                      onClick={() => setHiddenLabels((current) => {
+                        const next = new Set(current);
+                        if (next.has(label)) next.delete(label);
+                        else next.add(label);
+                        return next;
+                      })}
+                    >
+                      <i style={{ backgroundColor: color }} />
+                      <span>{label}</span>
+                      <strong>{count}</strong>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="tag-list compact">{image.tags.map((tag) => <span key={tag}>{tag}</span>)}</div>
           </aside>
-        </div>
-        <div className="dialog-actions">
-          <button type="button" onClick={onClose}>关闭</button>
-          <button className="primary" type="button" onClick={onAnnotate}>
-            <Tags size={16} />
-            标记
-          </button>
         </div>
       </section>
     </div>
   );
+}
+
+type ImageFolderState = {
+  names: string[];
+  assignments: Record<string, string>;
+};
+
+function readImageFolderState(projectId: string): ImageFolderState {
+  try {
+    const stored = window.localStorage.getItem(`image-folders:${projectId}`);
+    if (!stored) return { names: [], assignments: {} };
+    const parsed = JSON.parse(stored) as Partial<ImageFolderState>;
+    return {
+      names: Array.isArray(parsed.names) ? parsed.names.filter((name): name is string => typeof name === "string") : [],
+      assignments: parsed.assignments && typeof parsed.assignments === "object"
+        ? parsed.assignments as Record<string, string>
+        : {},
+    };
+  } catch {
+    return { names: [], assignments: {} };
+  }
 }
 
 function ProjectWorkspace({
@@ -1608,6 +1798,11 @@ function ProjectWorkspace({
   const [tab, setTab] = useState<ProjectTab>(routeTab ?? "概览");
   const [imagePage, setImagePage] = useState(0);
   const [previewImageId, setPreviewImageId] = useState<string | null>(null);
+  const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
+  const [imageClassFilter, setImageClassFilter] = useState("all");
+  const [imageStatusFilter, setImageStatusFilter] = useState("all");
+  const [imageFolderFilter, setImageFolderFilter] = useState("all");
+  const [imageFolderWorkspace, setImageFolderWorkspace] = useState<FolderWorkspace>({ folders: [], members: [] });
   const [loadError, setLoadError] = useState<{ title: string; message: string } | null>(null);
   const [selectedClass, setSelectedClass] = useState<ClassStat | null>(null);
   const [classSamples, setClassSamples] = useState<ClassSample[]>([]);
@@ -1623,13 +1818,40 @@ function ProjectWorkspace({
     images.find((image) => image.id === previewImageId)
     ?? classSampleImages.find((image) => image.id === previewImageId)
     ?? null;
+  const folderForImage = (image: DatasetImage) =>
+    imageFolderWorkspace.members.find((member) => member.imageId === image.id)?.folderId ?? "";
+  const imageFolders = imageFolderWorkspace.folders;
+  const folderFilteredImages = imageFolderFilter === "all"
+    ? images
+    : images.filter((image) => folderForImage(image) === imageFolderFilter);
 
   useEffect(() => {
     setImagePage(0);
     setSelectedClass(null);
     setClassSamples([]);
     setClassSamplePage(0);
+    setImageFolderFilter("all");
+    const legacyFolders = readImageFolderState(projectId);
+    const migrationKey = `image-folders-migrated:${projectId}`;
+    const needsMigration = window.localStorage.getItem(migrationKey) !== "1"
+      && (legacyFolders.names.length > 0 || Object.keys(legacyFolders.assignments).length > 0);
+    const loadFolders = needsMigration
+      ? migrateLegacyProjectFolders(projectId, legacyFolders.names, legacyFolders.assignments)
+          .then((workspace) => {
+            window.localStorage.setItem(migrationKey, "1");
+            return workspace;
+          })
+      : listProjectFolders(projectId);
+    loadFolders
+      .then(setImageFolderWorkspace)
+      .catch((error) => setWorkflowMessage(error instanceof Error ? error.message : String(error)));
   }, [projectId]);
+
+  useEffect(() => {
+    setSelectedImageId(null);
+    setImageClassFilter("all");
+    setImageStatusFilter("all");
+  }, [projectId, imagePage]);
 
   useEffect(() => {
     if (routeTab) {
@@ -1742,6 +1964,55 @@ function ProjectWorkspace({
     }
   }
 
+  async function createImageFolder() {
+    const name = window.prompt("输入新文件夹名称")?.trim();
+    if (!name || name === "all" || imageFolders.some((folder) => folder.name === name)) return;
+    try {
+      const next = await createProjectFolder(projectId, name);
+      setImageFolderWorkspace(next);
+      setImageFolderFilter(next.folders.find((folder) => folder.name === name)?.id ?? "all");
+    } catch (error) {
+      setWorkflowMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function renameImageFolder() {
+    if (imageFolderFilter === "all") return;
+    const folder = imageFolders.find((item) => item.id === imageFolderFilter);
+    if (!folder) return;
+    const previousName = folder.name;
+    const nextName = window.prompt("重命名文件夹", previousName)?.trim();
+    if (!nextName || nextName === previousName || nextName === "all" || imageFolders.some((item) => item.name === nextName)) return;
+    try {
+      setImageFolderWorkspace(await renameProjectFolder(projectId, folder.id, nextName));
+    } catch (error) {
+      setWorkflowMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function deleteImageFolder() {
+    if (imageFolderFilter === "all") return;
+    const folder = imageFolders.find((item) => item.id === imageFolderFilter);
+    if (!folder || !window.confirm(`删除文件夹“${folder.name}”？其中图片将移至“未分组”。`)) return;
+    try {
+      setImageFolderWorkspace(await deleteProjectFolder(projectId, folder.id));
+      setImageFolderFilter("all");
+    } catch (error) {
+      setWorkflowMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function moveSelectedImageToFolder(folderId: string) {
+    if (!selectedImageId || !folderId) return;
+    try {
+      setImageFolderWorkspace(await moveImageToProjectFolder(projectId, selectedImageId, folderId));
+      const folderName = imageFolders.find((folder) => folder.id === folderId)?.name ?? folderId;
+      setWorkflowMessage(`已将选中图片移动到“${folderName}”`);
+    } catch (error) {
+      setWorkflowMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   if (loadError) {
     return (
       <main className="project-page">
@@ -1773,7 +2044,58 @@ function ProjectWorkspace({
           </div>
         </div>
         <section className={`project-surface ${tab === "概览" ? "overview-surface" : ""}`}>
-          {renderProjectTab(tab, detail, images, imageUrls, imageAnnotations, {
+          {tab === "图片" ? (
+            <div className="image-folder-toolbar" aria-label="图片文件夹操作">
+              <div className="image-folder-list" role="tablist" aria-label="图片文件夹">
+                <button
+                  aria-selected={imageFolderFilter === "all"}
+                  className={imageFolderFilter === "all" ? "active" : ""}
+                  role="tab"
+                  type="button"
+                  onClick={() => setImageFolderFilter("all")}
+                >
+                  <FolderOpen size={14} />
+                  全部
+                  <strong>{images.length}</strong>
+                </button>
+                {imageFolders.map((folder) => (
+                  <button
+                    aria-selected={imageFolderFilter === folder.id}
+                    className={imageFolderFilter === folder.id ? "active" : ""}
+                    key={folder.id}
+                    role="tab"
+                    type="button"
+                    onClick={() => setImageFolderFilter(folder.id)}
+                  >
+                    <FolderOpen size={14} />
+                    {folder.name}
+                    <strong>{folder.imageCount}</strong>
+                  </button>
+                ))}
+              </div>
+              <div className="image-folder-actions">
+                <button type="button" onClick={createImageFolder}>新建文件夹</button>
+                <button disabled={imageFolderFilter === "all"} type="button" onClick={renameImageFolder}>重命名</button>
+                <button disabled={imageFolderFilter === "all"} type="button" onClick={deleteImageFolder}>删除</button>
+                <select
+                  aria-label="移动选中图片到文件夹"
+                  disabled={!selectedImageId || imageFolders.length === 0}
+                  value=""
+                  onChange={(event) => moveSelectedImageToFolder(event.target.value)}
+                >
+                  <option value="">移动选中图片至…</option>
+                  {imageFolders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+                </select>
+              </div>
+            </div>
+          ) : null}
+          {renderProjectTab(
+            tab,
+            detail,
+            tab === "图片" ? folderFilteredImages : images,
+            imageUrls,
+            imageAnnotations,
+            {
             classSampleAnnotations,
             classSampleMessage,
             classSamplePage,
@@ -1781,18 +2103,24 @@ function ProjectWorkspace({
             classSampleUrls,
             classSamples,
             exports,
+            imageClassFilter,
             imagePage,
             imagePageSize: projectImagePageSize,
+            imageStatusFilter,
+            selectedImageId,
             selectedClass,
             snapshots,
             workflowMessage,
             onClassSamplePageChange: setClassSamplePage,
             onCreateSnapshot: handleCreateSnapshot,
             onExport: handleExport,
+            onImageClassFilterChange: setImageClassFilter,
             onImagePageChange: setImagePage,
+            onImageStatusFilterChange: setImageStatusFilter,
             onOpenClassSample: openAnnotationConsole,
             onOpenAnnotation: openAnnotationConsole,
             onPreviewImage: setPreviewImageId,
+            onSelectImage: setSelectedImageId,
             onSelectClass: (row) => {
               setSelectedClass(row);
               setClassSamplePage(0);
@@ -1804,9 +2132,12 @@ function ProjectWorkspace({
           <ImagePreviewDialog
             image={previewImage}
             imageUrl={imageUrls[previewImage.id] ?? classSampleUrls[previewImage.id]}
+            images={images.some((candidate) => candidate.id === previewImage.id) ? images : classSampleImages}
+            imageUrls={{ ...imageUrls, ...classSampleUrls }}
             objects={imageAnnotations[previewImage.id] ?? classSampleAnnotations[previewImage.id]}
             onAnnotate={() => openAnnotationConsole(previewImage.id)}
             onClose={() => setPreviewImageId(null)}
+            onSelectImage={setPreviewImageId}
           />
         ) : null}
       </section>
@@ -1830,8 +2161,11 @@ function renderProjectTab(
     classSampleAnnotations: Record<string, AnnotationObject[]>;
     snapshots: DatasetSnapshot[];
     exports: DatasetExport[];
+    imageClassFilter: string;
     imagePage: number;
     imagePageSize: number;
+    imageStatusFilter: string;
+    selectedImageId: string | null;
     workflowMessage: string | null;
     onSelectClass: (row: ClassStat) => void;
     onClassSamplePageChange: (page: number) => void;
@@ -1839,8 +2173,11 @@ function renderProjectTab(
     onOpenAnnotation: (imageId: string) => void;
     onCreateSnapshot: () => void;
     onExport: (format: "yolo" | "coco") => void;
+    onImageClassFilterChange: (value: string) => void;
     onImagePageChange: (page: number) => void;
+    onImageStatusFilterChange: (value: string) => void;
     onPreviewImage: (imageId: string) => void;
+    onSelectImage: (imageId: string | null) => void;
     onTabChange: (tab: ProjectTab) => void;
   },
 ) {
@@ -1877,40 +2214,126 @@ function renderProjectTab(
           </div>
         </div>
       );
-    case "图片":
+    case "图片": {
+      const classCounts = new Map<string, number>();
+      const pageObjectCount = images.reduce((total, image) => {
+        const imageObjects = imageAnnotations[image.id] ?? [];
+        imageObjects.forEach((object) => {
+          classCounts.set(object.label, (classCounts.get(object.label) ?? 0) + 1);
+        });
+        return total + imageObjects.length;
+      }, 0);
+      const classOptions = Array.from(classCounts.entries())
+        .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]));
+      const statusOptions = Array.from(new Set(images.map((image) => image.status))).sort();
+      const filteredImages = images.filter((image) => {
+        const matchesStatus = workflow.imageStatusFilter === "all" || image.status === workflow.imageStatusFilter;
+        const matchesClass = workflow.imageClassFilter === "all"
+          || (imageAnnotations[image.id] ?? []).some((object) => object.label === workflow.imageClassFilter);
+        return matchesStatus && matchesClass;
+      });
+
       return (
-        <div>
-          <div className="tab-header-row">
-            <div className="tab-title-stack">
-              <h2>图片浏览</h2>
-              <p>查看图像、预览已有标注，并从预览进入标记控制台。</p>
-            </div>
-            <div className="pager-actions">
-              <span>
-                第 {workflow.imagePage + 1} 页 / {formatNumber(detail.project.imageCount)} 张
-              </span>
-              <button type="button" onClick={() => workflow.onImagePageChange(Math.max(0, workflow.imagePage - 1))} disabled={workflow.imagePage === 0}>
-                上一页
-              </button>
+        <div className="image-browser">
+          <div className="image-browser-header">
+            <div className="image-browser-toolbar">
+              <div className="image-browser-stats" aria-label="本页图片统计">
+                <span><strong>{images.length}</strong><small>图片</small></span>
+                <span><strong>{filteredImages.length}</strong><small>结果</small></span>
+                <span><strong>{pageObjectCount}</strong><small>对象</small></span>
+                <span><strong>{classOptions.length}</strong><small>类别</small></span>
+              </div>
+              <div aria-label="按状态筛选" className="image-status-filter">
+                <button
+                  aria-pressed={workflow.imageStatusFilter === "all"}
+                  className={workflow.imageStatusFilter === "all" ? "active" : ""}
+                  type="button"
+                  onClick={() => workflow.onImageStatusFilterChange("all")}
+                >
+                  全部状态
+                </button>
+                {statusOptions.map((status) => (
+                  <button
+                    aria-pressed={workflow.imageStatusFilter === status}
+                    className={workflow.imageStatusFilter === status ? "active" : ""}
+                    key={status}
+                    type="button"
+                    onClick={() => workflow.onImageStatusFilterChange(status)}
+                  >
+                    {status}
+                  </button>
+                ))}
+              </div>
               <button
+                className="image-filter-reset"
+                disabled={workflow.imageClassFilter === "all" && workflow.imageStatusFilter === "all"}
                 type="button"
-                onClick={() => workflow.onImagePageChange(workflow.imagePage + 1)}
-                disabled={(workflow.imagePage + 1) * workflow.imagePageSize >= detail.project.imageCount}
+                onClick={() => {
+                  workflow.onImageClassFilterChange("all");
+                  workflow.onImageStatusFilterChange("all");
+                }}
               >
-                下一页
+                重置筛选
               </button>
+              <div className="pager-actions">
+                <span>第 {workflow.imagePage + 1} 页 / 共 {formatNumber(detail.project.imageCount)} 张</span>
+                <button type="button" onClick={() => workflow.onImagePageChange(Math.max(0, workflow.imagePage - 1))} disabled={workflow.imagePage === 0}>上一页</button>
+                <button
+                  type="button"
+                  onClick={() => workflow.onImagePageChange(workflow.imagePage + 1)}
+                  disabled={(workflow.imagePage + 1) * workflow.imagePageSize >= detail.project.imageCount}
+                >
+                  下一页
+                </button>
+              </div>
+            </div>
+            <div aria-label="按类别筛选" className="image-class-filter">
+              <button
+                aria-pressed={workflow.imageClassFilter === "all"}
+                className={workflow.imageClassFilter === "all" ? "active" : ""}
+                type="button"
+                onClick={() => workflow.onImageClassFilterChange("all")}
+              >
+                全部
+                <strong>{images.length}</strong>
+              </button>
+              {classOptions.map(([label, count]) => (
+                <button
+                  aria-pressed={workflow.imageClassFilter === label}
+                  className={workflow.imageClassFilter === label ? "active" : ""}
+                  key={label}
+                  type="button"
+                  onClick={() => workflow.onImageClassFilterChange(label)}
+                >
+                  <i style={{ backgroundColor: annotationColor(label) }} />
+                  {label}
+                  <strong>{count}</strong>
+                </button>
+              ))}
             </div>
           </div>
-          <div className="image-grid">
-            {images.map((image) => (
+          {filteredImages.length > 0 ? (
+          <div aria-label="图片选择列表" className="image-grid selectable-image-grid" role="listbox">
+            {filteredImages.map((image) => {
+              const imageObjects = imageAnnotations[image.id] ?? [];
+              const labels = Array.from(new Set(imageObjects.map((object) => object.label)));
+              const selected = workflow.selectedImageId === image.id;
+              return (
               <article
-                className="image-tile"
+                aria-label={`${image.fileName}，${imageObjects.length} 个检测对象`}
+                aria-selected={selected}
+                className={`image-tile ${selected ? "selected" : ""}`}
                 key={image.id}
-                onDoubleClick={() => navigate(`#/annotate/${detail.project.id}/${image.id}`)}
+                onClick={() => workflow.onSelectImage(image.id)}
+                onDoubleClick={() => workflow.onPreviewImage(image.id)}
                 tabIndex={0}
+                role="option"
                 onKeyDown={(event) => {
-                  if (event.key === "Enter" && event.currentTarget === event.target) {
-                    navigate(`#/annotate/${detail.project.id}/${image.id}`);
+                  if (event.key === "Enter") {
+                    workflow.onPreviewImage(image.id);
+                  } else if (event.key === " ") {
+                    event.preventDefault();
+                    workflow.onSelectImage(image.id);
                   }
                 }}
               >
@@ -1920,25 +2343,31 @@ function renderProjectTab(
                   ) : null}
                   <ThumbnailAnnotationOverlay image={image} objects={imageAnnotations[image.id]} />
                 </div>
-                <span>{image.fileName}</span>
-                <em>{image.status}</em>
-                <div className="image-tile-actions">
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      workflow.onPreviewImage(image.id);
-                    }}
-                  >
-                    <Eye size={15} />
-                    预览 {image.fileName}
-                  </button>
+                <div className="image-tile-meta">
+                  <span title={image.fileName}>{image.fileName}</span>
+                </div>
+                <div className="image-tile-classes">
+                  {labels.slice(0, 3).map((label) => (
+                    <span key={label}><i style={{ backgroundColor: annotationColor(label) }} />{label}</span>
+                  ))}
+                  {labels.length > 3 ? <span>+{labels.length - 3}</span> : null}
+                  {labels.length === 0 ? <span className="empty">无检测对象</span> : null}
+                  <strong aria-label={`${imageObjects.length} 个对象`} title={`${imageObjects.length} 个对象`}>{imageObjects.length}</strong>
                 </div>
               </article>
-            ))}
+              );
+            })}
           </div>
+          ) : (
+            <div className="image-filter-empty">
+              <ImageIcon size={22} />
+              <strong>没有符合筛选条件的图片</strong>
+              <span>重置类别或状态筛选后继续浏览。</span>
+            </div>
+          )}
         </div>
       );
+    }
     case "类别":
       const matchedObjectCount = workflow.classSamples.reduce((sum, sample) => sum + sample.matchCount, 0);
       return (
@@ -2039,18 +2468,7 @@ function renderProjectTab(
         </div>
       );
     case "质检":
-      return (
-        <div className="quality-layout">
-          <h2>质检队列</h2>
-          {detail.qualityChecks.length === 0 ? <p>暂无质检问题</p> : detail.qualityChecks.map((item) => (
-            <div className={`quality-card ${item.severity}`} key={item.name}>
-              <strong>{item.name}</strong>
-              <span>{item.count}</span>
-              <button type="button">查看样本</button>
-            </div>
-          ))}
-        </div>
-      );
+      return <HybridProjectPanel projectId={detail.project.id} />;
     case "导出":
       return (
         <div>
@@ -2140,6 +2558,26 @@ function ProjectOverview({
   const topClasses = detail.classes.slice(0, 6);
   const largestClass = Math.max(1, ...topClasses.map((row) => row.count));
   const firstImage = images[0];
+  const densitySamples = images.slice(0, 12);
+  const densityValues = densitySamples.map((image) => imageAnnotations[image.id]?.length ?? 0);
+  const densityMax = Math.max(1, ...densityValues);
+  const densityAverage = densityValues.length > 0
+    ? densityValues.reduce((sum, value) => sum + value, 0) / densityValues.length
+    : 0;
+  const densityPoints = densityValues.map((value, index) => ({
+    x: 18 + index * (604 / Math.max(1, densityValues.length - 1)),
+    y: 116 - value / densityMax * 86,
+  }));
+  const densityLine = densityPoints.reduce((path, point, index) => {
+    if (index === 0) return `M ${point.x.toFixed(1)} ${point.y.toFixed(1)}`;
+    const previous = densityPoints[index - 1];
+    const controlX = (previous.x + point.x) / 2;
+    return `${path} C ${controlX.toFixed(1)} ${previous.y.toFixed(1)}, ${controlX.toFixed(1)} ${point.y.toFixed(1)}, ${point.x.toFixed(1)} ${point.y.toFixed(1)}`;
+  }, "");
+  const densityArea = densityPoints.length > 0
+    ? `${densityLine} L ${densityPoints[densityPoints.length - 1].x.toFixed(1)} 124 L ${densityPoints[0].x.toFixed(1)} 124 Z`
+    : "";
+  const completionAngle = Math.max(0, Math.min(360, project.annotatedPercent * 3.6));
 
   return (
     <div className="project-overview">
@@ -2218,6 +2656,80 @@ function ProjectOverview({
           </div>
         </section>
       </div>
+
+      <section className="overview-section overview-analytics" aria-label="数据趋势">
+        <div className="overview-section-header compact">
+          <div>
+            <span className="section-kicker">ANALYTICS</span>
+            <h2>数据趋势</h2>
+          </div>
+          <span className="chart-scope">当前加载样本</span>
+        </div>
+        <div className="overview-chart-grid">
+          <article className="overview-chart-card">
+            <div className="chart-card-heading">
+              <div>
+                <strong>对象密度</strong>
+                <span>最近 {densitySamples.length} 个样本的标注对象数</span>
+              </div>
+              <div className="chart-value">
+                <strong>{densityAverage.toFixed(1)}</strong>
+                <span>平均对象 / 图</span>
+              </div>
+            </div>
+            <div className="density-chart">
+              <svg aria-label="对象密度曲线" role="img" viewBox="0 0 640 132">
+                <defs>
+                  <linearGradient id="density-chart-fill" x1="0" x2="0" y1="0" y2="1">
+                    <stop offset="0%" stopColor="#1769e0" stopOpacity="0.24" />
+                    <stop offset="100%" stopColor="#1769e0" stopOpacity="0.02" />
+                  </linearGradient>
+                </defs>
+                <line className="chart-grid-line" x1="18" x2="622" y1="30" y2="30" />
+                <line className="chart-grid-line" x1="18" x2="622" y1="73" y2="73" />
+                <line className="chart-grid-line" x1="18" x2="622" y1="116" y2="116" />
+                {densityArea ? <path className="density-area" d={densityArea} /> : null}
+                {densityLine ? <path className="density-line" d={densityLine} /> : null}
+                {densityPoints.length > 0 ? (
+                  <circle
+                    className="density-last-point"
+                    cx={densityPoints[densityPoints.length - 1].x}
+                    cy={densityPoints[densityPoints.length - 1].y}
+                    r="4"
+                  />
+                ) : null}
+              </svg>
+              <div className="chart-axis">
+                <span>样本 1</span>
+                <span>样本 {Math.max(1, densitySamples.length)}</span>
+              </div>
+            </div>
+          </article>
+
+          <article className="overview-chart-card status-chart-card">
+            <div className="chart-card-heading">
+              <div>
+                <strong>工作状态</strong>
+                <span>标注、待处理与审核分布</span>
+              </div>
+            </div>
+            <div className="status-chart">
+              <div
+                aria-label={`标注完成度 ${project.annotatedPercent}%`}
+                className="status-donut"
+                style={{ background: `conic-gradient(#1769e0 0deg ${completionAngle}deg, #e8edf4 ${completionAngle}deg 360deg)` }}
+              >
+                <span><strong>{project.annotatedPercent}%</strong><small>完成</small></span>
+              </div>
+              <div className="status-chart-legend">
+                <span><i className="complete" /><b>已标注</b><strong>{formatNumber(annotatedCount)}</strong></span>
+                <span><i className="pending" /><b>待标注</b><strong>{formatNumber(remainingCount)}</strong></span>
+                <span><i className="review" /><b>待审核</b><strong>{formatNumber(project.reviewCount)}</strong></span>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
 
       <div className="project-overview-secondary">
         <section className="overview-section overview-recent" aria-label="最近样本">

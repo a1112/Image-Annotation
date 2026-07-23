@@ -221,3 +221,161 @@ export type ProjectManifest = {
   classCount: number;
   imageCount: number;
 };
+
+export type IssueSeverity = "blocker" | "critical" | "major" | "minor" | "suggestion";
+export type IssueStatus = "open" | "in_progress" | "resolved" | "pending_review" | "closed" | "reopened";
+
+export type IssueRecord = {
+  id: string;
+  projectId: string;
+  imageId: string;
+  annotationObjectId: string | null;
+  title: string;
+  description: string;
+  severity: IssueSeverity;
+  status: IssueStatus;
+  source: string;
+  reporterId: string;
+  assigneeId: string | null;
+  dueAt: string | null;
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt: string | null;
+  deletedAt: string | null;
+};
+
+export type IssueComment = {
+  id: string;
+  issueId: string;
+  authorId: string;
+  content: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type SyncSummary = {
+  projectId: string;
+  projectMode: "local_only" | "cloud_linked" | "mirrored";
+  pendingOperations: number;
+  failedOperations: number;
+  conflictCount: number;
+  lastPulledAt: string | null;
+  lastPushedAt: string | null;
+};
+
+export type RemoteProjectConfig = {
+  projectId: string;
+  serverUrl: string;
+  remoteProjectId: string;
+  deviceId: string;
+  cachePolicy: "thumbnail_only" | "on_demand" | "full_mirror";
+  autoSync: boolean;
+};
+
+export type AssetCacheRecord = {
+  assetId: string;
+  contentHash: string;
+  localPath: string;
+  cacheKind: string;
+  byteSize: number;
+  lastAccessedAt: string;
+  verifiedAt: string | null;
+  pinned: boolean;
+};
+
+export type AssetCacheSummary = {
+  entryCount: number;
+  byteSize: number;
+  pinnedCount: number;
+};
+
+export type AssetCacheCleanupResult = {
+  removedCount: number;
+  removedBytes: number;
+  remaining: AssetCacheSummary;
+};
+
+export type HybridDiagnostics = {
+  projectId: string;
+  projectMode: "local_only" | "cloud_linked" | "mirrored";
+  serverUrl: string | null;
+  remoteProjectId: string | null;
+  deviceId: string | null;
+  cachePolicy: "thumbnail_only" | "on_demand" | "full_mirror" | null;
+  autoSync: boolean;
+  cursor: string | null;
+  lastPulledAt: string | null;
+  lastPushedAt: string | null;
+  pendingOperations: number;
+  retryingOperations: number;
+  failedOperations: number;
+  oldestPendingAt: string | null;
+  conflictCount: number;
+  cacheEntries: number;
+  cacheBytes: number;
+  lastError: string | null;
+};
+
+export type ProjectRole = "owner" | "manager" | "annotator" | "reviewer" | "viewer";
+
+export type RemoteProjectMember = {
+  userId: string;
+  role: ProjectRole;
+  joinedAt: string | null;
+};
+
+export type PublishProjectResult = {
+  remoteProjectId: string;
+  createdRemoteProject: boolean;
+  uploadedAssets: number;
+  reusedAssets: number;
+  initializedAnnotations: number;
+  conflicts: number;
+  sync: SyncRunResult;
+};
+
+export type SyncRunResult = {
+  projectId: string;
+  pushed: number;
+  pulled: number;
+  conflicts: number;
+  failed: number;
+  cursor: string;
+};
+
+export type SyncConflict = {
+  id: string;
+  projectId: string;
+  entityType: string;
+  entityId: string;
+  base: unknown | null;
+  local: unknown;
+  remote: unknown;
+  status: string;
+  createdAt: string;
+  resolvedAt: string | null;
+};
+
+export type FolderRecord = {
+  id: string;
+  projectId: string;
+  parentId: string | null;
+  name: string;
+  sortOrder: number;
+  revision: number;
+  imageCount: number;
+  syncStatus: string;
+};
+
+export type FolderMemberRecord = {
+  folderId: string;
+  imageId: string;
+  revision: number;
+  syncStatus: string;
+};
+
+export type FolderWorkspace = {
+  folders: FolderRecord[];
+  members: FolderMemberRecord[];
+};
