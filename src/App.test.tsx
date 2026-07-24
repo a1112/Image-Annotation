@@ -8,6 +8,7 @@ const tauriState = vi.hoisted(() => ({
   backendAvailable: true,
   builtinDownloaded: true,
   localOpened: false,
+  analysisFormat: "voc-detect",
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -81,6 +82,32 @@ vi.mock("@tauri-apps/api/core", () => ({
     }
 
     if (command === "get_project_detail") {
+      if (args?.projectId === "classification-demo") {
+        return {
+          project: {
+            id: "classification-demo",
+            name: "Classification Demo",
+            description: "图像分类测试数据集",
+            annotationTypes: ["Classification"],
+            imageCount: 1,
+            annotatedPercent: 100,
+            reviewCount: 0,
+            issueCount: 0,
+            classCount: 2,
+            tagGroupCount: 1,
+            status: "已导入",
+            tags: ["format: image-classification"],
+          },
+          tagGroups: [],
+          classes: [
+            { id: 0, label: "cat", color: "#cc54d8", count: 1, attributes: [] },
+            { id: 1, label: "dog", color: "#1fa7ff", count: 0, attributes: [] },
+          ],
+          tasks: [],
+          qualityChecks: [],
+          exportPresets: [],
+        };
+      }
       if (args?.projectId === "local-out") {
         return {
           project: {
@@ -138,6 +165,19 @@ vi.mock("@tauri-apps/api/core", () => ({
     }
 
     if (command === "list_project_images") {
+      if (args?.projectId === "classification-demo") {
+        return [{
+          id: "cat_001",
+          fileName: "cat/cat_001.jpg",
+          width: 640,
+          height: 480,
+          split: "train",
+          status: "已标注",
+          qaStatus: "",
+          reviewNote: null,
+          tags: ["split=train"],
+        }];
+      }
       const imageIds = [
         "000000000009",
         "000000000025",
@@ -241,6 +281,21 @@ vi.mock("@tauri-apps/api/core", () => ({
     }
 
     if (command === "get_image_annotation_state") {
+      if (args?.projectId === "classification-demo") {
+        return {
+          imageId: args?.imageId,
+          revision: "rev-classification-1",
+          status: "已标注",
+          updatedAt: "1778638136",
+          objects: [{
+            id: "classification-cat_001",
+            classId: 0,
+            label: "cat",
+            type: "classification",
+            attributes: { source: "directory" },
+          }],
+        };
+      }
       return {
         imageId: args?.imageId,
         revision: "rev-1",
@@ -339,16 +394,21 @@ vi.mock("@tauri-apps/api/core", () => ({
     }
 
     if (command === "analyze_data_source") {
+      const classes = tauriState.analysisFormat === "image-classification"
+        ? ["cat", "dog"]
+        : tauriState.analysisFormat === "yolo-seg"
+          ? ["region"]
+          : ["defect"];
       return {
         sourcePaths: args?.sourcePaths,
         rootPath: "L:\\data_tool\\datas\\lg\\1580_2d\\新建文件夹\\2D数据标注原始\\out",
         sourceKind: "folder",
-        detectedFormat: "voc-detect",
+        detectedFormat: tauriState.analysisFormat,
         recommendedAction: "open-local",
         imageCount: 128,
         annotationCount: 128,
-        classCount: 1,
-        classes: ["defect"],
+        classCount: classes.length,
+        classes,
         splitCount: 1,
         warnings: [],
         tree: [
@@ -447,6 +507,7 @@ beforeEach(() => {
   tauriState.backendAvailable = true;
   tauriState.builtinDownloaded = true;
   tauriState.localOpened = false;
+  tauriState.analysisFormat = "voc-detect";
   vi.stubGlobal(
     "fetch",
     vi.fn(async () => {
@@ -747,6 +808,44 @@ describe("desktop shell", () => {
     expect(window.location.hash).toBe("#/datasets/local-out");
   });
 
+  it("数据提交会保留自动识别的 YOLO 分割类型", async () => {
+    const user = userEvent.setup();
+    tauriState.analysisFormat = "yolo-seg";
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(screen.getByRole("button", { name: /选择文件夹/ }));
+
+    expect(await screen.findByRole("heading", { name: "YOLO Polygon" })).toBeInTheDocument();
+    expect(screen.getByLabelText("数据类型")).toHaveValue("yolo-seg");
+    await user.click(screen.getByRole("button", { name: "确认导入" }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("open_local_dataset", expect.objectContaining({
+        datasetType: "yolo-seg",
+      })),
+    );
+  });
+
+  it("数据提交会保留自动识别的图像分类目录类型", async () => {
+    const user = userEvent.setup();
+    tauriState.analysisFormat = "image-classification";
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(screen.getByRole("button", { name: /选择文件夹/ }));
+
+    expect(await screen.findByRole("heading", { name: "图像分类目录" })).toBeInTheDocument();
+    expect(screen.getByLabelText("数据类型")).toHaveValue("image-classification");
+    await user.click(screen.getByRole("button", { name: "确认导入" }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("open_local_dataset", expect.objectContaining({
+        datasetType: "image-classification",
+      })),
+    );
+  });
+
   it("数据提交弹窗选择来源后展示导入确认细节", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -1030,8 +1129,9 @@ describe("desktop shell", () => {
       expect.stringContaining("asset://"),
     );
     expect(within(dialog).getByText("640 x 480")).toBeInTheDocument();
-    expect(within(dialog).getByText("对象数")).toBeInTheDocument();
-    expect(within(dialog).getByText("1")).toBeInTheDocument();
+    const objectCountLabel = within(dialog).getByText("对象数");
+    expect(objectCountLabel).toBeInTheDocument();
+    expect(within(objectCountLabel.parentElement as HTMLElement).getByText("1")).toBeInTheDocument();
     expect(within(dialog).getByLabelText("000000000009.jpg 标注预览")).toBeInTheDocument();
   });
 
@@ -1185,6 +1285,77 @@ describe("desktop shell", () => {
           objects: expect.not.arrayContaining([
             expect.objectContaining({ label: "object" }),
           ]),
+        }),
+      ),
+    );
+  });
+
+  it("标注控制台支持逐点绘制、闭合并保存 polygon", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+
+    render(<App />);
+
+    const canvas = await screen.findByTestId("annotation-canvas");
+    await user.click(screen.getByRole("button", { name: "Polygon" }));
+
+    fireEvent.mouseDown(canvas, { button: 0, clientX: 120, clientY: 120 });
+    fireEvent.mouseUp(canvas, { button: 0, clientX: 120, clientY: 120 });
+    fireEvent.mouseDown(canvas, { button: 0, clientX: 260, clientY: 130 });
+    fireEvent.mouseUp(canvas, { button: 0, clientX: 260, clientY: 130 });
+    fireEvent.mouseDown(canvas, { button: 0, clientX: 220, clientY: 260 });
+    fireEvent.mouseUp(canvas, { button: 0, clientX: 220, clientY: 260 });
+    fireEvent.keyDown(window, { key: "Enter" });
+
+    expect(await screen.findByText("polygon")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "save_image_annotations",
+        expect.objectContaining({
+          revision: "rev-1",
+          objects: expect.arrayContaining([
+            expect.objectContaining({
+              type: "polygon",
+              polygon: expect.arrayContaining([
+                expect.objectContaining({ x: expect.any(Number), y: expect.any(Number) }),
+              ]),
+            }),
+          ]),
+        }),
+      ),
+    );
+  });
+
+  it("分类数据集支持在工作台修改单标签分类并保存", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/classification-demo/cat_001";
+
+    render(<App />);
+
+    const classification = await screen.findByLabelText("图片分类");
+    expect(classification).toHaveValue("0");
+    expect(screen.queryByRole("button", { name: "BBox" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Polygon" })).not.toBeInTheDocument();
+
+    await user.selectOptions(classification, "1");
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "save_image_annotations",
+        expect.objectContaining({
+          projectId: "classification-demo",
+          imageId: "cat_001",
+          revision: "rev-classification-1",
+          objects: [
+            expect.objectContaining({
+              classId: 1,
+              label: "dog",
+              type: "classification",
+            }),
+          ],
         }),
       ),
     );

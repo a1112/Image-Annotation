@@ -126,6 +126,38 @@ pub fn annotations_to_yolo_lines(
     Ok(lines)
 }
 
+pub fn annotations_to_yolo_polygon_lines(
+    objects: &[AnnotationObject],
+    image_width: u32,
+    image_height: u32,
+) -> Result<String, String> {
+    if image_width == 0 || image_height == 0 {
+        return Err("image dimensions are required for YOLO export".to_string());
+    }
+
+    let mut lines = String::new();
+    for object in objects {
+        let Some(polygon) = object.polygon.as_ref() else {
+            continue;
+        };
+        if polygon.len() < 3 {
+            return Err(format!(
+                "polygon annotation '{}' must contain at least 3 points",
+                object.id
+            ));
+        }
+
+        lines.push_str(&object.class_id.to_string());
+        for point in polygon {
+            let x = point.x.clamp(0.0, image_width as f64) / image_width as f64;
+            let y = point.y.clamp(0.0, image_height as f64) / image_height as f64;
+            lines.push_str(&format!(" {x:.6} {y:.6}"));
+        }
+        lines.push('\n');
+    }
+    Ok(lines)
+}
+
 fn parse_f64_values(line: &str) -> Result<Vec<f64>, String> {
     line.split_whitespace()
         .map(|part| {

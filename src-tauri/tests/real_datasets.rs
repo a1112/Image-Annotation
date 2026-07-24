@@ -2,7 +2,10 @@ use image_annotation_lib::{
     datasets::builtin_datasets,
     domain::{AnnotationObject, BBox},
     http_backend::{backend_base_url, backend_bind_addr, health_payload},
-    importers::yolo::{annotations_to_yolo_lines, parse_yolo_bbox_line, parse_yolo_polygon_line},
+    importers::yolo::{
+        annotations_to_yolo_lines, annotations_to_yolo_polygon_lines, parse_yolo_bbox_line,
+        parse_yolo_polygon_line,
+    },
     project_fs::{safe_extract_path, test_data_root, workspace_data_root},
     windows::{annotation_route, backend_tasks_route},
 };
@@ -112,6 +115,27 @@ fn yolo_polygon_lines_convert_to_pixel_points() {
     assert_eq!(parsed.polygon[0].y, 40.0);
     assert_eq!(parsed.polygon[2].x, 50.0);
     assert_eq!(parsed.polygon[2].y, 160.0);
+}
+
+#[test]
+fn yolo_polygon_objects_write_normalized_segmentation_lines() {
+    let objects = vec![AnnotationObject::polygon(
+        "ann-1".to_string(),
+        4,
+        "region".to_string(),
+        vec![
+            image_annotation_lib::domain::Point { x: 10.0, y: 40.0 },
+            image_annotation_lib::domain::Point { x: 50.0, y: 40.0 },
+            image_annotation_lib::domain::Point { x: 50.0, y: 160.0 },
+        ],
+    )];
+
+    let lines = annotations_to_yolo_polygon_lines(&objects, 100, 200).unwrap();
+
+    assert_eq!(
+        lines,
+        "4 0.100000 0.200000 0.500000 0.200000 0.500000 0.800000\n"
+    );
 }
 
 #[test]

@@ -107,9 +107,9 @@ export function HybridProjectPanel({ projectId }: { projectId: string }) {
       listSyncConflicts(projectId),
       getHybridDiagnostics(projectId),
     ]);
-    setIssues(nextIssues);
+    setIssues(nextIssues ?? []);
     setSummary(nextSummary);
-    setConflicts(nextConflicts);
+    setConflicts(nextConflicts ?? []);
     setDiagnostics(nextDiagnostics);
   }, [projectId]);
 
@@ -127,7 +127,7 @@ export function HybridProjectPanel({ projectId }: { projectId: string }) {
       return;
     }
     listIssueComments(projectId, selectedIssueId)
-      .then(setComments)
+      .then((nextComments) => setComments(nextComments ?? []))
       .catch((error) => setMessage(error instanceof Error ? error.message : String(error)));
   }, [projectId, selectedIssueId]);
 

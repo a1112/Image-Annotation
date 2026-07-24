@@ -101,7 +101,7 @@ export type AnnotationObject = {
   id: string;
   classId: number;
   label: string;
-  type: "bbox" | "polygon";
+  type: "bbox" | "polygon" | "classification";
   bbox?: BBox;
   polygon?: Point[];
   attributes: Record<string, string | number | boolean>;

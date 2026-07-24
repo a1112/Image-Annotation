@@ -478,22 +478,32 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
         .iter()
         .filter(|path| has_extension(path, "txt") && path_contains_segment(path, "labels"))
         .count() as u32;
+    let classification_classes = indexed_classification_labels(&root);
     let mut classes = if xml_count > 0 {
         indexed_voc_labels_from_files(&scan_files)
-    } else {
+    } else if yolo_label_count > 0 {
         indexed_yolo_labels(&root)
+    } else {
+        classification_classes.clone()
     };
+    let detected_yolo_format = detect_yolo_annotation_format(&scan_files);
     let detected_format = if xml_count > 0 {
         "voc-detect"
+    } else if let Some(format) = detected_yolo_format {
+        format
     } else if yolo_label_count > 0 || !classes.is_empty() {
-        "yolo-detect"
+        if !classification_classes.is_empty() && yolo_label_count == 0 {
+            "image-classification"
+        } else {
+            "yolo-detect"
+        }
     } else if image_count > 0 {
         "image-directory"
     } else {
         "unknown"
     }
     .to_string();
-    if classes.is_empty() && detected_format == "yolo-detect" {
+    if classes.is_empty() && matches!(detected_format.as_str(), "yolo-detect" | "yolo-seg") {
         classes = indexed_yolo_label_ids_from_files(&scan_files)
             .into_iter()
             .max()
@@ -502,15 +512,19 @@ pub fn analyze_data_source(source_paths: &[String]) -> Result<DataSourceAnalysis
     }
     let annotation_count = if detected_format == "voc-detect" {
         xml_count
-    } else if detected_format == "yolo-detect" {
+    } else if matches!(detected_format.as_str(), "yolo-detect" | "yolo-seg") {
         yolo_label_count
+    } else if detected_format == "image-classification" {
+        image_count
     } else {
         0
     };
     let split_count = detected_splits(&scan_files).len() as u32;
     let recommended_action = if source_kind == "folder"
-        && (detected_format == "voc-detect" || detected_format == "yolo-detect")
-    {
+        && matches!(
+            detected_format.as_str(),
+            "voc-detect" | "yolo-detect" | "yolo-seg" | "image-classification"
+        ) {
         "open-local"
     } else {
         "copy-images"
@@ -643,10 +657,11 @@ pub fn open_local_dataset(
     let canonical = fs::canonicalize(&source).unwrap_or(source);
     let project_id = linked_project_id(&canonical);
     let paths = project_fs::ensure_workspace_project_dirs(&project_id)?;
-    let format = if dataset_type == "voc-detect" {
-        "voc-detect"
-    } else {
-        "yolo-detect"
+    let format = match dataset_type {
+        "voc-detect" => "voc-detect",
+        "yolo-seg" => "yolo-seg",
+        "image-classification" => "image-classification",
+        _ => "yolo-detect",
     };
     let images = indexed_local_images(&canonical, format);
     let labels = local_labels_for_format(&canonical, format);
@@ -970,10 +985,15 @@ fn indexed_local_images(root: &Path, format: &str) -> Vec<storage::StoredImage> 
 fn local_image_has_annotation(root: &Path, image_path: &Path, format: &str) -> bool {
     match format {
         "voc-detect" => image_path.with_extension("xml").exists(),
-        "yolo-detect" => {
+        "yolo-detect" | "yolo-seg" => {
             yolo_label_path_for_local_image(root, image_path).is_some()
                 || image_path.with_extension("txt").exists()
         }
+        "image-classification" => image_path
+            .parent()
+            .and_then(Path::file_name)
+            .map(|name| !is_generic_classification_directory(&name.to_string_lossy()))
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -996,7 +1016,8 @@ fn yolo_label_path_for_local_image(root: &Path, image_path: &Path) -> Option<Pat
 fn local_labels_for_format(root: &Path, format: &str) -> Vec<String> {
     match format {
         "voc-detect" => indexed_voc_labels(root),
-        "yolo-detect" => indexed_yolo_labels(root),
+        "yolo-detect" | "yolo-seg" => indexed_yolo_labels(root),
+        "image-classification" => indexed_classification_labels(root),
         _ => Vec::new(),
     }
 }
@@ -1069,6 +1090,73 @@ fn indexed_yolo_labels(root: &Path) -> Vec<String> {
     max_class_id
         .map(|max_id| (0..=max_id).map(|id| format!("class_{id}")).collect())
         .unwrap_or_default()
+}
+
+fn indexed_classification_labels(root: &Path) -> Vec<String> {
+    let mut labels = BTreeSet::new();
+    for image_path in indexed_image_paths(root) {
+        let Ok(relative) = image_path.strip_prefix(root) else {
+            continue;
+        };
+        let Some(parent) = relative.parent() else {
+            continue;
+        };
+        let Some(label) = parent.file_name() else {
+            continue;
+        };
+        let label = label.to_string_lossy();
+        if !is_generic_classification_directory(&label) {
+            labels.insert(label.to_string());
+        }
+    }
+    labels.into_iter().collect()
+}
+
+fn is_generic_classification_directory(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "" | "images"
+            | "image"
+            | "train"
+            | "training"
+            | "val"
+            | "valid"
+            | "validation"
+            | "test"
+            | "testing"
+            | "unlabeled"
+            | "unlabelled"
+    )
+}
+
+fn detect_yolo_annotation_format(paths: &[PathBuf]) -> Option<&'static str> {
+    let mut bbox_lines = 0usize;
+    let mut polygon_lines = 0usize;
+
+    for path in paths
+        .iter()
+        .filter(|path| has_extension(path, "txt") && path_contains_segment(path, "labels"))
+    {
+        let Ok(data) = fs::read_to_string(path) else {
+            continue;
+        };
+        for line in data.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let value_count = line.split_whitespace().count();
+            if value_count == 5 {
+                bbox_lines += 1;
+            } else if value_count >= 7 && value_count % 2 == 1 {
+                polygon_lines += 1;
+            }
+        }
+    }
+
+    if polygon_lines > 0 && polygon_lines >= bbox_lines {
+        Some("yolo-seg")
+    } else if bbox_lines > 0 {
+        Some("yolo-detect")
+    } else {
+        None
+    }
 }
 
 fn indexed_yolo_label_ids_from_files(paths: &[PathBuf]) -> Vec<u32> {
@@ -1384,6 +1472,34 @@ mod tests {
             .join("demo_001.txt")
             .exists());
         assert_eq!(storage::read_images(&paths.sqlite, None).unwrap().len(), 3);
+        let analysis = analyze_data_source(&[paths.raw.to_string_lossy().to_string()]).unwrap();
+        assert_eq!(analysis.detected_format, "image-classification");
+        assert_eq!(analysis.annotation_count, 3);
+        assert_eq!(analysis.class_count, 3);
+        let repository = domain::SampleRepository::new();
+        let state = repository.image_annotation_state(&project.id, "demo_001");
+        assert_eq!(state.objects.len(), 1);
+        assert_eq!(state.objects[0].object_type, "classification");
+        assert_eq!(state.objects[0].label, "object");
+        repository
+            .save_image_annotations_with_revision(
+                &project.id,
+                "demo_001",
+                None,
+                vec![domain::AnnotationObject::classification(
+                    "classification-demo_001".to_string(),
+                    2,
+                    "defect".to_string(),
+                )],
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .image_annotation_state(&project.id, "demo_001")
+                .objects[0]
+                .label,
+            "defect"
+        );
 
         let _ = fs::remove_dir_all(paths.root);
     }
@@ -1581,6 +1697,60 @@ mod tests {
         let txt = fs::read_to_string(source_root.join("labels").join("train").join("sample.txt"))
             .unwrap();
         assert_eq!(txt, "1 0.500000 0.450000 0.500000 0.500000\n");
+
+        let _ = fs::remove_dir_all(paths.root);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn detects_and_writes_local_yolo_segmentation_datasets() {
+        let source_root = std::env::temp_dir().join("image_annotation_yolo_seg_save_test");
+        let _ = fs::remove_dir_all(&source_root);
+        fs::create_dir_all(source_root.join("images").join("train")).unwrap();
+        fs::create_dir_all(source_root.join("labels").join("train")).unwrap();
+        let image_path = source_root.join("images").join("train").join("sample.png");
+        write_demo_image(&image_path, 1).unwrap();
+        fs::write(source_root.join("classes.txt"), "region\n").unwrap();
+        fs::write(
+            source_root.join("labels").join("train").join("sample.txt"),
+            "0 0.100000 0.200000 0.500000 0.200000 0.500000 0.800000\n",
+        )
+        .unwrap();
+        let analysis = analyze_data_source(&[source_root.to_string_lossy().to_string()]).unwrap();
+        assert_eq!(analysis.detected_format, "yolo-seg");
+
+        let stale_project_id = linked_project_id(&fs::canonicalize(&source_root).unwrap());
+        let _ = fs::remove_dir_all(project_fs::project_paths(&stale_project_id).root);
+        let project = open_local_dataset(&source_root.to_string_lossy(), "yolo-seg").unwrap();
+        let paths = project_fs::project_paths(&project.id);
+        let repository = domain::SampleRepository::new();
+        let state = repository.image_annotation_state(&project.id, "images_train_sample");
+        assert_eq!(state.objects[0].object_type, "polygon");
+
+        repository
+            .save_image_annotations_with_revision(
+                &project.id,
+                "images_train_sample",
+                None,
+                vec![domain::AnnotationObject::polygon(
+                    "ann-1".to_string(),
+                    0,
+                    "region".to_string(),
+                    vec![
+                        domain::Point { x: 64.0, y: 84.0 },
+                        domain::Point { x: 320.0, y: 84.0 },
+                        domain::Point { x: 320.0, y: 336.0 },
+                    ],
+                )],
+            )
+            .unwrap();
+
+        let txt = fs::read_to_string(source_root.join("labels").join("train").join("sample.txt"))
+            .unwrap();
+        assert_eq!(
+            txt,
+            "0 0.100000 0.200000 0.500000 0.200000 0.500000 0.800000\n"
+        );
 
         let _ = fs::remove_dir_all(paths.root);
         let _ = fs::remove_dir_all(source_root);
