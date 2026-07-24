@@ -104,6 +104,18 @@ impl AnnotationObject {
             attributes: BTreeMap::new(),
         }
     }
+
+    pub fn classification(id: String, class_id: u32, label: String) -> Self {
+        Self {
+            id,
+            class_id,
+            label,
+            object_type: "classification".to_string(),
+            bbox: None,
+            polygon: None,
+            attributes: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -689,6 +701,30 @@ impl SampleRepository {
                 updated_at: None,
             };
         };
+        if is_classification_project(project_id) {
+            let classes = storage::read_classes(&paths.sqlite).unwrap_or_default();
+            if let Some((class_id, label)) = classification_for_image(&image_path, &classes) {
+                return AnnotationState {
+                    image_id: image_id.to_string(),
+                    revision: None,
+                    objects: vec![AnnotationObject::classification(
+                        format!("classification-{image_id}"),
+                        class_id,
+                        label,
+                    )],
+                    status: image_status(project_id, image_id)
+                        .unwrap_or_else(|| "已标注".to_string()),
+                    updated_at: None,
+                };
+            }
+            return AnnotationState {
+                image_id: image_id.to_string(),
+                revision: None,
+                objects: Vec::new(),
+                status: image_status(project_id, image_id).unwrap_or_else(|| "未标注".to_string()),
+                updated_at: None,
+            };
+        }
         if is_voc_project(project_id) {
             let label_path = image_path.with_extension("xml");
             if let Ok(xml) = fs::read_to_string(label_path) {
@@ -806,14 +842,18 @@ impl SampleRepository {
                 fs::write(image_path.with_extension("xml"), xml).map_err(|err| err.to_string())?;
             }
         }
-        if is_yolo_detect_project(project_id) {
+        if let Some(yolo_format) = yolo_project_format(project_id) {
             if let Some(image_path) = self.image_path(project_id, image_id) {
                 let (width, height) = image::image_dimensions(&image_path).unwrap_or((0, 0));
                 let label_path = yolo_label_write_path_for_image(project_id, &image_path);
                 if let Some(parent) = label_path.parent() {
                     fs::create_dir_all(parent).map_err(|err| err.to_string())?;
                 }
-                let label_data = yolo::annotations_to_yolo_lines(&state.objects, width, height)?;
+                let label_data = if yolo_format == "yolo-seg" {
+                    yolo::annotations_to_yolo_polygon_lines(&state.objects, width, height)?
+                } else {
+                    yolo::annotations_to_yolo_lines(&state.objects, width, height)?
+                };
                 fs::write(label_path, label_data).map_err(|err| err.to_string())?;
             }
         }
@@ -1030,6 +1070,9 @@ impl SampleRepository {
                 json!({
                     "imageId": image.id,
                     "fileName": image.file_name,
+                    "width": image.width,
+                    "height": image.height,
+                    "split": image.split,
                     "status": image.status,
                     "revision": state.revision,
                     "objects": state.objects,
@@ -1096,8 +1139,7 @@ impl SampleRepository {
         fs::write(output_dir.join("manifest.json"), &manifest_json)
             .map_err(|err| err.to_string())?;
         if format == "coco" {
-            fs::write(output_dir.join("annotations.json"), manifest_json)
-                .map_err(|err| err.to_string())?;
+            self.write_coco_export(project_id, &paths, &manifest_json, &output_dir)?;
         } else {
             fs::write(
                 output_dir.join("dataset.yaml"),
@@ -1124,6 +1166,171 @@ impl SampleRepository {
         })
     }
 
+    fn write_coco_export(
+        &self,
+        project_id: &str,
+        paths: &project_fs::ProjectPaths,
+        manifest_json: &str,
+        output_dir: &Path,
+    ) -> Result<(), String> {
+        let manifest: Value = serde_json::from_str(manifest_json)
+            .map_err(|err| format!("invalid snapshot: {err}"))?;
+        let snapshot_images = manifest
+            .get("annotations")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "snapshot does not contain an annotations array".to_string())?;
+        let indexed_images = storage::read_images(&paths.sqlite, None)?
+            .into_iter()
+            .map(|image| (image.id.clone(), image))
+            .collect::<BTreeMap<_, _>>();
+        let mut category_labels = storage::read_classes(&paths.sqlite)?
+            .into_iter()
+            .map(|class| (class.id, class.label))
+            .collect::<BTreeMap<_, _>>();
+        let project_manifest = storage::read_project_manifest(&paths.sqlite)?;
+        let asset_root = project_manifest
+            .as_ref()
+            .map(|project| PathBuf::from(&project.root_path))
+            .filter(|path| path.exists())
+            .unwrap_or_else(|| paths.raw.clone());
+        let images_dir = output_dir.join("images");
+        fs::create_dir_all(&images_dir).map_err(|err| err.to_string())?;
+
+        let mut coco_images = Vec::new();
+        let mut coco_annotations = Vec::new();
+        let mut image_categories = Vec::new();
+        let mut annotation_id = 1u64;
+
+        for (image_index, snapshot_image) in snapshot_images.iter().enumerate() {
+            let image_id = snapshot_image
+                .get("imageId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "snapshot image is missing imageId".to_string())?;
+            let file_name = snapshot_image
+                .get("fileName")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("snapshot image '{image_id}' is missing fileName"))?;
+            let indexed = indexed_images.get(image_id);
+            let width = snapshot_image
+                .get("width")
+                .and_then(Value::as_u64)
+                .or_else(|| indexed.map(|image| image.width as u64))
+                .ok_or_else(|| format!("snapshot image '{image_id}' is missing width"))?;
+            let height = snapshot_image
+                .get("height")
+                .and_then(Value::as_u64)
+                .or_else(|| indexed.map(|image| image.height as u64))
+                .ok_or_else(|| format!("snapshot image '{image_id}' is missing height"))?;
+            if width == 0 || height == 0 {
+                return Err(format!(
+                    "snapshot image '{image_id}' has invalid dimensions"
+                ));
+            }
+            let coco_image_id = (image_index + 1) as u64;
+            let split = snapshot_image
+                .get("split")
+                .and_then(Value::as_str)
+                .or_else(|| indexed.map(|image| image.split.as_str()))
+                .unwrap_or("train");
+            let relative_path = safe_export_relative_path(file_name)?;
+            let exported_file_name = relative_path.to_string_lossy().replace('\\', "/");
+            coco_images.push(json!({
+                "id": coco_image_id,
+                "file_name": exported_file_name,
+                "width": width,
+                "height": height,
+                "split": split,
+                "source_id": image_id,
+            }));
+
+            let source_path = resolve_export_image_path(&asset_root, &paths.raw, file_name)
+                .ok_or_else(|| format!("image asset not found for '{file_name}'"))?;
+            let target_path = images_dir.join(relative_path);
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+            }
+            fs::copy(&source_path, &target_path).map_err(|err| {
+                format!(
+                    "copy image {} to {}: {err}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+
+            let objects: Vec<AnnotationObject> = serde_json::from_value(
+                snapshot_image
+                    .get("objects")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            )
+            .map_err(|err| format!("invalid objects for image '{image_id}': {err}"))?;
+
+            for object in objects {
+                category_labels
+                    .entry(object.class_id)
+                    .or_insert_with(|| object.label.clone());
+                let category_id = u64::from(object.class_id) + 1;
+                if object.object_type == "classification" {
+                    image_categories.push(json!({
+                        "image_id": coco_image_id,
+                        "category_id": category_id,
+                    }));
+                    continue;
+                }
+
+                let Some((bbox, segmentation, area)) = coco_geometry(&object)? else {
+                    continue;
+                };
+                let is_crowd = object
+                    .attributes
+                    .get("iscrowd")
+                    .and_then(|value| {
+                        value
+                            .as_u64()
+                            .or_else(|| value.as_bool().map(|enabled| u64::from(enabled)))
+                    })
+                    .unwrap_or(0);
+                coco_annotations.push(json!({
+                    "id": annotation_id,
+                    "image_id": coco_image_id,
+                    "category_id": category_id,
+                    "bbox": bbox,
+                    "segmentation": segmentation,
+                    "area": area,
+                    "iscrowd": is_crowd,
+                    "attributes": object.attributes,
+                    "source_id": object.id,
+                }));
+                annotation_id += 1;
+            }
+        }
+
+        let categories = category_labels
+            .into_iter()
+            .map(|(class_id, name)| {
+                json!({
+                    "id": u64::from(class_id) + 1,
+                    "name": name,
+                    "supercategory": "",
+                })
+            })
+            .collect::<Vec<_>>();
+        let coco = json!({
+            "info": {
+                "description": manifest.get("name").and_then(Value::as_str).unwrap_or(project_id),
+                "version": "1.0",
+                "contributor": "Image Annotation",
+            },
+            "licenses": [],
+            "images": coco_images,
+            "categories": categories,
+            "annotations": coco_annotations,
+            "image_categories": image_categories,
+        });
+        let coco_json = serde_json::to_string_pretty(&coco).map_err(|err| err.to_string())?;
+        fs::write(output_dir.join("annotations.json"), coco_json).map_err(|err| err.to_string())
+    }
+
     pub fn dataset_exports(&self, project_id: &str) -> Result<Vec<DatasetExport>, String> {
         let paths = project_fs::project_paths(project_id);
         Ok(storage::list_export_records(&paths.sqlite)?
@@ -1138,6 +1345,114 @@ impl SampleRepository {
             })
             .collect())
     }
+}
+
+fn safe_export_relative_path(file_name: &str) -> Result<PathBuf, String> {
+    let relative = Path::new(file_name)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value),
+            _ => None,
+        })
+        .collect::<PathBuf>();
+    if relative.as_os_str().is_empty() {
+        Err(format!("invalid image file name '{file_name}'"))
+    } else {
+        Ok(relative)
+    }
+}
+
+fn resolve_export_image_path(
+    asset_root: &Path,
+    fallback_root: &Path,
+    file_name: &str,
+) -> Option<PathBuf> {
+    [
+        asset_root.join(file_name),
+        asset_root.join("images").join(file_name),
+        fallback_root.join(file_name),
+        fallback_root.join("images").join(file_name),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+}
+
+fn coco_geometry(object: &AnnotationObject) -> Result<Option<(Vec<f64>, Value, f64)>, String> {
+    if let Some(polygon) = object.polygon.as_ref() {
+        if polygon.len() < 3 {
+            return Err(format!(
+                "polygon annotation '{}' must contain at least 3 points",
+                object.id
+            ));
+        }
+        if polygon
+            .iter()
+            .any(|point| !point.x.is_finite() || !point.y.is_finite())
+        {
+            return Err(format!(
+                "polygon annotation '{}' contains invalid coordinates",
+                object.id
+            ));
+        }
+        let min_x = polygon
+            .iter()
+            .map(|point| point.x)
+            .fold(f64::INFINITY, f64::min);
+        let max_x = polygon
+            .iter()
+            .map(|point| point.x)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let min_y = polygon
+            .iter()
+            .map(|point| point.y)
+            .fold(f64::INFINITY, f64::min);
+        let max_y = polygon
+            .iter()
+            .map(|point| point.y)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let flat = polygon
+            .iter()
+            .flat_map(|point| [point.x, point.y])
+            .collect::<Vec<_>>();
+        return Ok(Some((
+            vec![min_x, min_y, max_x - min_x, max_y - min_y],
+            json!([flat]),
+            polygon_area(polygon),
+        )));
+    }
+
+    if let Some(bbox) = object.bbox.as_ref() {
+        if !bbox.x.is_finite()
+            || !bbox.y.is_finite()
+            || !bbox.width.is_finite()
+            || !bbox.height.is_finite()
+        {
+            return Err(format!(
+                "bbox annotation '{}' contains invalid coordinates",
+                object.id
+            ));
+        }
+        let width = bbox.width.max(0.0);
+        let height = bbox.height.max(0.0);
+        return Ok(Some((
+            vec![bbox.x, bbox.y, width, height],
+            json!([]),
+            width * height,
+        )));
+    }
+
+    Ok(None)
+}
+
+fn polygon_area(points: &[Point]) -> f64 {
+    points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .map(|(left, right)| left.x * right.y - right.x * left.y)
+        .sum::<f64>()
+        .abs()
+        / 2.0
 }
 
 pub fn is_image_path(path: &PathBuf) -> bool {
@@ -1202,10 +1517,27 @@ fn is_voc_project(project_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn is_yolo_detect_project(project_id: &str) -> bool {
+fn is_classification_project(project_id: &str) -> bool {
     project_manifest(project_id)
-        .map(|manifest| manifest.format == "yolo-detect")
+        .map(|manifest| manifest.format == "image-classification")
         .unwrap_or(false)
+}
+
+fn classification_for_image(
+    image_path: &Path,
+    classes: &[storage::StoredClass],
+) -> Option<(u32, String)> {
+    let label = image_path.parent()?.file_name()?.to_string_lossy();
+    classes
+        .iter()
+        .find(|class| class.label == label)
+        .map(|class| (class.id, class.label.clone()))
+}
+
+fn yolo_project_format(project_id: &str) -> Option<String> {
+    project_manifest(project_id).and_then(|manifest| {
+        matches!(manifest.format.as_str(), "yolo-detect" | "yolo-seg").then_some(manifest.format)
+    })
 }
 
 fn yolo_label_path_for_image(project_id: &str, image_path: &Path) -> Option<PathBuf> {
@@ -1571,6 +1903,116 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].image.id, "image-a");
         assert_eq!(samples[0].match_count, 2);
+
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn exports_snapshot_as_coco_with_bbox_polygon_and_images() {
+        let repository = SampleRepository::new();
+        let project_id = "coco-export-unit";
+        let paths = project_fs::project_paths(project_id);
+        let _ = std::fs::remove_dir_all(&paths.root);
+        project_fs::ensure_workspace_project_dirs(project_id).unwrap();
+        storage::initialize_project_database(&paths.sqlite).unwrap();
+        std::fs::create_dir_all(paths.raw.join("train")).unwrap();
+        image::RgbImage::new(100, 80)
+            .save(paths.raw.join("train/sample.png"))
+            .unwrap();
+
+        let manifest = project_fs::ProjectManifest {
+            id: project_id.to_string(),
+            name: "COCO Export Unit".to_string(),
+            source_dataset_key: "local".to_string(),
+            format: "yolo-seg".to_string(),
+            root_path: paths.raw.to_string_lossy().to_string(),
+            created_at: now_unix_string(),
+            class_count: 2,
+            image_count: 1,
+        };
+        let images = vec![storage::StoredImage {
+            id: "image-a".to_string(),
+            file_name: "train/sample.png".to_string(),
+            width: 100,
+            height: 80,
+            split: "train".to_string(),
+            status: "已标注".to_string(),
+            qa_status: String::new(),
+            review_note: None,
+        }];
+        let classes = vec![
+            storage::StoredClass {
+                id: 0,
+                label: "box".to_string(),
+                color: "#1fa7ff".to_string(),
+            },
+            storage::StoredClass {
+                id: 1,
+                label: "region".to_string(),
+                color: "#cc54d8".to_string(),
+            },
+        ];
+        storage::upsert_project_index(&paths.sqlite, &manifest, &images, &classes).unwrap();
+        repository
+            .save_image_annotations_with_revision(
+                project_id,
+                "image-a",
+                None,
+                vec![
+                    AnnotationObject::bbox(
+                        "bbox-a".to_string(),
+                        0,
+                        "box".to_string(),
+                        BBox {
+                            x: 10.0,
+                            y: 12.0,
+                            width: 20.0,
+                            height: 15.0,
+                        },
+                    ),
+                    AnnotationObject::polygon(
+                        "polygon-a".to_string(),
+                        1,
+                        "region".to_string(),
+                        vec![
+                            Point { x: 40.0, y: 20.0 },
+                            Point { x: 70.0, y: 20.0 },
+                            Point { x: 70.0, y: 50.0 },
+                            Point { x: 40.0, y: 50.0 },
+                        ],
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let snapshot = repository
+            .create_dataset_snapshot(project_id, "release-1")
+            .unwrap();
+        let export = repository
+            .export_dataset(project_id, &snapshot.id, "coco")
+            .unwrap();
+        let output_dir = PathBuf::from(export.output_path);
+        let coco: Value = serde_json::from_str(
+            &std::fs::read_to_string(output_dir.join("annotations.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(coco["images"][0]["width"], 100);
+        assert_eq!(coco["images"][0]["height"], 80);
+        assert_eq!(coco["categories"][0]["name"], "box");
+        assert_eq!(coco["categories"][1]["name"], "region");
+        assert_eq!(coco["annotations"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            coco["annotations"][0]["bbox"],
+            json!([10.0, 12.0, 20.0, 15.0])
+        );
+        assert_eq!(coco["annotations"][0]["area"], 300.0);
+        assert_eq!(
+            coco["annotations"][1]["segmentation"][0],
+            json!([40.0, 20.0, 70.0, 20.0, 70.0, 50.0, 40.0, 50.0])
+        );
+        assert_eq!(coco["annotations"][1]["area"], 900.0);
+        assert!(output_dir.join("images/train/sample.png").is_file());
 
         let _ = std::fs::remove_dir_all(paths.root);
     }

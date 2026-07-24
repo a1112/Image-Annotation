@@ -85,6 +85,7 @@ import type {
   DataSourceTreeNode,
   ProjectDetail,
   FolderWorkspace,
+  Point,
 } from "./types/domain";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -484,11 +485,32 @@ function zoomCanvasViewport(
   };
 }
 
+function pointDistance(left: Point, right: Point) {
+  return Math.hypot(left.x - right.x, left.y - right.y);
+}
+
+function pointInPolygon(point: Point, polygon: Point[]) {
+  let inside = false;
+  for (let current = 0, previous = polygon.length - 1; current < polygon.length; previous = current++) {
+    const currentPoint = polygon[current];
+    const previousPoint = polygon[previous];
+    const crosses =
+      (currentPoint.y > point.y) !== (previousPoint.y > point.y)
+      && point.x
+        < ((previousPoint.x - currentPoint.x) * (point.y - currentPoint.y))
+          / (previousPoint.y - currentPoint.y)
+          + currentPoint.x;
+    if (crosses) inside = !inside;
+  }
+  return inside;
+}
+
 function drawAnnotationCanvas({
   activeImage,
   canvas,
   ctx,
   draftBox,
+  draftPolygon,
   imageElement,
   imageReady,
   mode,
@@ -501,6 +523,7 @@ function drawAnnotationCanvas({
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
   draftBox: { start: { x: number; y: number }; end: { x: number; y: number } } | null;
+  draftPolygon: Point[];
   imageElement: HTMLImageElement | null;
   imageReady: boolean;
   mode: ToolMode;
@@ -611,16 +634,69 @@ function drawAnnotationCanvas({
       });
       ctx.closePath();
       ctx.fillStyle = "rgba(204, 84, 216, 0.16)";
-      ctx.strokeStyle = "#cc54d8";
-      ctx.lineWidth = 2 / viewport.scale;
+      const selected = object.id === selectedObjectId;
+      ctx.strokeStyle = selected ? "#f0abfc" : "#cc54d8";
+      ctx.lineWidth = (selected ? 3 : 2) / viewport.scale;
       ctx.fill();
       ctx.stroke();
+      if (selected) {
+        const handleRadius = 5 / viewport.scale;
+        ctx.fillStyle = "#ffffff";
+        ctx.strokeStyle = "#cc54d8";
+        ctx.lineWidth = 2 / viewport.scale;
+        object.polygon.forEach((point) => {
+          ctx.fillRect(
+            point.x - handleRadius,
+            point.y - handleRadius,
+            handleRadius * 2,
+            handleRadius * 2,
+          );
+          ctx.strokeRect(
+            point.x - handleRadius,
+            point.y - handleRadius,
+            handleRadius * 2,
+            handleRadius * 2,
+          );
+        });
+      }
       ctx.restore();
     }
   });
 
   if (draftBox) {
     drawBox(normalizeBox(draftBox.start, draftBox.end), "", false, true);
+  }
+
+  if (draftPolygon.length) {
+    ctx.save();
+    ctx.beginPath();
+    draftPolygon.forEach((point, index) => {
+      if (index === 0) ctx.moveTo(point.x, point.y);
+      else ctx.lineTo(point.x, point.y);
+    });
+    ctx.strokeStyle = "#f0abfc";
+    ctx.lineWidth = 2 / viewport.scale;
+    ctx.setLineDash([6 / viewport.scale, 4 / viewport.scale]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    const handleRadius = 5 / viewport.scale;
+    draftPolygon.forEach((point, index) => {
+      ctx.fillStyle = index === 0 && draftPolygon.length >= 3 ? "#cc54d8" : "#ffffff";
+      ctx.strokeStyle = "#cc54d8";
+      ctx.fillRect(
+        point.x - handleRadius,
+        point.y - handleRadius,
+        handleRadius * 2,
+        handleRadius * 2,
+      );
+      ctx.strokeRect(
+        point.x - handleRadius,
+        point.y - handleRadius,
+        handleRadius * 2,
+        handleRadius * 2,
+      );
+    });
+    ctx.restore();
   }
 
   if (mode === "pan") {
@@ -1029,7 +1105,7 @@ function ProjectInfoDialog({ onClose }: { onClose: () => void }) {
           </h3>
           <div className="format-row">
             <span>COCO JSON</span>
-            <strong>规划中</strong>
+            <strong>标准导出</strong>
           </div>
           <div className="format-row">
             <span>YOLO TXT</span>
@@ -1068,7 +1144,9 @@ function DataSubmitDialog({
 }) {
   const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
   const [analysis, setAnalysis] = useState<DataSourceAnalysis | null>(null);
-  const [datasetType, setDatasetType] = useState<"voc-detect" | "yolo-detect" | "image-directory">("voc-detect");
+  const [datasetType, setDatasetType] = useState<
+    "voc-detect" | "yolo-detect" | "yolo-seg" | "image-classification" | "image-directory"
+  >("voc-detect");
   const [importAction, setImportAction] = useState<DataImportAction>("open-local");
   const [analyzeState, setAnalyzeState] = useState<"idle" | "loading" | "error">("idle");
   const [message, setMessage] = useState<string | null>(null);
@@ -1254,7 +1332,7 @@ function DataSubmitDialog({
                   <select value={importAction} onChange={(event) => setImportAction(event.target.value as DataImportAction)}>
                     <option value="open-local">链接本机目录（原地写回标注）</option>
                     <option value="copy-images">复制图片到目标项目</option>
-                    {analysis.detectedFormat === "yolo-detect" ? <option value="copy-yolo">复制 YOLO 数据集到目标项目</option> : null}
+                    {matchesYoloFormat(analysis.detectedFormat) ? <option value="copy-yolo">复制 YOLO 数据集到目标项目</option> : null}
                   </select>
                 </label>
                 <label>
@@ -1262,6 +1340,8 @@ function DataSubmitDialog({
                   <select value={datasetType} onChange={(event) => setDatasetType(event.target.value as typeof datasetType)}>
                     <option value="voc-detect">Pascal VOC BBox XML</option>
                     <option value="yolo-detect">YOLO BBox TXT</option>
+                    <option value="yolo-seg">YOLO Polygon TXT</option>
+                    <option value="image-classification">图像分类目录</option>
                     <option value="image-directory">仅图片目录</option>
                   </select>
                 </label>
@@ -1353,10 +1433,22 @@ function pathsFromDrop(dataTransfer: DataTransfer) {
     .filter(Boolean);
 }
 
-function normalizeDetectedDatasetType(format: DataSourceAnalysis["detectedFormat"]): "voc-detect" | "yolo-detect" | "image-directory" {
-  if (format === "yolo-detect") return "yolo-detect";
-  if (format === "voc-detect") return "voc-detect";
+function normalizeDetectedDatasetType(
+  format: DataSourceAnalysis["detectedFormat"],
+): "voc-detect" | "yolo-detect" | "yolo-seg" | "image-classification" | "image-directory" {
+  if (
+    format === "yolo-detect"
+    || format === "yolo-seg"
+    || format === "voc-detect"
+    || format === "image-classification"
+  ) {
+    return format;
+  }
   return "image-directory";
+}
+
+function matchesYoloFormat(format: DataSourceAnalysis["detectedFormat"]) {
+  return format === "yolo-detect" || format === "yolo-seg";
 }
 
 function defaultImportAction(analysis: DataSourceAnalysis): DataImportAction {
@@ -1367,6 +1459,8 @@ function defaultImportAction(analysis: DataSourceAnalysis): DataImportAction {
 function formatDatasetFormat(format: DataSourceAnalysis["detectedFormat"]) {
   if (format === "voc-detect") return "Pascal VOC BBox";
   if (format === "yolo-detect") return "YOLO BBox";
+  if (format === "yolo-seg") return "YOLO Polygon";
+  if (format === "image-classification") return "图像分类目录";
   if (format === "image-directory") return "图片目录";
   return "未识别";
 }
@@ -1615,12 +1709,13 @@ function ImagePreviewDialog({
         <div className="detail-header preview-dialog-header">
           <div>
             <span className="eyebrow">IMAGE INSPECTOR</span>
-            <h2 id="image-preview-title">{image.fileName}</h2>
+            <h2 id="image-preview-title">图像预览</h2>
+            <strong className="preview-file-name">{image.fileName}</strong>
           </div>
           <div className="preview-header-actions">
             <button className="preview-edit-action primary" type="button" onClick={onAnnotate}>
               <Tags size={15} />
-              <span>编辑标注</span>
+              <span>标记</span>
             </button>
             <span className={`preview-status ${image.status === "已标注" ? "complete" : ""}`}>{image.status}</span>
             <button aria-label="关闭图像预览" type="button" onClick={onClose}>
@@ -1691,8 +1786,8 @@ function ImagePreviewDialog({
           </div>
           <aside className="image-preview-meta" aria-label="图像信息">
             <div className="preview-stat-grid">
-              <div><span>尺寸</span><strong>{renderedSize?.width ?? image.width} × {renderedSize?.height ?? image.height}</strong></div>
-              <div><span>对象</span><strong>{enabledObjects.length} / {visibleObjects.length}</strong></div>
+              <div><span>尺寸</span><strong>{renderedSize?.width ?? image.width} x {renderedSize?.height ?? image.height}</strong></div>
+              <div><span>对象数</span><strong>{visibleObjects.length}</strong></div>
               <div><span>分组</span><strong>{image.split}</strong></div>
               <div><span>质检</span><strong>{image.qaStatus || "未质检"}</strong></div>
             </div>
@@ -1818,9 +1913,10 @@ function ProjectWorkspace({
     images.find((image) => image.id === previewImageId)
     ?? classSampleImages.find((image) => image.id === previewImageId)
     ?? null;
+  const safeImageFolderWorkspace = imageFolderWorkspace ?? { folders: [], members: [] };
   const folderForImage = (image: DatasetImage) =>
-    imageFolderWorkspace.members.find((member) => member.imageId === image.id)?.folderId ?? "";
-  const imageFolders = imageFolderWorkspace.folders;
+    safeImageFolderWorkspace.members.find((member) => member.imageId === image.id)?.folderId ?? "";
+  const imageFolders = safeImageFolderWorkspace.folders;
   const folderFilteredImages = imageFolderFilter === "all"
     ? images
     : images.filter((image) => folderForImage(image) === imageFolderFilter);
@@ -1843,7 +1939,7 @@ function ProjectWorkspace({
           })
       : listProjectFolders(projectId);
     loadFolders
-      .then(setImageFolderWorkspace)
+      .then((workspace) => setImageFolderWorkspace(workspace ?? { folders: [], members: [] }))
       .catch((error) => setWorkflowMessage(error instanceof Error ? error.message : String(error)));
   }, [projectId]);
 
@@ -2236,6 +2332,10 @@ function renderProjectTab(
       return (
         <div className="image-browser">
           <div className="image-browser-header">
+            <div className="tab-title-stack">
+              <h2>图片浏览</h2>
+              <p>浏览、筛选、预览并选择需要继续标注的图片。</p>
+            </div>
             <div className="image-browser-toolbar">
               <div className="image-browser-stats" aria-label="本页图片统计">
                 <span><strong>{images.length}</strong><small>图片</small></span>
@@ -2354,6 +2454,27 @@ function renderProjectTab(
                   {labels.length === 0 ? <span className="empty">无检测对象</span> : null}
                   <strong aria-label={`${imageObjects.length} 个对象`} title={`${imageObjects.length} 个对象`}>{imageObjects.length}</strong>
                 </div>
+                <div className="image-tile-actions">
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      workflow.onPreviewImage(image.id);
+                    }}
+                  >
+                    <Eye size={15} />
+                    预览 {image.fileName}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      workflow.onOpenAnnotation(image.id);
+                    }}
+                  >
+                    标记
+                  </button>
+                </div>
               </article>
               );
             })}
@@ -2468,7 +2589,13 @@ function renderProjectTab(
         </div>
       );
     case "质检":
-      return <HybridProjectPanel projectId={detail.project.id} />;
+      return (
+        <div>
+          <h2>质检队列</h2>
+          {detail.project.issueCount === 0 ? <p>暂无质检问题</p> : null}
+          <HybridProjectPanel projectId={detail.project.id} />
+        </div>
+      );
     case "导出":
       return (
         <div>
@@ -2802,6 +2929,7 @@ function AnnotationWorkspace({
   showWindowControls: boolean;
 }) {
   const [images, setImages] = useState<DatasetImage[]>([]);
+  const [workspaceDetail, setWorkspaceDetail] = useState<ProjectDetail | null>(null);
   const [imagesLoaded, setImagesLoaded] = useState(false);
   const [loadError, setLoadError] = useState<{ title: string; message: string } | null>(null);
   const [activeImageId, setActiveImageId] = useState(imageId ?? "");
@@ -2815,6 +2943,7 @@ function AnnotationWorkspace({
   const [mode, setMode] = useState<ToolMode>("select");
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
   const [draftBox, setDraftBox] = useState<{ start: { x: number; y: number }; end: { x: number; y: number } } | null>(null);
+  const [draftPolygon, setDraftPolygon] = useState<Point[]>([]);
   const [dragState, setDragState] = useState<{
     objectId: string;
     kind: "move" | "resize";
@@ -2822,9 +2951,18 @@ function AnnotationWorkspace({
     start: { x: number; y: number };
     original: NonNullable<AnnotationObject["bbox"]>;
   } | null>(null);
+  const [polygonDragState, setPolygonDragState] = useState<{
+    objectId: string;
+    kind: "move" | "vertex";
+    vertexIndex?: number;
+    start: Point;
+    original: Point[];
+  } | null>(null);
   const activeImage = images.find((image) => image.id === activeImageId) ?? images[0];
   const filmstripUrls = useImageAssetUrls(projectId, images, 12);
   const selectedObject = objects.find((object) => object.id === selectedObjectId) ?? null;
+  const classificationObject = objects.find((object) => object.type === "classification") ?? null;
+  const isClassification = workspaceDetail?.project.annotationTypes.includes("Classification") ?? false;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvasShellRef = useRef<HTMLDivElement | null>(null);
   const imageElementRef = useRef<HTMLImageElement | null>(null);
@@ -2858,6 +2996,12 @@ function AnnotationWorkspace({
   }, [projectId]);
 
   useEffect(() => {
+    getProjectDetail(projectId)
+      .then(setWorkspaceDetail)
+      .catch(() => setWorkspaceDetail(null));
+  }, [projectId]);
+
+  useEffect(() => {
     const nextImageId = activeImageId || imageId;
     if (!nextImageId) return;
     setLoadError(null);
@@ -2878,6 +3022,7 @@ function AnnotationWorkspace({
         setSaveMessage(null);
         setDirty(false);
         setSelectedObjectId(state.objects[0]?.id ?? null);
+        setDraftPolygon([]);
       })
       .catch(() => {
         setObjects([]);
@@ -2959,6 +3104,7 @@ function AnnotationWorkspace({
       canvas,
       ctx,
       draftBox,
+      draftPolygon,
       imageElement: imageElementRef.current,
       imageReady,
       mode,
@@ -2967,7 +3113,7 @@ function AnnotationWorkspace({
       size: canvasSize,
       viewport,
     });
-  }, [activeImage, canvasSize, draftBox, imageReady, mode, objects, selectedObjectId, viewport]);
+  }, [activeImage, canvasSize, draftBox, draftPolygon, imageReady, mode, objects, selectedObjectId, viewport]);
 
   useEffect(() => {
     function handleBeforeUnload(event: BeforeUnloadEvent) {
@@ -3052,6 +3198,19 @@ function AnnotationWorkspace({
 
       if (editableTarget) return;
 
+      if (key === "escape" && draftPolygon.length) {
+        event.preventDefault();
+        setDraftPolygon([]);
+        setSaveMessage("已取消当前多边形");
+        return;
+      }
+
+      if (key === "enter" && draftPolygon.length >= 3) {
+        event.preventDefault();
+        completeDraftPolygon();
+        return;
+      }
+
       if (key === "delete" || key === "backspace") {
         event.preventDefault();
         deleteSelectedObject();
@@ -3061,6 +3220,12 @@ function AnnotationWorkspace({
       if (key === "w") {
         event.preventDefault();
         setMode("bbox");
+        return;
+      }
+
+      if (key === "p") {
+        event.preventDefault();
+        setMode("polygon");
         return;
       }
 
@@ -3098,7 +3263,7 @@ function AnnotationWorkspace({
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selectedObjectId, selectedObject, objects, revision, activeImageId, imageId, activeImage, dirty, images, saveAndNext, canvasSize]);
+  }, [selectedObjectId, selectedObject, objects, revision, activeImageId, imageId, activeImage, dirty, images, saveAndNext, canvasSize, draftPolygon]);
 
   function goToImage(offset: number) {
     if (!activeImage) return;
@@ -3179,19 +3344,48 @@ function AnnotationWorkspace({
   function hitTestObject(point: { x: number; y: number }) {
     const handleRadius = Math.max(5 / viewport.scale, 3);
     for (const object of [...objects].reverse()) {
-      if (!object.bbox) continue;
-      if (object.id === selectedObjectId) {
-        const handle = bboxHandles(object.bbox).find(
-          (item) => Math.abs(point.x - item.x) <= handleRadius && Math.abs(point.y - item.y) <= handleRadius,
-        );
-        if (handle) return { object, handle: handle.handle };
+      if (object.bbox) {
+        if (object.id === selectedObjectId) {
+          const handle = bboxHandles(object.bbox).find(
+            (item) => Math.abs(point.x - item.x) <= handleRadius && Math.abs(point.y - item.y) <= handleRadius,
+          );
+          if (handle) return { object, handle: handle.handle, vertexIndex: null };
+        }
+        const box = object.bbox;
+        if (point.x >= box.x && point.x <= box.x + box.width && point.y >= box.y && point.y <= box.y + box.height) {
+          return { object, handle: null, vertexIndex: null };
+        }
       }
-      const box = object.bbox;
-      if (point.x >= box.x && point.x <= box.x + box.width && point.y >= box.y && point.y <= box.y + box.height) {
-        return { object, handle: null };
+      if (object.polygon) {
+        if (object.id === selectedObjectId) {
+          const vertexIndex = object.polygon.findIndex(
+            (item) => Math.abs(point.x - item.x) <= handleRadius && Math.abs(point.y - item.y) <= handleRadius,
+          );
+          if (vertexIndex >= 0) return { object, handle: null, vertexIndex };
+        }
+        if (pointInPolygon(point, object.polygon)) {
+          return { object, handle: null, vertexIndex: null };
+        }
       }
     }
     return null;
+  }
+
+  function completeDraftPolygon(points = draftPolygon) {
+    if (points.length < 3) return;
+    const object: AnnotationObject = {
+      id: `ann-${Date.now()}`,
+      classId: 0,
+      label: "object",
+      type: "polygon",
+      polygon: points,
+      attributes: { source: "manual" },
+    };
+    setObjects((current) => [...current, object]);
+    setDraftPolygon([]);
+    setDirty(true);
+    setSelectedObjectId(object.id);
+    setMode("select");
   }
 
   function beginCanvasInteraction(event: MouseEvent<HTMLCanvasElement>) {
@@ -3203,6 +3397,18 @@ function AnnotationWorkspace({
     }
 
     const point = pointFromEvent(event);
+    if (mode === "polygon") {
+      if (
+        draftPolygon.length >= 3
+        && pointDistance(point, draftPolygon[0]) <= Math.max(10 / viewport.scale, 5)
+      ) {
+        completeDraftPolygon();
+      } else {
+        setDraftPolygon((current) => [...current, point]);
+      }
+      return;
+    }
+
     const target = hitTestObject(point);
     if (target?.object.bbox) {
       setMode("select");
@@ -3213,6 +3419,18 @@ function AnnotationWorkspace({
         handle: target.handle ?? undefined,
         start: point,
         original: target.object.bbox,
+      });
+      return;
+    }
+    if (target?.object.polygon) {
+      setMode("select");
+      setSelectedObjectId(target.object.id);
+      setPolygonDragState({
+        objectId: target.object.id,
+        kind: target.vertexIndex === null ? "move" : "vertex",
+        vertexIndex: target.vertexIndex ?? undefined,
+        start: point,
+        original: target.object.polygon,
       });
       return;
     }
@@ -3266,6 +3484,31 @@ function AnnotationWorkspace({
         }),
       );
     }
+    if (polygonDragState && activeImage) {
+      const dx = point.x - polygonDragState.start.x;
+      const dy = point.y - polygonDragState.start.y;
+      setDirty(true);
+      setObjects((current) =>
+        current.map((object) => {
+          if (object.id !== polygonDragState.objectId || !object.polygon) return object;
+          return {
+            ...object,
+            polygon: polygonDragState.original.map((originalPoint, index) => {
+              if (
+                polygonDragState.kind === "vertex"
+                && index !== polygonDragState.vertexIndex
+              ) {
+                return originalPoint;
+              }
+              return {
+                x: Number(clamp(originalPoint.x + dx, 0, activeImage.width).toFixed(1)),
+                y: Number(clamp(originalPoint.y + dy, 0, activeImage.height).toFixed(1)),
+              };
+            }),
+          };
+        }),
+      );
+    }
   }
 
   function finishCanvasInteraction(event: MouseEvent<HTMLCanvasElement>) {
@@ -3288,7 +3531,20 @@ function AnnotationWorkspace({
     }
 
     setDragState(null);
+    setPolygonDragState(null);
     setPanState(null);
+  }
+
+  function handleCanvasDoubleClick(event: MouseEvent<HTMLCanvasElement>) {
+    if (mode !== "polygon") return;
+    event.preventDefault();
+    const point = pointFromEvent(event);
+    const points =
+      draftPolygon.length > 0
+      && pointDistance(draftPolygon[draftPolygon.length - 1], point) < 1
+        ? draftPolygon
+        : [...draftPolygon, point];
+    completeDraftPolygon(points);
   }
 
   function zoomImage(factor: number) {
@@ -3324,6 +3580,32 @@ function AnnotationWorkspace({
     setObjects((current) =>
       current.map((object) => (object.id === selectedObjectId ? { ...object, label } : object)),
     );
+  }
+
+  function assignClassification(rawClassId: string) {
+    if (!workspaceDetail) return;
+    const classId = Number(rawClassId);
+    if (!Number.isInteger(classId)) {
+      setObjects((current) => current.filter((object) => object.type !== "classification"));
+      setSelectedObjectId(null);
+      setDirty(true);
+      return;
+    }
+    const selectedClass = workspaceDetail.classes.find((item) => item.id === classId);
+    if (!selectedClass) return;
+    const object: AnnotationObject = {
+      id: classificationObject?.id ?? `classification-${activeImageId || imageId || Date.now()}`,
+      classId: selectedClass.id ?? 0,
+      label: selectedClass.label,
+      type: "classification",
+      attributes: { ...classificationObject?.attributes, source: "manual" },
+    };
+    setObjects((current) => [
+      ...current.filter((item) => item.type !== "classification"),
+      object,
+    ]);
+    setSelectedObjectId(object.id);
+    setDirty(true);
   }
 
   function updateSelectedBbox(field: "x" | "y" | "width" | "height", rawValue: string) {
@@ -3410,14 +3692,21 @@ function AnnotationWorkspace({
   return (
     <main className="annotation-page">
       <aside className="tool-rail" aria-label="Annotation tools">
-        {[
-          { label: "选择", icon: MousePointer2, mode: "select" as ToolMode },
-          { label: "BBox", icon: BoxSelect, mode: "bbox" as ToolMode },
-          { label: "平移", icon: Move, mode: "pan" as ToolMode },
-          { label: "Polygon", icon: Square, mode: "polygon" as ToolMode },
-          { label: "智能工具", icon: Zap, mode: "select" as ToolMode },
-          { label: "显示", icon: Eye, mode: "select" as ToolMode },
-        ].map((tool) => {
+        {(isClassification
+          ? [
+              { label: "选择", icon: MousePointer2, mode: "select" as ToolMode },
+              { label: "平移", icon: Move, mode: "pan" as ToolMode },
+              { label: "显示", icon: Eye, mode: "select" as ToolMode },
+            ]
+          : [
+              { label: "选择", icon: MousePointer2, mode: "select" as ToolMode },
+              { label: "BBox", icon: BoxSelect, mode: "bbox" as ToolMode },
+              { label: "平移", icon: Move, mode: "pan" as ToolMode },
+              { label: "Polygon", icon: Square, mode: "polygon" as ToolMode },
+              { label: "智能工具", icon: Zap, mode: "select" as ToolMode },
+              { label: "显示", icon: Eye, mode: "select" as ToolMode },
+            ]
+        ).map((tool) => {
           const Icon = tool.icon;
           return (
             <button
@@ -3483,8 +3772,9 @@ function AnnotationWorkspace({
           <div className="canvas-stage-shell" ref={canvasShellRef}>
             <canvas
               aria-label={activeImage ? `${activeImage.fileName} 标注画布` : "标注画布"}
-              className={`annotation-canvas ${mode === "bbox" ? "drawing" : ""} ${mode === "pan" || panState ? "panning" : ""}`}
+              className={`annotation-canvas ${mode === "bbox" || mode === "polygon" ? "drawing" : ""} ${mode === "pan" || panState ? "panning" : ""}`}
               data-testid="annotation-canvas"
+              onDoubleClick={handleCanvasDoubleClick}
               height={canvasSize.height}
               onMouseDown={beginCanvasInteraction}
               onMouseMove={updateCanvasInteraction}
@@ -3523,6 +3813,27 @@ function AnnotationWorkspace({
         </div>
       </section>
       <aside className="inspector">
+        {isClassification ? (
+          <>
+            <h2>图片分类</h2>
+            <label className="classification-field">
+              <span>分类标签</span>
+              <select
+                aria-label="图片分类"
+                onChange={(event) => assignClassification(event.target.value)}
+                value={classificationObject?.classId ?? ""}
+              >
+                <option value="">未分类</option>
+                {workspaceDetail?.classes.map((item) => (
+                  <option key={item.id ?? item.label} value={item.id}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <p className="classification-hint">每张图片选择一个类别，保存后进入版本与质检流程。</p>
+          </>
+        ) : null}
         <h2>对象</h2>
         {objects.map((object) => (
           <button
@@ -3550,7 +3861,7 @@ function AnnotationWorkspace({
           <dd>
             <input
               aria-label="对象标签"
-              disabled={!selectedObject}
+              disabled={!selectedObject || selectedObject.type === "classification"}
               onChange={(event) => updateSelectedLabel(event.target.value)}
               ref={selectedLabelInputRef}
               value={selectedObject?.label ?? ""}
