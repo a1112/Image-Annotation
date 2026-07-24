@@ -30,11 +30,20 @@ pub struct ProjectPaths {
     pub manifest: PathBuf,
 }
 
+#[cfg(not(test))]
 pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
         .to_path_buf()
+}
+
+#[cfg(test)]
+pub fn workspace_root() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "image-annotation-tests-{}",
+        std::process::id()
+    ))
 }
 
 pub fn test_data_root() -> PathBuf {

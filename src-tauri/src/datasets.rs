@@ -1,4 +1,5 @@
 use crate::{domain, importers::voc, project_fs, storage};
+use image::{metadata::Orientation, ImageDecoder, ImageReader};
 use serde::Serialize;
 use std::{
     collections::{hash_map::DefaultHasher, BTreeSet},
@@ -109,6 +110,9 @@ pub fn builtin_datasets() -> Vec<BuiltinDataset> {
         .into_iter()
         .map(|source| {
             let downloaded = project_is_imported(&source.key);
+            if downloaded {
+                let _ = rebuild_sqlite_index_if_needed(&source);
+            }
             BuiltinDataset {
                 key: source.key.clone(),
                 name: source.name,
@@ -832,10 +836,8 @@ fn project_is_imported(project_id: &str) -> bool {
 
 fn rebuild_sqlite_index_if_needed(source: &BuiltinDatasetSource) -> Result<(), String> {
     let paths = project_fs::project_paths(&source.key);
-    if !storage::read_images(&paths.sqlite, None)?.is_empty() {
-        return Ok(());
-    }
     let images = indexed_images(&paths.raw);
+    let stored_images = storage::read_images(&paths.sqlite, None)?;
     let labels = domain::coco_labels();
     let classes: Vec<_> = labels
         .iter()
@@ -846,8 +848,23 @@ fn rebuild_sqlite_index_if_needed(source: &BuiltinDatasetSource) -> Result<(), S
             color: class_color(index),
         })
         .collect();
-    let manifest = project_fs::read_manifest(&source.key)
+    let mut manifest = project_fs::read_manifest(&source.key)
         .ok_or_else(|| format!("project manifest not found: {}", source.key))?;
+    let index_is_current = manifest.image_count == images.len() as u32
+        && stored_images.len() == images.len()
+        && stored_images
+            .iter()
+            .zip(images.iter())
+            .all(|(stored, indexed)| {
+                stored.file_name == indexed.file_name
+                    && stored.width == indexed.width
+                    && stored.height == indexed.height
+            });
+    if index_is_current {
+        return Ok(());
+    }
+    manifest.image_count = images.len() as u32;
+    project_fs::write_manifest(&manifest)?;
     storage::initialize_project_database(&paths.sqlite)?;
     storage::upsert_project_index(&paths.sqlite, &manifest, &images, &classes)
 }
@@ -856,11 +873,29 @@ fn count_images(raw_root: &Path) -> u32 {
     indexed_image_paths(raw_root).len() as u32
 }
 
+fn oriented_image_dimensions(path: &Path) -> (u32, u32) {
+    let fallback = || image::image_dimensions(path).unwrap_or((0, 0));
+    let Ok(reader) = ImageReader::open(path).and_then(|reader| reader.with_guessed_format()) else {
+        return fallback();
+    };
+    let Ok(mut decoder) = reader.into_decoder() else {
+        return fallback();
+    };
+    let (width, height) = decoder.dimensions();
+    match decoder.orientation().unwrap_or(Orientation::NoTransforms) {
+        Orientation::Rotate90
+        | Orientation::Rotate270
+        | Orientation::Rotate90FlipH
+        | Orientation::Rotate270FlipH => (height, width),
+        _ => (width, height),
+    }
+}
+
 fn indexed_images(raw_root: &Path) -> Vec<storage::StoredImage> {
     let mut images: Vec<_> = indexed_image_paths(raw_root)
         .into_iter()
         .map(|path| {
-            let (width, height) = image::image_dimensions(&path).unwrap_or((0, 0));
+            let (width, height) = oriented_image_dimensions(&path);
             let file_name = path
                 .file_name()
                 .map(|value| value.to_string_lossy().to_string())
@@ -890,7 +925,9 @@ fn indexed_image_paths(raw_root: &Path) -> Vec<PathBuf> {
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| {
-            entry.file_type().is_file() && domain::is_image_path(&entry.path().to_path_buf())
+            entry.file_type().is_file()
+                && !entry.file_name().to_string_lossy().starts_with("._")
+                && domain::is_image_path(&entry.path().to_path_buf())
         })
         .map(|entry| entry.path().to_path_buf())
         .collect()
@@ -900,7 +937,7 @@ fn indexed_local_images(root: &Path, format: &str) -> Vec<storage::StoredImage> 
     let mut images: Vec<_> = indexed_image_paths(root)
         .into_iter()
         .map(|path| {
-            let (width, height) = image::image_dimensions(&path).unwrap_or((0, 0));
+            let (width, height) = oriented_image_dimensions(&path);
             let relative = path
                 .strip_prefix(root)
                 .map(|value| value.to_string_lossy().replace('\\', "/"))

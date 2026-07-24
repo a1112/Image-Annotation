@@ -13,6 +13,22 @@ import type {
   DataSourceAnalysis,
   DownloadJob,
   ProjectDetail,
+  IssueComment,
+  IssueRecord,
+  IssueSeverity,
+  IssueStatus,
+  SyncSummary,
+  RemoteProjectConfig,
+  SyncConflict,
+  SyncRunResult,
+  FolderWorkspace,
+  AssetCacheRecord,
+  AssetCacheSummary,
+  AssetCacheCleanupResult,
+  HybridDiagnostics,
+  ProjectRole,
+  RemoteProjectMember,
+  PublishProjectResult,
 } from "../types/domain";
 
 export class BackendUnavailableError extends Error {
@@ -153,6 +169,208 @@ export async function saveImageAnnotations(
 
 export async function submitImageAnnotations(projectId: string, imageId: string): Promise<void> {
   await invokeRequired("submit_image_annotations", { projectId, imageId });
+}
+
+export async function listIssues(projectId: string, includeClosed = false): Promise<IssueRecord[]> {
+  return invokeRequired("list_issues", { projectId, includeClosed });
+}
+
+export async function createIssue(
+  projectId: string,
+  input: {
+    imageId: string;
+    annotationObjectId?: string;
+    title: string;
+    description: string;
+    severity: IssueSeverity;
+    assigneeId?: string;
+  },
+): Promise<IssueRecord> {
+  return invokeRequired("create_issue", {
+    projectId,
+    imageId: input.imageId,
+    annotationObjectId: input.annotationObjectId ?? null,
+    title: input.title,
+    description: input.description,
+    severity: input.severity,
+    assigneeId: input.assigneeId ?? null,
+  });
+}
+
+export async function transitionIssue(
+  projectId: string,
+  issueId: string,
+  nextStatus: IssueStatus,
+): Promise<IssueRecord> {
+  return invokeRequired("transition_issue", { projectId, issueId, nextStatus });
+}
+
+export async function addIssueComment(
+  projectId: string,
+  issueId: string,
+  content: string,
+): Promise<IssueComment> {
+  return invokeRequired("add_issue_comment", { projectId, issueId, content });
+}
+
+export async function listIssueComments(projectId: string, issueId: string): Promise<IssueComment[]> {
+  return invokeRequired("list_issue_comments", { projectId, issueId });
+}
+
+export async function getProjectSyncSummary(projectId: string): Promise<SyncSummary> {
+  return invokeRequired("get_project_sync_summary", { projectId });
+}
+
+export async function configureRemoteProject(
+  projectId: string,
+  input: {
+    serverUrl: string;
+    remoteProjectId: string;
+    deviceId: string;
+    mode: "cloud_linked" | "mirrored";
+    cachePolicy: "thumbnail_only" | "on_demand" | "full_mirror";
+    autoSync: boolean;
+  },
+): Promise<RemoteProjectConfig> {
+  return invokeRequired("configure_remote_project", { projectId, ...input });
+}
+
+export async function syncProject(
+  projectId: string,
+  accessToken?: string,
+): Promise<SyncRunResult> {
+  return invokeRequired("sync_project", { projectId, accessToken: accessToken ?? null });
+}
+
+export async function cacheRemoteAsset(
+  projectId: string,
+  imageId: string,
+  accessToken?: string,
+  pinned = false,
+): Promise<AssetCacheRecord> {
+  return invokeRequired("cache_remote_asset", {
+    projectId,
+    imageId,
+    accessToken: accessToken || null,
+    pinned,
+  });
+}
+
+export async function getAssetCacheSummary(projectId: string): Promise<AssetCacheSummary> {
+  return invokeRequired("get_asset_cache_summary", { projectId });
+}
+
+export async function cleanupAssetCache(
+  projectId: string,
+  targetBytes: number,
+): Promise<AssetCacheCleanupResult> {
+  return invokeRequired("cleanup_asset_cache", { projectId, targetBytes });
+}
+
+export async function getHybridDiagnostics(projectId: string): Promise<HybridDiagnostics> {
+  return invokeRequired("get_hybrid_diagnostics", { projectId });
+}
+
+export async function listRemoteProjectMembers(projectId: string): Promise<RemoteProjectMember[]> {
+  return invokeRequired("list_remote_project_members", { projectId });
+}
+
+export async function upsertRemoteProjectMember(
+  projectId: string,
+  userId: string,
+  role: ProjectRole,
+): Promise<RemoteProjectMember> {
+  return invokeRequired("upsert_remote_project_member", { projectId, userId, role });
+}
+
+export async function removeRemoteProjectMember(
+  projectId: string,
+  userId: string,
+): Promise<void> {
+  await invokeRequired("remove_remote_project_member", { projectId, userId });
+}
+
+export async function publishProject(
+  projectId: string,
+  input: {
+    serverUrl: string;
+    deviceId: string;
+    mode: "cloud_linked" | "mirrored";
+    cachePolicy: "thumbnail_only" | "on_demand" | "full_mirror";
+    accessToken?: string;
+  },
+): Promise<PublishProjectResult> {
+  return invokeRequired("publish_project", {
+    projectId,
+    ...input,
+    accessToken: input.accessToken || null,
+  });
+}
+
+export async function listSyncConflicts(projectId: string): Promise<SyncConflict[]> {
+  return invokeRequired("list_sync_conflicts", { projectId });
+}
+
+export async function resolveSyncConflict(
+  projectId: string,
+  conflictId: string,
+  resolution: "local" | "remote",
+): Promise<void> {
+  await invokeRequired("resolve_sync_conflict", { projectId, conflictId, resolution });
+}
+
+export async function listProjectFolders(projectId: string): Promise<FolderWorkspace> {
+  return invokeRequired("list_project_folders", { projectId });
+}
+
+export async function migrateLegacyProjectFolders(
+  projectId: string,
+  names: string[],
+  assignments: Record<string, string>,
+): Promise<FolderWorkspace> {
+  return invokeRequired("migrate_legacy_project_folders", { projectId, names, assignments });
+}
+
+export async function createProjectFolder(
+  projectId: string,
+  name: string,
+  parentId?: string,
+): Promise<FolderWorkspace> {
+  return invokeRequired("create_project_folder", { projectId, name, parentId: parentId ?? null });
+}
+
+export async function renameProjectFolder(
+  projectId: string,
+  folderId: string,
+  name: string,
+): Promise<FolderWorkspace> {
+  return invokeRequired("rename_project_folder", { projectId, folderId, name });
+}
+
+export async function deleteProjectFolder(
+  projectId: string,
+  folderId: string,
+): Promise<FolderWorkspace> {
+  return invokeRequired("delete_project_folder", { projectId, folderId });
+}
+
+export async function moveImageToProjectFolder(
+  projectId: string,
+  imageId: string,
+  folderId: string,
+): Promise<FolderWorkspace> {
+  return invokeRequired("move_image_to_project_folder", { projectId, imageId, folderId });
+}
+
+export async function storeProjectCredential(
+  projectId: string,
+  accessToken: string,
+): Promise<void> {
+  await invokeRequired("store_project_credential", { projectId, accessToken });
+}
+
+export async function clearProjectCredential(projectId: string): Promise<void> {
+  await invokeRequired("clear_project_credential", { projectId });
 }
 
 export async function openAnnotationWindow(projectId: string, imageId?: string): Promise<void> {

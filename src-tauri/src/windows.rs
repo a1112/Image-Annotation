@@ -34,7 +34,7 @@ pub fn open_annotation_window(
         return Ok(());
     }
 
-    WebviewWindowBuilder::new(
+    let window = WebviewWindowBuilder::new(
         app,
         label,
         WebviewUrl::App(format!("index.html{route}").into()),
@@ -48,6 +48,7 @@ pub fn open_annotation_window(
     .shadow(true)
     .build()
     .map_err(|err| err.to_string())?;
+    crate::platform::configure_window(&window);
 
     Ok(())
 }
@@ -63,7 +64,7 @@ pub fn open_backend_tasks_window(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    WebviewWindowBuilder::new(
+    let window = WebviewWindowBuilder::new(
         app,
         label,
         WebviewUrl::App(format!("index.html{route}").into()),
@@ -77,6 +78,7 @@ pub fn open_backend_tasks_window(app: &AppHandle) -> Result<(), String> {
     .shadow(true)
     .build()
     .map_err(|err| err.to_string())?;
+    crate::platform::configure_window(&window);
 
     Ok(())
 }

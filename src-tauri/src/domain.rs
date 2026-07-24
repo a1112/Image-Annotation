@@ -829,6 +829,75 @@ impl SampleRepository {
         storage::submit_image_for_review(&paths.sqlite, image_id)
     }
 
+    pub fn project_issues(
+        &self,
+        project_id: &str,
+        include_closed: bool,
+    ) -> Result<Vec<crate::hybrid::IssueRecord>, String> {
+        let paths = project_fs::project_paths(project_id);
+        storage::list_issue_records(&paths.sqlite, project_id, include_closed)
+    }
+
+    pub fn create_project_issue(
+        &self,
+        project_id: &str,
+        image_id: &str,
+        annotation_object_id: Option<&str>,
+        title: &str,
+        description: &str,
+        severity: &str,
+        assignee_id: Option<&str>,
+    ) -> Result<crate::hybrid::IssueRecord, String> {
+        let paths = project_fs::project_paths(project_id);
+        storage::create_issue_record(
+            &paths.sqlite,
+            project_id,
+            image_id,
+            annotation_object_id,
+            title,
+            description,
+            severity,
+            assignee_id,
+        )
+    }
+
+    pub fn transition_project_issue(
+        &self,
+        project_id: &str,
+        issue_id: &str,
+        next_status: &str,
+    ) -> Result<crate::hybrid::IssueRecord, String> {
+        let paths = project_fs::project_paths(project_id);
+        storage::transition_issue_record(&paths.sqlite, project_id, issue_id, next_status)
+    }
+
+    pub fn add_project_issue_comment(
+        &self,
+        project_id: &str,
+        issue_id: &str,
+        content: &str,
+    ) -> Result<crate::hybrid::IssueCommentRecord, String> {
+        let paths = project_fs::project_paths(project_id);
+        storage::add_issue_comment_record(&paths.sqlite, project_id, issue_id, content)
+    }
+
+    pub fn project_issue_comments(
+        &self,
+        project_id: &str,
+        issue_id: &str,
+    ) -> Result<Vec<crate::hybrid::IssueCommentRecord>, String> {
+        let paths = project_fs::project_paths(project_id);
+        storage::list_issue_comment_records(&paths.sqlite, issue_id)
+    }
+
+    pub fn project_sync_summary(
+        &self,
+        project_id: &str,
+    ) -> Result<crate::hybrid::SyncSummary, String> {
+        let paths = project_fs::project_paths(project_id);
+        storage::read_sync_summary(&paths.sqlite, project_id)
+    }
+
     pub fn annotation_history(
         &self,
         project_id: &str,

@@ -378,6 +378,239 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
             repository.submit_image_annotations(&project_id, &image_id)?;
             Ok(Value::Null)
         }
+        "list_issues" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let include_closed = args
+                .get("includeClosed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
+            serde_json::to_value(repository.project_issues(&project_id, include_closed)?)
+                .map_err(|err| err.to_string())
+        }
+        "create_issue" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let image_id = string_arg(&args, "imageId")?;
+            let title = string_arg(&args, "title")?;
+            let description = string_arg(&args, "description")?;
+            let severity = string_arg(&args, "severity")?;
+            let annotation_object_id = optional_string_arg(&args, "annotationObjectId");
+            let assignee_id = optional_string_arg(&args, "assigneeId");
+            let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
+            serde_json::to_value(repository.create_project_issue(
+                &project_id,
+                &image_id,
+                annotation_object_id.as_deref(),
+                &title,
+                &description,
+                &severity,
+                assignee_id.as_deref(),
+            )?)
+            .map_err(|err| err.to_string())
+        }
+        "transition_issue" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let issue_id = string_arg(&args, "issueId")?;
+            let next_status = string_arg(&args, "nextStatus")?;
+            let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
+            serde_json::to_value(repository.transition_project_issue(
+                &project_id,
+                &issue_id,
+                &next_status,
+            )?)
+            .map_err(|err| err.to_string())
+        }
+        "add_issue_comment" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let issue_id = string_arg(&args, "issueId")?;
+            let content = string_arg(&args, "content")?;
+            let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
+            serde_json::to_value(repository.add_project_issue_comment(
+                &project_id,
+                &issue_id,
+                &content,
+            )?)
+            .map_err(|err| err.to_string())
+        }
+        "list_issue_comments" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let issue_id = string_arg(&args, "issueId")?;
+            let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
+            serde_json::to_value(repository.project_issue_comments(&project_id, &issue_id)?)
+                .map_err(|err| err.to_string())
+        }
+        "get_project_sync_summary" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
+            serde_json::to_value(repository.project_sync_summary(&project_id)?)
+                .map_err(|err| err.to_string())
+        }
+        "configure_remote_project" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let server_url = string_arg(&args, "serverUrl")?;
+            let remote_project_id = string_arg(&args, "remoteProjectId")?;
+            let device_id = string_arg(&args, "deviceId")?;
+            let mode = string_arg(&args, "mode")?;
+            let cache_policy = string_arg(&args, "cachePolicy")?;
+            let auto_sync = args.get("autoSync").and_then(Value::as_bool).unwrap_or(true);
+            let paths = crate::project_fs::project_paths(&project_id);
+            crate::storage::initialize_project_database(&paths.sqlite)?;
+            let mut connection =
+                rusqlite::Connection::open(&paths.sqlite).map_err(|err| err.to_string())?;
+            serde_json::to_value(crate::hybrid::configure_remote_project(
+                &mut connection,
+                &project_id,
+                &server_url,
+                &remote_project_id,
+                &device_id,
+                &mode,
+                &cache_policy,
+                auto_sync,
+            )?)
+            .map_err(|err| err.to_string())
+        }
+        "sync_project" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let access_token = optional_string_arg(&args, "accessToken");
+            let paths = crate::project_fs::project_paths(&project_id);
+            serde_json::to_value(crate::sync_engine::sync_project(
+                &paths.sqlite,
+                &project_id,
+                access_token.as_deref(),
+            )?)
+            .map_err(|err| err.to_string())
+        }
+        "list_sync_conflicts" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let paths = crate::project_fs::project_paths(&project_id);
+            crate::storage::initialize_project_database(&paths.sqlite)?;
+            let connection =
+                rusqlite::Connection::open(&paths.sqlite).map_err(|err| err.to_string())?;
+            serde_json::to_value(crate::hybrid::list_conflicts(&connection, &project_id)?)
+                .map_err(|err| err.to_string())
+        }
+        "resolve_sync_conflict" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let conflict_id = string_arg(&args, "conflictId")?;
+            let resolution = string_arg(&args, "resolution")?;
+            let paths = crate::project_fs::project_paths(&project_id);
+            crate::storage::initialize_project_database(&paths.sqlite)?;
+            let mut connection =
+                rusqlite::Connection::open(&paths.sqlite).map_err(|err| err.to_string())?;
+            crate::hybrid::resolve_conflict(
+                &mut connection,
+                &project_id,
+                &conflict_id,
+                &resolution,
+            )?;
+            Ok(Value::Null)
+        }
+        "list_project_folders" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let paths = crate::project_fs::project_paths(&project_id);
+            crate::storage::initialize_project_database(&paths.sqlite)?;
+            let mut connection =
+                rusqlite::Connection::open(&paths.sqlite).map_err(|err| err.to_string())?;
+            serde_json::to_value(crate::hybrid::folder_workspace(
+                &mut connection,
+                &project_id,
+            )?)
+            .map_err(|err| err.to_string())
+        }
+        "migrate_legacy_project_folders" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let names = string_vec_arg(&args, "names")?;
+            let assignments = serde_json::from_value(
+                args.get("assignments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            )
+            .map_err(|err| err.to_string())?;
+            let paths = crate::project_fs::project_paths(&project_id);
+            crate::storage::initialize_project_database(&paths.sqlite)?;
+            let mut connection =
+                rusqlite::Connection::open(&paths.sqlite).map_err(|err| err.to_string())?;
+            serde_json::to_value(crate::hybrid::migrate_legacy_folders(
+                &mut connection,
+                &project_id,
+                &names,
+                &assignments,
+            )?)
+            .map_err(|err| err.to_string())
+        }
+        "create_project_folder" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let name = string_arg(&args, "name")?;
+            let parent_id = optional_string_arg(&args, "parentId");
+            let paths = crate::project_fs::project_paths(&project_id);
+            crate::storage::initialize_project_database(&paths.sqlite)?;
+            let mut connection =
+                rusqlite::Connection::open(&paths.sqlite).map_err(|err| err.to_string())?;
+            serde_json::to_value(crate::hybrid::create_folder(
+                &mut connection,
+                &project_id,
+                &name,
+                parent_id.as_deref(),
+            )?)
+            .map_err(|err| err.to_string())
+        }
+        "rename_project_folder" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let folder_id = string_arg(&args, "folderId")?;
+            let name = string_arg(&args, "name")?;
+            let paths = crate::project_fs::project_paths(&project_id);
+            crate::storage::initialize_project_database(&paths.sqlite)?;
+            let mut connection =
+                rusqlite::Connection::open(&paths.sqlite).map_err(|err| err.to_string())?;
+            serde_json::to_value(crate::hybrid::rename_folder(
+                &mut connection,
+                &project_id,
+                &folder_id,
+                &name,
+            )?)
+            .map_err(|err| err.to_string())
+        }
+        "delete_project_folder" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let folder_id = string_arg(&args, "folderId")?;
+            let paths = crate::project_fs::project_paths(&project_id);
+            crate::storage::initialize_project_database(&paths.sqlite)?;
+            let mut connection =
+                rusqlite::Connection::open(&paths.sqlite).map_err(|err| err.to_string())?;
+            serde_json::to_value(crate::hybrid::delete_folder(
+                &mut connection,
+                &project_id,
+                &folder_id,
+            )?)
+            .map_err(|err| err.to_string())
+        }
+        "move_image_to_project_folder" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let image_id = string_arg(&args, "imageId")?;
+            let folder_id = string_arg(&args, "folderId")?;
+            let paths = crate::project_fs::project_paths(&project_id);
+            crate::storage::initialize_project_database(&paths.sqlite)?;
+            let mut connection =
+                rusqlite::Connection::open(&paths.sqlite).map_err(|err| err.to_string())?;
+            serde_json::to_value(crate::hybrid::move_image_to_folder(
+                &mut connection,
+                &project_id,
+                &image_id,
+                &folder_id,
+            )?)
+            .map_err(|err| err.to_string())
+        }
+        "store_project_credential" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let access_token = string_arg(&args, "accessToken")?;
+            crate::credentials::store_access_token(&project_id, &access_token)?;
+            Ok(Value::Null)
+        }
+        "clear_project_credential" => {
+            let project_id = string_arg(&args, "projectId")?;
+            crate::credentials::delete_access_token(&project_id)?;
+            Ok(Value::Null)
+        }
         "create_dataset_project" => {
             let name = string_arg(&args, "name")?;
             let dataset_type = string_arg(&args, "datasetType")?;
