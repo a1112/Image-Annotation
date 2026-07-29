@@ -826,14 +826,21 @@ impl SampleRepository {
             &image.file_name,
             &image.id,
         )?;
-        let (image_width, image_height) =
-            image::image_dimensions(&image_path).map_err(|error| {
+        let dimensions =
+            crate::datasets::oriented_image_dimensions(&image_path).map_err(|error| {
                 format!(
-                    "read image dimensions for '{}' at {}: {error}",
+                    "read oriented image dimensions for '{}' at {}: {error}",
                     image.id,
                     image_path.display()
                 )
             })?;
+        let (image_width, image_height) = dimensions;
+        if (image_width, image_height) != (image.width, image.height) {
+            return Err(format!(
+                "image '{}' dimensions changed from {}x{} to {}x{}; rescan project assets before creating a snapshot",
+                image.id, image.width, image.height, image_width, image_height
+            ));
+        }
 
         if let Some(payload) = storage::read_annotation_payload(&paths.sqlite, &image.id)? {
             let objects = serde_json::from_str::<Vec<AnnotationObject>>(&payload.object_json)
@@ -1341,10 +1348,9 @@ impl SampleRepository {
                         image.id
                     ));
                 }
-                copy_file_and_sync(
-                    &source_path,
-                    &snapshot_asset_root.join(Path::new(&relative_path)),
-                )?;
+                let target_path = snapshot_asset_root.join(Path::new(&relative_path));
+                copy_file_and_sync(&source_path, &target_path)?;
+                verify_snapshot_asset_dimensions(&target_path, image.width, image.height)?;
                 bridge_samples.push(BridgeSourceSample {
                     id: image.id.clone(),
                     relative_path,
@@ -1874,6 +1880,25 @@ fn copy_file_and_sync(source: &Path, target: &Path) -> Result<(), String> {
     if let Err(error) = copy_result {
         let _ = fs::remove_file(&temporary_path);
         return Err(error);
+    }
+    Ok(())
+}
+
+fn verify_snapshot_asset_dimensions(
+    path: &Path,
+    expected_width: u32,
+    expected_height: u32,
+) -> Result<(), String> {
+    let actual = crate::datasets::oriented_image_dimensions(path)?;
+    if actual != (expected_width, expected_height) {
+        return Err(format!(
+            "copied snapshot asset {} dimensions changed: expected {}x{}, got {}x{}",
+            path.display(),
+            expected_width,
+            expected_height,
+            actual.0,
+            actual.1
+        ));
     }
     Ok(())
 }
@@ -2427,10 +2452,11 @@ mod tests {
             crate::bridge::BridgeTaskType::Classification
         );
         assert_eq!(bridge.samples.len(), 3);
-        assert!(bridge.samples.iter().all(|sample| sample
-            .objects
-            .iter()
-            .all(|object| matches!(object, BridgeObject::Classification { .. }))));
+        assert!(!bridge.samples.is_empty());
+        assert!(bridge.samples.iter().all(|sample| {
+            sample.objects.len() == 1
+                && matches!(sample.objects[0], BridgeObject::Classification { .. })
+        }));
         let _ = std::fs::remove_dir_all(paths.root);
     }
 
@@ -2750,6 +2776,59 @@ mod tests {
             .unwrap()
             .is_empty());
         let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn snapshot_rejects_changed_image_dimensions_before_creating_record() {
+        let name = format!(
+            "Bridge Changed Dimensions {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let project =
+            crate::datasets::create_dataset_project(&name, "yolo-detect", "demo-bbox").unwrap();
+        let paths = project_fs::project_paths(&project.id);
+        let image = storage::read_images(&paths.sqlite, None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        image::RgbImage::from_pixel(13, 7, image::Rgb([1, 2, 3]))
+            .save(paths.raw.join(&image.file_name))
+            .unwrap();
+
+        let result =
+            SampleRepository::new().create_dataset_snapshot(&project.id, "must-rescan-first");
+
+        assert!(result.unwrap_err().to_lowercase().contains("rescan"));
+        assert!(storage::list_snapshot_records(&paths.sqlite)
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read_dir(&paths.snapshots).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn copied_snapshot_asset_dimensions_are_verified() {
+        let root = std::env::temp_dir().join(format!(
+            "bridge-copy-dimensions-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("asset.png");
+        image::RgbImage::from_pixel(9, 5, image::Rgb([1, 2, 3]))
+            .save(&target)
+            .unwrap();
+
+        let result = verify_snapshot_asset_dimensions(&target, 10, 5);
+
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

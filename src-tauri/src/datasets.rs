@@ -234,7 +234,7 @@ pub fn import_dataset_archive(
         io::copy(&mut file, &mut output).map_err(|err| err.to_string())?;
     }
 
-    let images = indexed_images(&paths.raw);
+    let images = indexed_images(&paths.raw)?;
     let labels = domain::coco_labels();
     let classes: Vec<_> = labels
         .iter()
@@ -316,7 +316,7 @@ pub fn create_dataset_project(
         create_demo_files(&paths.raw, &source.format, demo_template)?;
     }
 
-    let images = indexed_images(&paths.raw);
+    let images = indexed_images(&paths.raw)?;
     let labels = demo_class_labels();
     let classes: Vec<_> = labels
         .iter()
@@ -565,17 +565,20 @@ pub fn rescan_project_assets(project_id: &str) -> Result<domain::DatasetProject,
         .ok_or_else(|| format!("project manifest not found: {project_id}"))?;
     let is_local_linked = manifest.source_dataset_key == "local-linked";
     let local_root = PathBuf::from(&manifest.root_path);
-    let images = if is_local_linked {
+    let scanned_images = if is_local_linked {
         if !local_root.exists() {
             return Err(format!(
                 "local dataset directory not found: {}",
                 manifest.root_path
             ));
         }
-        indexed_local_images(&local_root, &manifest.format)
+        indexed_local_images(&local_root, &manifest.format)?
     } else {
-        indexed_images(&paths.raw)
+        indexed_images(&paths.raw)?
     };
+    storage::initialize_project_database(&paths.sqlite)?;
+    let existing_images = storage::read_images(&paths.sqlite, None)?;
+    let images = reconcile_scanned_images(&existing_images, &scanned_images)?;
     let mut classes = if is_local_linked {
         classes_from_labels(local_labels_for_format(&local_root, &manifest.format))
     } else {
@@ -590,7 +593,6 @@ pub fn rescan_project_assets(project_id: &str) -> Result<domain::DatasetProject,
     manifest.image_count = images.len() as u32;
     manifest.class_count = classes.len() as u32;
     project_fs::write_manifest_to_path(&manifest, &paths.manifest)?;
-    storage::initialize_project_database(&paths.sqlite)?;
     storage::upsert_project_index(&paths.sqlite, &manifest, &images, &classes)?;
     domain::SampleRepository::new()
         .dataset_projects()
@@ -663,7 +665,7 @@ pub fn open_local_dataset(
         "image-classification" => "image-classification",
         _ => "yolo-detect",
     };
-    let images = indexed_local_images(&canonical, format);
+    let images = indexed_local_images(&canonical, format)?;
     let labels = local_labels_for_format(&canonical, format);
     let labels = if labels.is_empty() {
         demo_class_labels()
@@ -851,8 +853,9 @@ fn project_is_imported(project_id: &str) -> bool {
 
 fn rebuild_sqlite_index_if_needed(source: &BuiltinDatasetSource) -> Result<(), String> {
     let paths = project_fs::project_paths(&source.key);
-    let images = indexed_images(&paths.raw);
+    let scanned_images = indexed_images(&paths.raw)?;
     let stored_images = storage::read_images(&paths.sqlite, None)?;
+    let images = reconcile_scanned_images(&stored_images, &scanned_images)?;
     let labels = domain::coco_labels();
     let classes: Vec<_> = labels
         .iter()
@@ -867,15 +870,7 @@ fn rebuild_sqlite_index_if_needed(source: &BuiltinDatasetSource) -> Result<(), S
         .ok_or_else(|| format!("project manifest not found: {}", source.key))?;
     let index_is_current = manifest.image_count == images.len() as u32
         && stored_images.len() == images.len()
-        && (stored_images
-            .iter()
-            .zip(images.iter())
-            .all(|(stored, indexed)| {
-                stored.file_name == indexed.file_name
-                    && stored.width == indexed.width
-                    && stored.height == indexed.height
-            })
-            || legacy_basename_index_matches(&stored_images, &images));
+        && stored_images == images;
     if index_is_current {
         return Ok(());
     }
@@ -885,54 +880,127 @@ fn rebuild_sqlite_index_if_needed(source: &BuiltinDatasetSource) -> Result<(), S
     storage::upsert_project_index(&paths.sqlite, &manifest, &images, &classes)
 }
 
-fn legacy_basename_index_matches(
-    stored_images: &[storage::StoredImage],
-    indexed_images: &[storage::StoredImage],
-) -> bool {
-    stored_images.iter().all(|stored| {
-        let stored_path = Path::new(&stored.file_name);
-        if stored_path.components().count() != 1 {
-            return false;
+fn reconcile_scanned_images(
+    existing_images: &[storage::StoredImage],
+    scanned_images: &[storage::StoredImage],
+) -> Result<Vec<storage::StoredImage>, String> {
+    let mut existing_ids = BTreeSet::new();
+    for existing in existing_images {
+        if !existing_ids.insert(existing.id.as_str()) {
+            return Err(format!("duplicate existing image id '{}'", existing.id));
         }
-        indexed_images
-            .iter()
-            .filter(|indexed| {
-                Path::new(&indexed.file_name).file_name() == stored_path.file_name()
-                    && indexed.width == stored.width
-                    && indexed.height == stored.height
-            })
-            .count()
-            == 1
-    })
+    }
+
+    let mut scanned_paths = BTreeSet::new();
+    for scanned in scanned_images {
+        if !scanned_paths.insert(scanned.file_name.as_str()) {
+            return Err(format!(
+                "duplicate scanned image path '{}'",
+                scanned.file_name
+            ));
+        }
+    }
+
+    let mut matched_existing: Vec<Option<usize>> = vec![None; scanned_images.len()];
+    for (existing_index, existing) in existing_images.iter().enumerate() {
+        let is_legacy_basename = Path::new(&existing.file_name).components().count() == 1;
+        let scanned_index = if is_legacy_basename {
+            let basename_matches = scanned_images
+                .iter()
+                .enumerate()
+                .filter(|(_, scanned)| {
+                    Path::new(&scanned.file_name).file_name()
+                        == Path::new(&existing.file_name).file_name()
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            match basename_matches.len() {
+                0 => None,
+                1 => Some(basename_matches[0]),
+                _ => {
+                    return Err(format!(
+                        "ambiguous legacy image basename '{}': {} scanned files match",
+                        existing.file_name,
+                        basename_matches.len()
+                    ))
+                }
+            }
+        } else {
+            scanned_images
+                .iter()
+                .position(|scanned| scanned.file_name == existing.file_name)
+        };
+
+        if let Some(scanned_index) = scanned_index {
+            if let Some(other_existing) = matched_existing[scanned_index] {
+                return Err(format!(
+                    "scanned image '{}' matches multiple existing records '{}' and '{}'",
+                    scanned_images[scanned_index].file_name,
+                    existing_images[other_existing].id,
+                    existing.id
+                ));
+            }
+            matched_existing[scanned_index] = Some(existing_index);
+        }
+    }
+
+    let mut reconciled = Vec::with_capacity(scanned_images.len());
+    let mut output_ids = BTreeSet::new();
+    for (scanned_index, scanned) in scanned_images.iter().enumerate() {
+        let image = if let Some(existing_index) = matched_existing[scanned_index] {
+            let existing = &existing_images[existing_index];
+            storage::StoredImage {
+                id: existing.id.clone(),
+                file_name: scanned.file_name.clone(),
+                width: scanned.width,
+                height: scanned.height,
+                split: scanned.split.clone(),
+                status: existing.status.clone(),
+                qa_status: existing.qa_status.clone(),
+                review_note: existing.review_note.clone(),
+            }
+        } else {
+            scanned.clone()
+        };
+        if !output_ids.insert(image.id.clone()) {
+            return Err(format!(
+                "reconciled image id collision for '{}' at '{}'",
+                image.id, image.file_name
+            ));
+        }
+        reconciled.push(image);
+    }
+    reconciled.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+    Ok(reconciled)
 }
 
 fn count_images(raw_root: &Path) -> u32 {
     indexed_image_paths(raw_root).len() as u32
 }
 
-fn oriented_image_dimensions(path: &Path) -> (u32, u32) {
-    let fallback = || image::image_dimensions(path).unwrap_or((0, 0));
-    let Ok(reader) = ImageReader::open(path).and_then(|reader| reader.with_guessed_format()) else {
-        return fallback();
-    };
-    let Ok(mut decoder) = reader.into_decoder() else {
-        return fallback();
-    };
+pub(crate) fn oriented_image_dimensions(path: &Path) -> Result<(u32, u32), String> {
+    let reader = ImageReader::open(path)
+        .and_then(|reader| reader.with_guessed_format())
+        .map_err(|error| format!("open image {}: {error}", path.display()))?;
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|error| format!("decode image metadata {}: {error}", path.display()))?;
     let (width, height) = decoder.dimensions();
-    match decoder.orientation().unwrap_or(Orientation::NoTransforms) {
+    let dimensions = match decoder.orientation().unwrap_or(Orientation::NoTransforms) {
         Orientation::Rotate90
         | Orientation::Rotate270
         | Orientation::Rotate90FlipH
         | Orientation::Rotate270FlipH => (height, width),
         _ => (width, height),
-    }
+    };
+    Ok(dimensions)
 }
 
-fn indexed_images(raw_root: &Path) -> Vec<storage::StoredImage> {
+fn indexed_images(raw_root: &Path) -> Result<Vec<storage::StoredImage>, String> {
     let mut images: Vec<_> = indexed_image_paths(raw_root)
         .into_iter()
         .map(|path| {
-            let (width, height) = oriented_image_dimensions(&path);
+            let (width, height) = oriented_image_dimensions(&path)?;
             let file_name = path
                 .strip_prefix(raw_root)
                 .map(|value| value.to_string_lossy().replace('\\', "/"))
@@ -942,7 +1010,7 @@ fn indexed_images(raw_root: &Path) -> Vec<storage::StoredImage> {
                         .unwrap_or_else(|| "image.jpg".to_string())
                 });
             let id = image_id_from_relative(&file_name);
-            storage::StoredImage {
+            Ok(storage::StoredImage {
                 id,
                 file_name,
                 width,
@@ -951,11 +1019,11 @@ fn indexed_images(raw_root: &Path) -> Vec<storage::StoredImage> {
                 status: "已标注".to_string(),
                 qa_status: String::new(),
                 review_note: None,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
     images.sort_by(|left, right| left.file_name.cmp(&right.file_name));
-    images
+    Ok(images)
 }
 
 fn indexed_image_paths(raw_root: &Path) -> Vec<PathBuf> {
@@ -971,11 +1039,11 @@ fn indexed_image_paths(raw_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn indexed_local_images(root: &Path, format: &str) -> Vec<storage::StoredImage> {
+fn indexed_local_images(root: &Path, format: &str) -> Result<Vec<storage::StoredImage>, String> {
     let mut images: Vec<_> = indexed_image_paths(root)
         .into_iter()
         .map(|path| {
-            let (width, height) = oriented_image_dimensions(&path);
+            let (width, height) = oriented_image_dimensions(&path)?;
             let relative = path
                 .strip_prefix(root)
                 .map(|value| value.to_string_lossy().replace('\\', "/"))
@@ -985,7 +1053,7 @@ fn indexed_local_images(root: &Path, format: &str) -> Vec<storage::StoredImage> 
                         .unwrap_or_else(|| "image.jpg".to_string())
                 });
             let id = image_id_from_relative(&relative);
-            storage::StoredImage {
+            Ok(storage::StoredImage {
                 id,
                 file_name: relative,
                 width,
@@ -998,11 +1066,11 @@ fn indexed_local_images(root: &Path, format: &str) -> Vec<storage::StoredImage> 
                 },
                 qa_status: String::new(),
                 review_note: None,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
     images.sort_by(|left, right| left.file_name.cmp(&right.file_name));
-    images
+    Ok(images)
 }
 
 fn local_image_has_annotation(root: &Path, image_path: &Path, format: &str) -> bool {
@@ -1451,9 +1519,9 @@ mod tests {
                 width: 640,
                 height: 420,
                 split: "train".to_string(),
-                status: "已标注".to_string(),
-                qa_status: String::new(),
-                review_note: None,
+                status: "通过".to_string(),
+                qa_status: "通过".to_string(),
+                review_note: Some("保留人工审核".to_string()),
             }],
             &[storage::StoredClass {
                 id: 0,
@@ -1463,16 +1531,266 @@ mod tests {
         )
         .unwrap();
         storage::save_annotation_payload(&paths.sqlite, "legacy", None, "[]").unwrap();
+        let task =
+            storage::create_annotation_task_record(&paths.sqlite, "legacy task", &["legacy"])
+                .unwrap();
+        storage::submit_image_for_review(&paths.sqlite, "legacy").unwrap();
+        storage::review_image(&paths.sqlite, "legacy", "approved", "保留人工审核").unwrap();
 
         rebuild_sqlite_index_if_needed(&source).unwrap();
 
         let stored = storage::read_images(&paths.sqlite, None).unwrap();
         assert_eq!(stored[0].id, "legacy");
-        assert_eq!(stored[0].file_name, "legacy.png");
+        assert_eq!(stored[0].file_name, "images/train/legacy.png");
+        assert_eq!(stored[0].status, "通过");
+        assert_eq!(stored[0].qa_status, "通过");
+        assert_eq!(stored[0].review_note.as_deref(), Some("保留人工审核"));
+        assert!(storage::read_annotation_payload(&paths.sqlite, "legacy")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            storage::list_task_item_records(&paths.sqlite, &task.id).unwrap()[0].image_id,
+            "legacy"
+        );
+
+        image::RgbImage::from_pixel(24, 12, image::Rgb([1, 2, 3]))
+            .save(paths.raw.join("images/train/legacy.png"))
+            .unwrap();
+        rebuild_sqlite_index_if_needed(&source).unwrap();
+        let resized = storage::read_images(&paths.sqlite, None).unwrap();
+        assert_eq!(resized[0].id, "legacy");
+        assert_eq!((resized[0].width, resized[0].height), (24, 12));
         assert!(storage::read_annotation_payload(&paths.sqlite, "legacy")
             .unwrap()
             .is_some());
         let _ = fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn reconciliation_removes_deleted_images_but_preserves_remaining_identity() {
+        let existing = vec![
+            storage::StoredImage {
+                id: "stable-a".to_string(),
+                file_name: "images/train/a.png".to_string(),
+                width: 10,
+                height: 10,
+                split: "train".to_string(),
+                status: "通过".to_string(),
+                qa_status: "通过".to_string(),
+                review_note: Some("manual".to_string()),
+            },
+            storage::StoredImage {
+                id: "deleted-id".to_string(),
+                file_name: "images/train/deleted.png".to_string(),
+                width: 10,
+                height: 10,
+                split: "train".to_string(),
+                status: "草稿".to_string(),
+                qa_status: String::new(),
+                review_note: None,
+            },
+        ];
+        let scanned = vec![
+            storage::StoredImage {
+                id: "images_train_a".to_string(),
+                file_name: "images/train/a.png".to_string(),
+                width: 20,
+                height: 12,
+                split: "train".to_string(),
+                status: "已标注".to_string(),
+                qa_status: String::new(),
+                review_note: None,
+            },
+            storage::StoredImage {
+                id: "images_train_new".to_string(),
+                file_name: "images/train/new.png".to_string(),
+                width: 8,
+                height: 8,
+                split: "train".to_string(),
+                status: "未标注".to_string(),
+                qa_status: String::new(),
+                review_note: None,
+            },
+        ];
+
+        let reconciled = reconcile_scanned_images(&existing, &scanned).unwrap();
+
+        assert_eq!(reconciled.len(), 2);
+        let stable = reconciled
+            .iter()
+            .find(|image| image.file_name == "images/train/a.png")
+            .unwrap();
+        assert_eq!(stable.id, "stable-a");
+        assert_eq!((stable.width, stable.height), (20, 12));
+        assert_eq!(stable.status, "通过");
+        assert_eq!(stable.qa_status, "通过");
+        assert_eq!(stable.review_note.as_deref(), Some("manual"));
+        assert!(reconciled.iter().all(|image| image.id != "deleted-id"));
+        assert!(reconciled
+            .iter()
+            .any(|image| image.id == "images_train_new"));
+    }
+
+    #[test]
+    fn reconciliation_rejects_new_generated_id_collision_with_preserved_id() {
+        let existing = vec![storage::StoredImage {
+            id: "images_train_new".to_string(),
+            file_name: "images/train/old.png".to_string(),
+            width: 10,
+            height: 10,
+            split: "train".to_string(),
+            status: "草稿".to_string(),
+            qa_status: String::new(),
+            review_note: None,
+        }];
+        let scanned = vec![
+            storage::StoredImage {
+                id: "images_train_old".to_string(),
+                file_name: "images/train/old.png".to_string(),
+                width: 10,
+                height: 10,
+                split: "train".to_string(),
+                status: "已标注".to_string(),
+                qa_status: String::new(),
+                review_note: None,
+            },
+            storage::StoredImage {
+                id: "images_train_new".to_string(),
+                file_name: "images/train/new.png".to_string(),
+                width: 10,
+                height: 10,
+                split: "train".to_string(),
+                status: "已标注".to_string(),
+                qa_status: String::new(),
+                review_note: None,
+            },
+        ];
+
+        let result = reconcile_scanned_images(&existing, &scanned);
+
+        assert!(result.unwrap_err().contains("id collision"));
+    }
+
+    #[test]
+    fn rescan_preserves_legacy_identity_and_relations_when_adding_an_image() {
+        let source_root = std::env::temp_dir().join(format!(
+            "image_annotation_identity_rescan_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(source_root.join("images/train")).unwrap();
+        write_demo_image(&source_root.join("images/train/sample.png"), 1).unwrap();
+        let project = open_local_dataset(&source_root.to_string_lossy(), "yolo-detect").unwrap();
+        let paths = project_fs::project_paths(&project.id);
+        let manifest = project_fs::read_manifest(&project.id).unwrap();
+        storage::upsert_project_index(
+            &paths.sqlite,
+            &manifest,
+            &[storage::StoredImage {
+                id: "legacy-sample-id".to_string(),
+                file_name: "sample.png".to_string(),
+                width: 640,
+                height: 420,
+                split: "local".to_string(),
+                status: "通过".to_string(),
+                qa_status: "通过".to_string(),
+                review_note: Some("人工结论".to_string()),
+            }],
+            &storage::read_classes(&paths.sqlite).unwrap(),
+        )
+        .unwrap();
+        storage::save_annotation_payload(&paths.sqlite, "legacy-sample-id", None, "[]").unwrap();
+        let task = storage::create_annotation_task_record(
+            &paths.sqlite,
+            "identity task",
+            &["legacy-sample-id"],
+        )
+        .unwrap();
+        storage::submit_image_for_review(&paths.sqlite, "legacy-sample-id").unwrap();
+        storage::review_image(&paths.sqlite, "legacy-sample-id", "approved", "人工结论").unwrap();
+
+        rescan_project_assets(&project.id).unwrap();
+        write_demo_image(&source_root.join("images/train/new.png"), 2).unwrap();
+        rescan_project_assets(&project.id).unwrap();
+
+        let stored = storage::read_images(&paths.sqlite, None).unwrap();
+        let preserved = stored
+            .iter()
+            .find(|image| image.id == "legacy-sample-id")
+            .unwrap();
+        assert_eq!(preserved.file_name, "images/train/sample.png");
+        assert_eq!(preserved.status, "通过");
+        assert_eq!(preserved.qa_status, "通过");
+        assert_eq!(preserved.review_note.as_deref(), Some("人工结论"));
+        assert!(stored.iter().any(|image| image.id == "images_train_new"));
+        assert!(
+            storage::read_annotation_payload(&paths.sqlite, "legacy-sample-id")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            storage::list_task_item_records(&paths.sqlite, &task.id).unwrap()[0].image_id,
+            "legacy-sample-id"
+        );
+
+        let _ = fs::remove_dir_all(paths.root);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn ambiguous_legacy_basename_rescan_is_rejected_without_mutating_index() {
+        let source_root = std::env::temp_dir().join(format!(
+            "image_annotation_ambiguous_rescan_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(source_root.join("images/train")).unwrap();
+        fs::create_dir_all(source_root.join("images/val")).unwrap();
+        write_demo_image(&source_root.join("images/train/sample.png"), 1).unwrap();
+        let project = open_local_dataset(&source_root.to_string_lossy(), "yolo-detect").unwrap();
+        let paths = project_fs::project_paths(&project.id);
+        let manifest = project_fs::read_manifest(&project.id).unwrap();
+        let legacy = storage::StoredImage {
+            id: "legacy-sample-id".to_string(),
+            file_name: "sample.png".to_string(),
+            width: 640,
+            height: 420,
+            split: "local".to_string(),
+            status: "草稿".to_string(),
+            qa_status: String::new(),
+            review_note: None,
+        };
+        storage::upsert_project_index(
+            &paths.sqlite,
+            &manifest,
+            std::slice::from_ref(&legacy),
+            &storage::read_classes(&paths.sqlite).unwrap(),
+        )
+        .unwrap();
+        storage::save_annotation_payload(&paths.sqlite, &legacy.id, None, "[]").unwrap();
+        write_demo_image(&source_root.join("images/val/sample.png"), 2).unwrap();
+
+        let result = rescan_project_assets(&project.id);
+
+        assert!(result.is_err());
+        assert_eq!(
+            storage::read_images(&paths.sqlite, None).unwrap(),
+            vec![storage::StoredImage {
+                status: "草稿".to_string(),
+                ..legacy
+            }]
+        );
+        assert!(
+            storage::read_annotation_payload(&paths.sqlite, "legacy-sample-id")
+                .unwrap()
+                .is_some()
+        );
+        let _ = fs::remove_dir_all(paths.root);
+        let _ = fs::remove_dir_all(source_root);
     }
 
     #[test]
@@ -1498,6 +1816,14 @@ mod tests {
         );
         assert_eq!(storage::read_images(&paths.sqlite, None).unwrap().len(), 1);
         assert_eq!(storage::read_classes(&paths.sqlite).unwrap().len(), 80);
+        let snapshot = domain::SampleRepository::new()
+            .create_dataset_snapshot(&source.key, "immediate")
+            .unwrap();
+        assert_eq!(snapshot.bridge_status, "ready");
+        assert!(paths
+            .root
+            .join(snapshot.bridge_manifest_path.unwrap())
+            .is_file());
         let _ = fs::remove_dir_all(paths.root);
     }
 
