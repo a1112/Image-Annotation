@@ -1,0 +1,56 @@
+{
+  "schema_version": "visualai.image-annotation.snapshot/v1",
+  "project_id": "project-classification",
+  "snapshot_id": "snapshot-classification-001",
+  "snapshot_name": "Classification training snapshot",
+  "created_at": "2026-07-29T08:10:00Z",
+  "task_type": "classification",
+  "annotation_format": "visualai.normalized/v1",
+  "asset_root": "assets",
+  "classes": [
+    {
+      "id": "cat",
+      "label": "Cat"
+    },
+    {
+      "id": "dog",
+      "label": "Dog"
+    }
+  ],
+  "samples": [
+    {
+      "id": "image-cls-001",
+      "relative_path": "images/cat/ginger.jpg",
+      "width": 512,
+      "height": 512,
+      "size_bytes": 23456,
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "split": "train",
+      "revision": "rev-cls-001",
+      "objects": [
+        {
+          "type": "classification",
+          "id": "object-cls-001",
+          "class_id": "cat"
+        }
+      ]
+    },
+    {
+      "id": "image-cls-002",
+      "relative_path": "images/dog/retriever.jpg",
+      "width": 640,
+      "height": 426,
+      "size_bytes": 34567,
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "split": "val",
+      "revision": "rev-cls-002",
+      "objects": [
+        {
+          "type": "classification",
+          "id": "object-cls-002",
+          "class_id": "dog"
+        }
+      ]
+    }
+  ]
+}

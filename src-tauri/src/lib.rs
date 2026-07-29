@@ -1,5 +1,6 @@
 pub mod annotations;
 pub mod asset_cache;
+pub mod bridge;
 pub mod credentials;
 pub mod datasets;
 pub mod diagnostics;

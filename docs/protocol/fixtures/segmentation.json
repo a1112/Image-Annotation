@@ -1,0 +1,53 @@
+{
+  "schema_version": "visualai.image-annotation.snapshot/v1",
+  "project_id": "project-segmentation",
+  "snapshot_id": "snapshot-segmentation-001",
+  "snapshot_name": "Segmentation discovery snapshot",
+  "created_at": "2026-07-29T08:20:00Z",
+  "task_type": "segmentation",
+  "annotation_format": "visualai.normalized/v1",
+  "asset_root": "assets",
+  "classes": [
+    {
+      "id": "road",
+      "label": "Road"
+    }
+  ],
+  "samples": [
+    {
+      "id": "image-seg-001",
+      "relative_path": "images/road/city.png",
+      "width": 1024,
+      "height": 768,
+      "size_bytes": 45678,
+      "sha256": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+      "split": null,
+      "revision": "rev-seg-001",
+      "objects": [
+        {
+          "type": "polygon",
+          "id": "object-seg-001",
+          "class_id": "road",
+          "points": [
+            {
+              "x": 32.0,
+              "y": 640.0
+            },
+            {
+              "x": 992.0,
+              "y": 640.0
+            },
+            {
+              "x": 768.0,
+              "y": 384.0
+            },
+            {
+              "x": 256.0,
+              "y": 384.0
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

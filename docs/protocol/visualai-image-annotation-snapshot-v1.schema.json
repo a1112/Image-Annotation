@@ -1,0 +1,289 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://visualai.local/schemas/visualai-image-annotation-snapshot-v1.schema.json",
+  "title": "VisualAI Image-Annotation Snapshot Bridge v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "project_id",
+    "snapshot_id",
+    "snapshot_name",
+    "created_at",
+    "task_type",
+    "annotation_format",
+    "asset_root",
+    "classes",
+    "samples"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "visualai.image-annotation.snapshot/v1"
+    },
+    "project_id": {
+      "$ref": "#/$defs/stableId"
+    },
+    "snapshot_id": {
+      "$ref": "#/$defs/stableId"
+    },
+    "snapshot_name": {
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "task_type": {
+      "enum": [
+        "detection",
+        "classification",
+        "segmentation"
+      ]
+    },
+    "annotation_format": {
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "asset_root": {
+      "$ref": "#/$defs/safeRelativePath"
+    },
+    "classes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/class"
+      }
+    },
+    "samples": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/sample"
+      }
+    }
+  },
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "stableId": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?=\\S(?:.*\\S)?$)[^/\\\\\\u0000-\\u001f]+$"
+    },
+    "safeRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?![/\\\\])(?!.*:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*//)[^\\u0000]+$"
+    },
+    "class": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "label": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "relative_path",
+        "width",
+        "height",
+        "size_bytes",
+        "sha256",
+        "objects"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "relative_path": {
+          "$ref": "#/$defs/safeRelativePath"
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "split": {
+          "oneOf": [
+            {
+              "enum": [
+                "train",
+                "val",
+                "test"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/stableId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "objects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/object"
+          }
+        }
+      }
+    },
+    "object": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/bboxObject"
+        },
+        {
+          "$ref": "#/$defs/classificationObject"
+        },
+        {
+          "$ref": "#/$defs/polygonObject"
+        }
+      ],
+      "discriminator": {
+        "propertyName": "type",
+        "mapping": {
+          "bbox": "#/$defs/bboxObject",
+          "classification": "#/$defs/classificationObject",
+          "polygon": "#/$defs/polygonObject"
+        }
+      }
+    },
+    "bboxObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "class_id",
+        "x",
+        "y",
+        "width",
+        "height"
+      ],
+      "properties": {
+        "type": {
+          "const": "bbox"
+        },
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "class_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "x": {
+          "type": "number",
+          "minimum": 0
+        },
+        "y": {
+          "type": "number",
+          "minimum": 0
+        },
+        "width": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "height": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "classificationObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "class_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "classification"
+        },
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "class_id": {
+          "$ref": "#/$defs/stableId"
+        }
+      }
+    },
+    "polygonObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "class_id",
+        "points"
+      ],
+      "properties": {
+        "type": {
+          "const": "polygon"
+        },
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "class_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "points": {
+          "type": "array",
+          "minItems": 3,
+          "items": {
+            "$ref": "#/$defs/point"
+          }
+        }
+      }
+    },
+    "point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "x",
+        "y"
+      ],
+      "properties": {
+        "x": {
+          "type": "number",
+          "minimum": 0
+        },
+        "y": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}
