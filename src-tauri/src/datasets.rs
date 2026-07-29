@@ -960,6 +960,12 @@ fn reconcile_scanned_images(
                 review_note: existing.review_note.clone(),
             }
         } else {
+            if existing_ids.contains(scanned.id.as_str()) {
+                return Err(format!(
+                    "reserved image id collision: new scanned path '{}' generated historical id '{}'",
+                    scanned.file_name, scanned.id
+                ));
+            }
             scanned.clone()
         };
         if !output_ids.insert(image.id.clone()) {
@@ -1669,6 +1675,72 @@ mod tests {
         let result = reconcile_scanned_images(&existing, &scanned);
 
         assert!(result.unwrap_err().contains("id collision"));
+    }
+
+    #[test]
+    fn rescan_rejects_reusing_deleted_image_id_without_mutating_history() {
+        let source_root = std::env::temp_dir().join(format!(
+            "image_annotation_reserved_id_rescan_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(source_root.join("images/train")).unwrap();
+        write_demo_image(&source_root.join("images/train/new.png"), 1).unwrap();
+        let project = open_local_dataset(&source_root.to_string_lossy(), "yolo-detect").unwrap();
+        let paths = project_fs::project_paths(&project.id);
+        let manifest = project_fs::read_manifest(&project.id).unwrap();
+        let historical = storage::StoredImage {
+            id: "images_train_new".to_string(),
+            file_name: "images/train/deleted.png".to_string(),
+            width: 640,
+            height: 420,
+            split: "local".to_string(),
+            status: "草稿".to_string(),
+            qa_status: String::new(),
+            review_note: None,
+        };
+        storage::upsert_project_index(
+            &paths.sqlite,
+            &manifest,
+            std::slice::from_ref(&historical),
+            &storage::read_classes(&paths.sqlite).unwrap(),
+        )
+        .unwrap();
+        storage::save_annotation_payload(&paths.sqlite, &historical.id, None, "[]").unwrap();
+        let task = storage::create_annotation_task_record(
+            &paths.sqlite,
+            "historical identity",
+            &[&historical.id],
+        )
+        .unwrap();
+        storage::submit_image_for_review(&paths.sqlite, &historical.id).unwrap();
+        storage::review_image(&paths.sqlite, &historical.id, "approved", "historical QA").unwrap();
+        let before_images = storage::read_images(&paths.sqlite, None).unwrap();
+
+        let result = rescan_project_assets(&project.id);
+
+        let error = result.unwrap_err();
+        assert!(error.contains("images_train_new"));
+        assert!(error.contains("images/train/new.png"));
+        assert_eq!(
+            storage::read_images(&paths.sqlite, None).unwrap(),
+            before_images
+        );
+        assert!(
+            storage::read_annotation_payload(&paths.sqlite, &historical.id)
+                .unwrap()
+                .is_some()
+        );
+        let task_items = storage::list_task_item_records(&paths.sqlite, &task.id).unwrap();
+        assert_eq!(task_items.len(), 1);
+        assert_eq!(task_items[0].image_id, historical.id);
+        assert_eq!(task_items[0].qa_status, "通过");
+        assert_eq!(task_items[0].review_note.as_deref(), Some("historical QA"));
+
+        let _ = fs::remove_dir_all(paths.root);
+        let _ = fs::remove_dir_all(source_root);
     }
 
     #[test]
