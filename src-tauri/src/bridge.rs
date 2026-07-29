@@ -474,7 +474,7 @@ fn relative_asset_root(snapshot_dir: &Path, asset_root: &Path) -> Result<String,
     Ok(relative)
 }
 
-fn stream_file_integrity(path: &Path) -> Result<(u64, String), String> {
+pub(crate) fn stream_file_integrity(path: &Path) -> Result<(u64, String), String> {
     let mut file = File::open(path)
         .map_err(|error| format!("open bridge asset {}: {error}", path.display()))?;
     let mut hasher = Sha256::new();

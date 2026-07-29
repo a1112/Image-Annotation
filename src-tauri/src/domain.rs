@@ -1480,6 +1480,7 @@ impl SampleRepository {
             .map_err(|error| format!("invalid snapshot id: {error}"))?;
 
         let paths = project_fs::project_paths(project_id);
+        ensure_project_root_is_in_workspace(&paths.root)?;
         let record = storage::list_snapshot_records(&paths.sqlite)?
             .into_iter()
             .find(|record| record.id == snapshot_id)
@@ -1684,17 +1685,8 @@ impl SampleRepository {
                 let snapshot_dir = paths.snapshots.join(&record.id);
                 let bridge_manifest_path = snapshot_dir.join("visualai-bridge.json");
                 let bridge_exists = bridge_manifest_path.is_file();
-                let bridge_ready = bridge_exists
-                    && fs::read_to_string(&bridge_manifest_path)
-                        .ok()
-                        .and_then(|text| {
-                            serde_json::from_str::<crate::bridge::BridgeManifest>(&text).ok()
-                        })
-                        .is_some_and(|manifest| {
-                            manifest.validate().is_ok()
-                                && manifest.project_id == project_id
-                                && manifest.snapshot_id == record.id
-                        });
+                let bridge_ready =
+                    bridge_exists && bridge_file_is_ready(project_id, &record.id, &snapshot_dir);
                 let bridge_manifest_api_path = bridge_manifest_relative_path(&record.id);
                 DatasetSnapshot {
                     manifest_path: snapshot_dir
@@ -2046,13 +2038,14 @@ fn bridge_object_from_legacy(object: LegacySnapshotObject) -> Result<BridgeObjec
 
 fn validate_snapshot_stable_id(value: &str) -> Result<(), &'static str> {
     validate_snapshot_text(value)?;
-    if value
-        .chars()
-        .all(|character| character != '/' && character != '\\')
-    {
-        Ok(())
-    } else {
-        Err("stable ID must not contain path separators")
+    if value.contains(':') {
+        return Err("stable ID must not contain a path prefix");
+    }
+    let path = Path::new(value);
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(component)), None) if component == path.as_os_str() => Ok(()),
+        _ => Err("stable ID must be exactly one normal path component"),
     }
 }
 
@@ -2102,15 +2095,155 @@ fn ensure_path_is_within_project(
     }
 }
 
+fn ensure_project_root_is_in_workspace(project_root: &Path) -> Result<(), String> {
+    let workspace_root = project_fs::workspace_data_root();
+    let projects_root = project_fs::workspace_projects_dir();
+    let workspace_metadata = fs::symlink_metadata(&workspace_root).map_err(|error| {
+        format!(
+            "read workspace root metadata {}: {error}",
+            workspace_root.display()
+        )
+    })?;
+    let projects_metadata = fs::symlink_metadata(&projects_root).map_err(|error| {
+        format!(
+            "read workspace projects metadata {}: {error}",
+            projects_root.display()
+        )
+    })?;
+    let project_metadata = fs::symlink_metadata(project_root).map_err(|error| {
+        format!(
+            "read project root metadata {}: {error}",
+            project_root.display()
+        )
+    })?;
+    if workspace_metadata.file_type().is_symlink()
+        || projects_metadata.file_type().is_symlink()
+        || project_metadata.file_type().is_symlink()
+    {
+        return Err("workspace and project roots must not be symlinks".to_string());
+    }
+    if !workspace_metadata.is_dir() || !projects_metadata.is_dir() || !project_metadata.is_dir() {
+        return Err("workspace and project roots must be directories".to_string());
+    }
+
+    let canonical_workspace = fs::canonicalize(&workspace_root).map_err(|error| {
+        format!(
+            "resolve workspace root {}: {error}",
+            workspace_root.display()
+        )
+    })?;
+    let canonical_projects = fs::canonicalize(&projects_root).map_err(|error| {
+        format!(
+            "resolve workspace projects root {}: {error}",
+            projects_root.display()
+        )
+    })?;
+    let canonical_project = fs::canonicalize(project_root)
+        .map_err(|error| format!("resolve project root {}: {error}", project_root.display()))?;
+    if canonical_projects.parent() != Some(canonical_workspace.as_path()) {
+        return Err(format!(
+            "workspace projects root escapes workspace: {}",
+            projects_root.display()
+        ));
+    }
+    if canonical_project.parent() != Some(canonical_projects.as_path()) {
+        return Err(format!(
+            "project root escapes workspace projects root: {}",
+            project_root.display()
+        ));
+    }
+    Ok(())
+}
+
 fn bridge_file_is_ready(project_id: &str, snapshot_id: &str, snapshot_dir: &Path) -> bool {
-    fs::read_to_string(snapshot_dir.join("visualai-bridge.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<crate::bridge::BridgeManifest>(&text).ok())
-        .is_some_and(|manifest| {
-            manifest.validate().is_ok()
-                && manifest.project_id == project_id
-                && manifest.snapshot_id == snapshot_id
-        })
+    let result = (|| -> Result<(), String> {
+        let bridge_path = snapshot_dir.join("visualai-bridge.json");
+        let text = fs::read_to_string(&bridge_path)
+            .map_err(|error| format!("read bridge manifest {}: {error}", bridge_path.display()))?;
+        let manifest: crate::bridge::BridgeManifest = serde_json::from_str(&text)
+            .map_err(|error| format!("parse bridge manifest {}: {error}", bridge_path.display()))?;
+        manifest.validate()?;
+        if manifest.project_id != project_id || manifest.snapshot_id != snapshot_id {
+            return Err("bridge manifest identity does not match snapshot".to_string());
+        }
+
+        let canonical_snapshot = fs::canonicalize(snapshot_dir).map_err(|error| {
+            format!(
+                "resolve snapshot directory {}: {error}",
+                snapshot_dir.display()
+            )
+        })?;
+        let asset_root = snapshot_dir.join(Path::new(&manifest.asset_root));
+        let asset_metadata = fs::symlink_metadata(&asset_root).map_err(|error| {
+            format!(
+                "read bridge asset root metadata {}: {error}",
+                asset_root.display()
+            )
+        })?;
+        if asset_metadata.file_type().is_symlink() || !asset_metadata.is_dir() {
+            return Err(format!(
+                "bridge asset root is not a regular directory: {}",
+                asset_root.display()
+            ));
+        }
+        let canonical_asset_root = fs::canonicalize(&asset_root).map_err(|error| {
+            format!(
+                "resolve bridge asset root {}: {error}",
+                asset_root.display()
+            )
+        })?;
+        if !canonical_asset_root.starts_with(&canonical_snapshot) {
+            return Err(format!(
+                "bridge asset root escapes snapshot directory: {}",
+                asset_root.display()
+            ));
+        }
+
+        for sample in &manifest.samples {
+            let asset_path = asset_root.join(Path::new(&sample.relative_path));
+            let metadata = fs::symlink_metadata(&asset_path).map_err(|error| {
+                format!(
+                    "read bridge sample metadata {}: {error}",
+                    asset_path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!(
+                    "bridge sample is not a regular file: {}",
+                    asset_path.display()
+                ));
+            }
+            let canonical_asset = fs::canonicalize(&asset_path).map_err(|error| {
+                format!("resolve bridge sample {}: {error}", asset_path.display())
+            })?;
+            if !canonical_asset.starts_with(&canonical_asset_root) {
+                return Err(format!(
+                    "bridge sample escapes asset root: {}",
+                    asset_path.display()
+                ));
+            }
+            let (size_bytes, sha256) = bridge::stream_file_integrity(&canonical_asset)?;
+            if size_bytes != sample.size_bytes || sha256 != sample.sha256 {
+                return Err(format!(
+                    "bridge sample integrity mismatch: {}",
+                    asset_path.display()
+                ));
+            }
+            let dimensions = crate::datasets::oriented_image_dimensions(&canonical_asset)?;
+            if dimensions != (sample.width, sample.height) {
+                return Err(format!(
+                    "bridge sample dimension mismatch for {}: expected {}x{}, got {}x{}",
+                    asset_path.display(),
+                    sample.width,
+                    sample.height,
+                    dimensions.0,
+                    dimensions.1
+                ));
+            }
+        }
+        Ok(())
+    })();
+    result.is_ok()
 }
 
 fn dataset_snapshot_from_record(
@@ -4171,5 +4304,192 @@ mod tests {
             fixture.manifest_bytes
         );
         let _ = std::fs::remove_dir_all(fixture.paths.root);
+    }
+
+    fn tamper_ready_snapshot_and_assert_rebuild(
+        label: &str,
+        tamper: impl FnOnce(&LegacySnapshotFixture, &Path, &mut crate::bridge::BridgeManifest),
+    ) {
+        let fixture = legacy_snapshot_fixture(label);
+        let repository = SampleRepository::new();
+        let upgraded = repository
+            .upgrade_dataset_snapshot_bridge(&fixture.project_id, &fixture.record.id)
+            .unwrap();
+        let bridge_path = fixture
+            .paths
+            .root
+            .join(upgraded.bridge_manifest_path.as_ref().unwrap());
+        let mut bridge: crate::bridge::BridgeManifest =
+            serde_json::from_slice(&std::fs::read(&bridge_path).unwrap()).unwrap();
+        let asset_path = bridge_path
+            .parent()
+            .unwrap()
+            .join(&bridge.asset_root)
+            .join(&bridge.samples[0].relative_path);
+        tamper(&fixture, &asset_path, &mut bridge);
+
+        let listed = repository.dataset_snapshots(&fixture.project_id).unwrap();
+        assert_eq!(listed[0].bridge_status, "invalid");
+        assert_eq!(listed[0].bridge_manifest_path, None);
+
+        let rebuilt = repository
+            .upgrade_dataset_snapshot_bridge(&fixture.project_id, &fixture.record.id)
+            .unwrap();
+        assert_eq!(rebuilt.bridge_status, "ready");
+        assert!(bridge_file_is_ready(
+            &fixture.project_id,
+            &fixture.record.id,
+            &fixture.paths.snapshots.join(&fixture.record.id)
+        ));
+        let _ = std::fs::remove_dir_all(fixture.paths.root);
+    }
+
+    #[test]
+    fn ready_snapshot_with_missing_asset_is_invalid_and_rebuilt() {
+        tamper_ready_snapshot_and_assert_rebuild("ready-missing", |_, asset_path, _| {
+            std::fs::remove_file(asset_path).unwrap();
+        });
+    }
+
+    #[test]
+    fn ready_snapshot_with_changed_asset_hash_is_invalid_and_rebuilt() {
+        tamper_ready_snapshot_and_assert_rebuild("ready-hash", |_, asset_path, _| {
+            image::RgbImage::from_pixel(12, 8, image::Rgb([99, 88, 77]))
+                .save(asset_path)
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn ready_snapshot_with_changed_asset_dimensions_is_invalid_and_rebuilt() {
+        tamper_ready_snapshot_and_assert_rebuild("ready-dimensions", |_, asset_path, _| {
+            image::RgbImage::from_pixel(13, 8, image::Rgb([99, 88, 77]))
+                .save(asset_path)
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn ready_snapshot_with_symlink_asset_is_invalid_and_rebuilt() {
+        tamper_ready_snapshot_and_assert_rebuild("ready-symlink", |fixture, asset_path, _| {
+            let outside_asset = fixture.paths.root.join("outside-ready-asset.png");
+            image::RgbImage::from_pixel(12, 8, image::Rgb([99, 88, 77]))
+                .save(&outside_asset)
+                .unwrap();
+            std::fs::remove_file(asset_path).unwrap();
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(outside_asset, asset_path).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(outside_asset, asset_path).unwrap();
+        });
+    }
+
+    #[test]
+    fn ready_snapshot_with_escaping_asset_root_is_invalid_and_rebuilt() {
+        tamper_ready_snapshot_and_assert_rebuild("ready-escape", |fixture, _, bridge| {
+            let bridge_path = fixture
+                .paths
+                .snapshots
+                .join(&fixture.record.id)
+                .join("visualai-bridge.json");
+            let mut value = serde_json::to_value(bridge.clone()).unwrap();
+            value["asset_root"] = json!("../outside");
+            std::fs::write(bridge_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        });
+    }
+
+    #[test]
+    fn failed_rebuild_preserves_preexisting_bridge_bytes() {
+        let fixture = legacy_snapshot_fixture("ready-rebuild-rollback");
+        let repository = SampleRepository::new();
+        let upgraded = repository
+            .upgrade_dataset_snapshot_bridge(&fixture.project_id, &fixture.record.id)
+            .unwrap();
+        let bridge_path = fixture
+            .paths
+            .root
+            .join(upgraded.bridge_manifest_path.as_ref().unwrap());
+        let bridge: crate::bridge::BridgeManifest =
+            serde_json::from_slice(&std::fs::read(&bridge_path).unwrap()).unwrap();
+        let asset_path = bridge_path
+            .parent()
+            .unwrap()
+            .join(&bridge.asset_root)
+            .join(&bridge.samples[0].relative_path);
+        std::fs::remove_file(asset_path).unwrap();
+        std::fs::remove_file(fixture.paths.raw.join("sample.png")).unwrap();
+        let original_bridge_bytes = std::fs::read(&bridge_path).unwrap();
+
+        let result =
+            repository.upgrade_dataset_snapshot_bridge(&fixture.project_id, &fixture.record.id);
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(bridge_path).unwrap(), original_bridge_bytes);
+        let _ = std::fs::remove_dir_all(fixture.paths.root);
+    }
+
+    #[test]
+    fn upgrade_rejects_special_path_components_before_storage_access() {
+        let marker_root = project_fs::workspace_projects_dir();
+        std::fs::create_dir_all(&marker_root).unwrap();
+        let marker_path = marker_root.join("upgrade-id-marker.txt");
+        std::fs::write(&marker_path, b"unchanged").unwrap();
+
+        for project_id in [".", "..", "C:escape", "", "a/b", r"a\b"] {
+            let error = SampleRepository::new()
+                .upgrade_dataset_snapshot_bridge(project_id, "snapshot-1")
+                .unwrap_err();
+            assert!(
+                error.starts_with("invalid project id:"),
+                "{project_id:?} reached storage: {error}"
+            );
+        }
+        for snapshot_id in [".", "..", "C:escape", "", "a/b", r"a\b"] {
+            let error = SampleRepository::new()
+                .upgrade_dataset_snapshot_bridge("safe-project", snapshot_id)
+                .unwrap_err();
+            assert!(
+                error.starts_with("invalid snapshot id:"),
+                "{snapshot_id:?} reached storage: {error}"
+            );
+        }
+        assert_eq!(std::fs::read(&marker_path).unwrap(), b"unchanged");
+        let _ = std::fs::remove_file(marker_path);
+    }
+
+    #[test]
+    fn upgrade_rejects_project_directory_symlink_escape_before_storage_access() {
+        let project_id = "upgrade-project-root-symlink";
+        let projects_root = project_fs::workspace_projects_dir();
+        std::fs::create_dir_all(&projects_root).unwrap();
+        let project_link = projects_root.join(project_id);
+        let _ = std::fs::remove_dir(&project_link);
+        let external_root = std::env::temp_dir().join(format!(
+            "image-annotation-upgrade-external-{}",
+            unique_operation_suffix()
+        ));
+        std::fs::create_dir_all(&external_root).unwrap();
+        let marker_path = external_root.join("marker.txt");
+        std::fs::write(&marker_path, b"outside").unwrap();
+
+        #[cfg(windows)]
+        let link_result = std::os::windows::fs::symlink_dir(&external_root, &project_link);
+        #[cfg(unix)]
+        let link_result = std::os::unix::fs::symlink(&external_root, &project_link);
+
+        if link_result.is_ok() {
+            let error = SampleRepository::new()
+                .upgrade_dataset_snapshot_bridge(project_id, "snapshot-1")
+                .unwrap_err();
+            assert!(
+                error.contains("project root") || error.contains("symlink"),
+                "symlink escape reached storage: {error}"
+            );
+            assert_eq!(std::fs::read(&marker_path).unwrap(), b"outside");
+            std::fs::remove_dir(&project_link).unwrap();
+        } else {
+            assert!(ensure_project_root_is_in_workspace(&external_root).is_err());
+        }
+        let _ = std::fs::remove_dir_all(external_root);
     }
 }
