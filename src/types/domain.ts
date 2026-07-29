@@ -153,6 +153,8 @@ export type DatasetSnapshot = {
   imageCount: number;
   manifestPath: string;
   createdAt: string;
+  bridgeManifestPath?: string;
+  bridgeStatus: string;
 };
 
 export type DatasetExport = {

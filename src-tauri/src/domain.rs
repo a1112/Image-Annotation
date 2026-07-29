@@ -1,13 +1,16 @@
 use crate::{
+    bridge::{self, BridgeBuildInput, BridgeObject, BridgePoint, BridgeSourceSample, BridgeSplit},
     importers::{voc, yolo},
     project_fs, storage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
-    fs,
-    path::{Path, PathBuf},
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    path::{Component, Path, PathBuf},
 };
 use walkdir::WalkDir;
 
@@ -224,6 +227,14 @@ pub struct DatasetSnapshot {
     pub image_count: u32,
     pub manifest_path: String,
     pub created_at: String,
+    #[serde(default)]
+    pub bridge_manifest_path: Option<String>,
+    #[serde(default = "legacy_bridge_status")]
+    pub bridge_status: String,
+}
+
+fn legacy_bridge_status() -> String {
+    "legacy".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1063,11 +1074,11 @@ impl SampleRepository {
     ) -> Result<DatasetSnapshot, String> {
         let paths = project_fs::ensure_project_dirs(project_id)?;
         let images = self.project_images(project_id, None);
-        let annotations: Vec<_> = images
+        let snapshot_sources: Vec<_> = images
             .iter()
             .map(|image| {
                 let state = self.image_annotation_state(project_id, &image.id);
-                json!({
+                let annotation = json!({
                     "imageId": image.id,
                     "fileName": image.file_name,
                     "width": image.width,
@@ -1076,9 +1087,14 @@ impl SampleRepository {
                     "status": image.status,
                     "revision": state.revision,
                     "objects": state.objects,
-                })
+                });
+                (image.clone(), state, annotation)
             })
             .collect();
+        let annotations = snapshot_sources
+            .iter()
+            .map(|(_, _, annotation)| annotation.clone())
+            .collect::<Vec<_>>();
         let manifest = json!({
             "projectId": project_id,
             "name": name,
@@ -1094,15 +1110,100 @@ impl SampleRepository {
             images.len() as u32,
         )?;
         let snapshot_dir = paths.snapshots.join(&record.id);
-        fs::create_dir_all(&snapshot_dir).map_err(|err| err.to_string())?;
         let manifest_path = snapshot_dir.join("manifest.json");
-        fs::write(&manifest_path, manifest_json).map_err(|err| err.to_string())?;
+        let mut snapshot_dir_created = false;
+        let bridge_result = (|| {
+            fs::create_dir(&snapshot_dir).map_err(|err| err.to_string())?;
+            snapshot_dir_created = true;
+            fs::write(&manifest_path, manifest_json).map_err(|err| err.to_string())?;
+
+            let project = project_manifest(project_id)
+                .ok_or_else(|| format!("project manifest not found: {project_id}"))?;
+            let classes = storage::read_classes(&paths.sqlite)?;
+            let source_asset_root = PathBuf::from(&project.root_path);
+            let source_asset_root = if source_asset_root.exists() {
+                source_asset_root
+            } else {
+                paths.raw.clone()
+            };
+            let snapshot_asset_root = snapshot_dir.join("assets");
+            fs::create_dir_all(&snapshot_asset_root).map_err(|err| err.to_string())?;
+            let mut target_paths = BTreeSet::new();
+            let mut bridge_samples = Vec::with_capacity(snapshot_sources.len());
+            for (image, state, _) in &snapshot_sources {
+                let source_path =
+                    resolve_snapshot_image_path(&source_asset_root, &paths.raw, &image.file_name)?;
+                let relative_path = stable_snapshot_asset_path(&image.id, &source_path)?;
+                if !target_paths.insert(relative_path.clone()) {
+                    return Err(format!(
+                        "duplicate snapshot asset target for image '{}': {relative_path}",
+                        image.id
+                    ));
+                }
+                copy_file_and_sync(
+                    &source_path,
+                    &snapshot_asset_root.join(Path::new(&relative_path)),
+                )?;
+                bridge_samples.push(BridgeSourceSample {
+                    id: image.id.clone(),
+                    relative_path,
+                    width: image.width,
+                    height: image.height,
+                    split: bridge_split(&image.split)?,
+                    revision: state.revision.clone(),
+                    objects: state
+                        .objects
+                        .iter()
+                        .map(bridge_object)
+                        .collect::<Result<Vec<_>, _>>()?,
+                });
+            }
+
+            bridge::write_bridge_manifest(
+                &snapshot_dir,
+                BridgeBuildInput {
+                    project: &project,
+                    snapshot_id: &record.id,
+                    snapshot_name: &record.name,
+                    created_at: &record.created_at,
+                    asset_root: &snapshot_asset_root,
+                    classes: &classes,
+                    samples: &bridge_samples,
+                },
+            )
+        })();
+        let _bridge_manifest_path = match bridge_result {
+            Ok(path) => path,
+            Err(error) => {
+                let directory_cleanup = snapshot_dir_created
+                    .then(|| fs::remove_dir_all(&snapshot_dir))
+                    .transpose();
+                let record_cleanup = storage::delete_snapshot_record(&paths.sqlite, &record.id);
+                let mut cleanup_errors = Vec::new();
+                if let Err(cleanup_error) = directory_cleanup {
+                    cleanup_errors.push(format!("remove snapshot directory: {cleanup_error}"));
+                }
+                if let Err(cleanup_error) = record_cleanup {
+                    cleanup_errors.push(format!("delete snapshot record: {cleanup_error}"));
+                }
+                if cleanup_errors.is_empty() {
+                    return Err(error);
+                }
+                return Err(format!(
+                    "{error}; cleanup failed: {}",
+                    cleanup_errors.join("; ")
+                ));
+            }
+        };
+        let bridge_manifest_api_path = bridge_manifest_relative_path(&record.id);
         Ok(DatasetSnapshot {
             id: record.id,
             name: record.name,
             image_count: record.image_count,
             manifest_path: manifest_path.to_string_lossy().to_string(),
             created_at: record.created_at,
+            bridge_manifest_path: Some(bridge_manifest_api_path),
+            bridge_status: "ready".to_string(),
         })
     }
 
@@ -1110,17 +1211,38 @@ impl SampleRepository {
         let paths = project_fs::project_paths(project_id);
         Ok(storage::list_snapshot_records(&paths.sqlite)?
             .into_iter()
-            .map(|record| DatasetSnapshot {
-                manifest_path: paths
-                    .snapshots
-                    .join(&record.id)
-                    .join("manifest.json")
-                    .to_string_lossy()
-                    .to_string(),
-                id: record.id,
-                name: record.name,
-                image_count: record.image_count,
-                created_at: record.created_at,
+            .map(|record| {
+                let snapshot_dir = paths.snapshots.join(&record.id);
+                let bridge_manifest_path = snapshot_dir.join("visualai-bridge.json");
+                let bridge_exists = bridge_manifest_path.is_file();
+                let bridge_ready = bridge_exists
+                    && fs::read_to_string(&bridge_manifest_path)
+                        .ok()
+                        .and_then(|text| {
+                            serde_json::from_str::<crate::bridge::BridgeManifest>(&text).ok()
+                        })
+                        .is_some_and(|manifest| {
+                            manifest.project_id == project_id && manifest.snapshot_id == record.id
+                        });
+                let bridge_manifest_api_path = bridge_manifest_relative_path(&record.id);
+                DatasetSnapshot {
+                    manifest_path: snapshot_dir
+                        .join("manifest.json")
+                        .to_string_lossy()
+                        .to_string(),
+                    id: record.id,
+                    name: record.name,
+                    image_count: record.image_count,
+                    created_at: record.created_at,
+                    bridge_manifest_path: bridge_ready.then_some(bridge_manifest_api_path),
+                    bridge_status: if bridge_ready {
+                        "ready".to_string()
+                    } else if bridge_exists {
+                        "invalid".to_string()
+                    } else {
+                        legacy_bridge_status()
+                    },
+                }
             })
             .collect())
     }
@@ -1347,6 +1469,10 @@ impl SampleRepository {
     }
 }
 
+fn bridge_manifest_relative_path(snapshot_id: &str) -> String {
+    format!("snapshots/{snapshot_id}/visualai-bridge.json")
+}
+
 fn safe_export_relative_path(file_name: &str) -> Result<PathBuf, String> {
     let relative = Path::new(file_name)
         .components()
@@ -1359,6 +1485,197 @@ fn safe_export_relative_path(file_name: &str) -> Result<PathBuf, String> {
         Err(format!("invalid image file name '{file_name}'"))
     } else {
         Ok(relative)
+    }
+}
+
+fn stable_snapshot_asset_path(sample_id: &str, source_path: &Path) -> Result<String, String> {
+    if sample_id.is_empty()
+        || sample_id
+            .chars()
+            .any(|character| character.is_control() || character == '/' || character == '\\')
+    {
+        return Err(format!("invalid snapshot sample id: {sample_id:?}"));
+    }
+    let extension = source_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .filter(|value| matches!(value.as_str(), "jpg" | "jpeg" | "png" | "bmp" | "webp"))
+        .ok_or_else(|| {
+            format!(
+                "snapshot asset has an unsupported extension: {}",
+                source_path.display()
+            )
+        })?;
+    let stable_name = format!("{:x}", Sha256::digest(sample_id.as_bytes()));
+    Ok(format!("images/{stable_name}.{extension}"))
+}
+
+fn resolve_snapshot_image_path(
+    asset_root: &Path,
+    fallback_root: &Path,
+    file_name: &str,
+) -> Result<PathBuf, String> {
+    let relative = Path::new(file_name);
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!(
+            "snapshot image path must be normalized and relative: {file_name:?}"
+        ));
+    }
+
+    for (root, candidate) in [
+        (asset_root, asset_root.join(relative)),
+        (asset_root, asset_root.join("images").join(relative)),
+        (fallback_root, fallback_root.join(relative)),
+        (fallback_root, fallback_root.join("images").join(relative)),
+    ] {
+        if !candidate.is_file() {
+            continue;
+        }
+        let canonical_root = fs::canonicalize(root)
+            .map_err(|error| format!("resolve snapshot asset root {}: {error}", root.display()))?;
+        let canonical_candidate = fs::canonicalize(&candidate).map_err(|error| {
+            format!(
+                "resolve snapshot image asset {}: {error}",
+                candidate.display()
+            )
+        })?;
+        if canonical_candidate.starts_with(&canonical_root) {
+            return Ok(canonical_candidate);
+        }
+    }
+    Err(format!("image asset not found for '{file_name}'"))
+}
+
+fn copy_file_and_sync(source: &Path, target: &Path) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("snapshot asset has no parent: {}", target.display()))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "create snapshot asset directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    if target.exists() {
+        return Err(format!(
+            "snapshot asset target already exists: {}",
+            target.display()
+        ));
+    }
+    let file_name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            format!(
+                "snapshot asset target is not valid UTF-8: {}",
+                target.display()
+            )
+        })?;
+    let temporary_path = parent.join(format!(".{file_name}.tmp"));
+    match fs::remove_file(&temporary_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "remove stale snapshot asset {}: {error}",
+                temporary_path.display()
+            ))
+        }
+    }
+
+    let copy_result = (|| {
+        let mut input = File::open(source)
+            .map_err(|error| format!("open snapshot source {}: {error}", source.display()))?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .map_err(|error| {
+                format!(
+                    "create snapshot asset temporary file {}: {error}",
+                    temporary_path.display()
+                )
+            })?;
+        io::copy(&mut input, &mut output).map_err(|error| {
+            format!(
+                "copy snapshot asset {} to {}: {error}",
+                source.display(),
+                target.display()
+            )
+        })?;
+        output
+            .flush()
+            .map_err(|error| format!("flush snapshot asset {}: {error}", target.display()))?;
+        output
+            .sync_all()
+            .map_err(|error| format!("sync snapshot asset {}: {error}", target.display()))?;
+        drop(output);
+        fs::rename(&temporary_path, target)
+            .map_err(|error| format!("publish snapshot asset {}: {error}", target.display()))
+    })();
+    if let Err(error) = copy_result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn bridge_split(split: &str) -> Result<Option<BridgeSplit>, String> {
+    match split {
+        "train" => Ok(Some(BridgeSplit::Train)),
+        "val" => Ok(Some(BridgeSplit::Val)),
+        "test" => Ok(Some(BridgeSplit::Test)),
+        "" | "local" | "unassigned" => Ok(None),
+        value => Err(format!("unsupported bridge split: {value}")),
+    }
+}
+
+fn bridge_object(object: &AnnotationObject) -> Result<BridgeObject, String> {
+    match object.object_type.as_str() {
+        "bbox" => {
+            let bbox = object
+                .bbox
+                .as_ref()
+                .ok_or_else(|| format!("bbox annotation '{}' has no bbox", object.id))?;
+            Ok(BridgeObject::Bbox {
+                id: object.id.clone(),
+                class_id: object.class_id.to_string(),
+                x: bbox.x,
+                y: bbox.y,
+                width: bbox.width,
+                height: bbox.height,
+            })
+        }
+        "classification" => Ok(BridgeObject::Classification {
+            id: object.id.clone(),
+            class_id: object.class_id.to_string(),
+        }),
+        "polygon" => {
+            let points = object
+                .polygon
+                .as_ref()
+                .ok_or_else(|| format!("polygon annotation '{}' has no points", object.id))?
+                .iter()
+                .map(|point| BridgePoint {
+                    x: point.x,
+                    y: point.y,
+                })
+                .collect();
+            Ok(BridgeObject::Polygon {
+                id: object.id.clone(),
+                class_id: object.class_id.to_string(),
+                points,
+            })
+        }
+        object_type => Err(format!(
+            "unsupported annotation type '{}' for object '{}'",
+            object_type, object.id
+        )),
     }
 }
 
@@ -1792,6 +2109,322 @@ fn now_unix_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_dataset_snapshot_json_defaults_bridge_fields() {
+        let snapshot: DatasetSnapshot = serde_json::from_value(json!({
+            "id": "snapshot-legacy",
+            "name": "Legacy",
+            "imageCount": 1,
+            "manifestPath": "snapshots/snapshot-legacy/manifest.json",
+            "createdAt": "1785312000"
+        }))
+        .unwrap();
+
+        assert_eq!(snapshot.bridge_manifest_path, None);
+        assert_eq!(snapshot.bridge_status, "legacy");
+    }
+
+    #[test]
+    fn malformed_bridge_file_is_not_listed_as_ready() {
+        let repository = SampleRepository::new();
+        let project_id = "bridge-malformed-list-unit";
+        let paths = project_fs::project_paths(project_id);
+        let _ = std::fs::remove_dir_all(&paths.root);
+        project_fs::ensure_workspace_project_dirs(project_id).unwrap();
+        storage::initialize_project_database(&paths.sqlite).unwrap();
+        let record = storage::create_snapshot_record(&paths.sqlite, "Malformed", "{}", 0).unwrap();
+        let snapshot_dir = paths.snapshots.join(&record.id);
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::write(
+            snapshot_dir.join("visualai-bridge.json"),
+            b"{\"schema_version\":\"not-supported\"}",
+        )
+        .unwrap();
+
+        let snapshots = repository.dataset_snapshots(project_id).unwrap();
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].bridge_status, "invalid");
+        assert_eq!(snapshots[0].bridge_manifest_path, None);
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn maps_annotation_domain_objects_to_strict_bridge_variants() {
+        let bbox = bridge_object(&AnnotationObject::bbox(
+            "bbox-1".to_string(),
+            1,
+            "box".to_string(),
+            BBox {
+                x: 1.0,
+                y: 2.0,
+                width: 3.0,
+                height: 4.0,
+            },
+        ))
+        .unwrap();
+        let classification = bridge_object(&AnnotationObject::classification(
+            "classification-1".to_string(),
+            2,
+            "class".to_string(),
+        ))
+        .unwrap();
+        let polygon = bridge_object(&AnnotationObject::polygon(
+            "polygon-1".to_string(),
+            3,
+            "region".to_string(),
+            vec![
+                Point { x: 0.0, y: 0.0 },
+                Point { x: 2.0, y: 0.0 },
+                Point { x: 1.0, y: 2.0 },
+            ],
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            bbox,
+            BridgeObject::Bbox {
+                id,
+                class_id,
+                x: 1.0,
+                y: 2.0,
+                width: 3.0,
+                height: 4.0,
+            } if id == "bbox-1" && class_id == "1"
+        ));
+        assert!(matches!(
+            classification,
+            BridgeObject::Classification { id, class_id }
+                if id == "classification-1" && class_id == "2"
+        ));
+        assert!(matches!(
+            polygon,
+            BridgeObject::Polygon { id, class_id, points }
+                if id == "polygon-1" && class_id == "3" && points.len() == 3
+        ));
+    }
+
+    #[test]
+    fn maps_local_linked_split_to_unassigned_bridge_split() {
+        assert_eq!(bridge_split("local").unwrap(), None);
+    }
+
+    #[test]
+    fn creates_snapshot_with_ready_bridge_and_collision_safe_assets() {
+        let repository = SampleRepository::new();
+        let project_id = "bridge-snapshot-unit";
+        let paths = project_fs::project_paths(project_id);
+        let _ = std::fs::remove_dir_all(&paths.root);
+        project_fs::ensure_workspace_project_dirs(project_id).unwrap();
+        storage::initialize_project_database(&paths.sqlite).unwrap();
+        std::fs::create_dir_all(paths.raw.join("train")).unwrap();
+        std::fs::create_dir_all(paths.raw.join("val")).unwrap();
+        image::RgbImage::from_pixel(32, 16, image::Rgb([1, 2, 3]))
+            .save(paths.raw.join("train/shared.png"))
+            .unwrap();
+        image::RgbImage::from_pixel(24, 12, image::Rgb([4, 5, 6]))
+            .save(paths.raw.join("val/shared.png"))
+            .unwrap();
+
+        let manifest = project_fs::ProjectManifest {
+            id: project_id.to_string(),
+            name: "Bridge Snapshot Unit".to_string(),
+            source_dataset_key: "local".to_string(),
+            format: "yolo-detect".to_string(),
+            root_path: paths.raw.to_string_lossy().to_string(),
+            created_at: now_unix_string(),
+            class_count: 2,
+            image_count: 2,
+        };
+        let images = vec![
+            storage::StoredImage {
+                id: "image-z".to_string(),
+                file_name: "train/shared.png".to_string(),
+                width: 32,
+                height: 16,
+                split: "train".to_string(),
+                status: "已标注".to_string(),
+                qa_status: String::new(),
+                review_note: None,
+            },
+            storage::StoredImage {
+                id: "image-a".to_string(),
+                file_name: "val/shared.png".to_string(),
+                width: 24,
+                height: 12,
+                split: "val".to_string(),
+                status: "已标注".to_string(),
+                qa_status: String::new(),
+                review_note: None,
+            },
+        ];
+        let classes = vec![
+            storage::StoredClass {
+                id: 2,
+                label: "zebra".to_string(),
+                color: "#ffffff".to_string(),
+            },
+            storage::StoredClass {
+                id: 1,
+                label: "antelope".to_string(),
+                color: "#000000".to_string(),
+            },
+        ];
+        storage::upsert_project_index(&paths.sqlite, &manifest, &images, &classes).unwrap();
+        repository
+            .save_image_annotations_with_revision(
+                project_id,
+                "image-a",
+                None,
+                vec![AnnotationObject::bbox(
+                    "object-a".to_string(),
+                    1,
+                    "antelope".to_string(),
+                    BBox {
+                        x: 1.0,
+                        y: 2.0,
+                        width: 3.0,
+                        height: 4.0,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let snapshot = repository
+            .create_dataset_snapshot(project_id, "bridge-ready")
+            .unwrap();
+
+        assert_eq!(snapshot.bridge_status, "ready");
+        let bridge_manifest_path = snapshot.bridge_manifest_path.as_ref().unwrap();
+        assert_eq!(
+            bridge_manifest_path,
+            &format!("snapshots/{}/visualai-bridge.json", snapshot.id)
+        );
+        assert!(!Path::new(bridge_manifest_path).is_absolute());
+        assert!(!bridge_manifest_path.contains(':'));
+        assert!(!bridge_manifest_path.contains('\\'));
+        let bridge_path = paths.root.join(bridge_manifest_path);
+        assert!(bridge_path.is_file());
+        let bridge: crate::bridge::BridgeManifest =
+            serde_json::from_str(&std::fs::read_to_string(&bridge_path).unwrap()).unwrap();
+        assert_eq!(bridge.project_id, project_id);
+        assert_eq!(bridge.snapshot_id, snapshot.id);
+        assert_eq!(bridge.asset_root, "assets");
+        assert_eq!(
+            bridge
+                .samples
+                .iter()
+                .map(|sample| sample.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["image-a", "image-z"]
+        );
+        assert_ne!(
+            bridge.samples[0].relative_path,
+            bridge.samples[1].relative_path
+        );
+        let snapshot_dir = bridge_path.parent().unwrap();
+        for sample in &bridge.samples {
+            assert!(snapshot_dir
+                .join(&bridge.asset_root)
+                .join(&sample.relative_path)
+                .is_file());
+        }
+        let listed = repository.dataset_snapshots(project_id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].bridge_status, "ready");
+        assert_eq!(
+            listed[0].bridge_manifest_path,
+            snapshot.bridge_manifest_path
+        );
+
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn failed_bridge_publish_compensates_snapshot_record_and_directory() {
+        let repository = SampleRepository::new();
+        let project_id = "bridge-snapshot-failure-unit";
+        let paths = project_fs::project_paths(project_id);
+        let _ = std::fs::remove_dir_all(&paths.root);
+        project_fs::ensure_workspace_project_dirs(project_id).unwrap();
+        storage::initialize_project_database(&paths.sqlite).unwrap();
+        let manifest = project_fs::ProjectManifest {
+            id: project_id.to_string(),
+            name: "Bridge Failure Unit".to_string(),
+            source_dataset_key: "local".to_string(),
+            format: "yolo-detect".to_string(),
+            root_path: paths.raw.to_string_lossy().to_string(),
+            created_at: now_unix_string(),
+            class_count: 0,
+            image_count: 1,
+        };
+        let images = vec![storage::StoredImage {
+            id: "missing-image".to_string(),
+            file_name: "missing.png".to_string(),
+            width: 10,
+            height: 10,
+            split: "train".to_string(),
+            status: "已标注".to_string(),
+            qa_status: String::new(),
+            review_note: None,
+        }];
+        storage::upsert_project_index(&paths.sqlite, &manifest, &images, &[]).unwrap();
+
+        let result = repository.create_dataset_snapshot(project_id, "must-fail");
+
+        assert!(result.is_err());
+        assert!(storage::list_snapshot_records(&paths.sqlite)
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read_dir(&paths.snapshots).unwrap().count(), 0);
+
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn snapshot_creation_rejects_source_path_traversal_and_compensates() {
+        let repository = SampleRepository::new();
+        let project_id = "bridge-snapshot-traversal-unit";
+        let paths = project_fs::project_paths(project_id);
+        let _ = std::fs::remove_dir_all(&paths.root);
+        project_fs::ensure_workspace_project_dirs(project_id).unwrap();
+        storage::initialize_project_database(&paths.sqlite).unwrap();
+        image::RgbImage::from_pixel(10, 10, image::Rgb([7, 8, 9]))
+            .save(paths.root.join("outside.png"))
+            .unwrap();
+        let manifest = project_fs::ProjectManifest {
+            id: project_id.to_string(),
+            name: "Bridge Traversal Unit".to_string(),
+            source_dataset_key: "local".to_string(),
+            format: "yolo-detect".to_string(),
+            root_path: paths.raw.to_string_lossy().to_string(),
+            created_at: now_unix_string(),
+            class_count: 0,
+            image_count: 1,
+        };
+        let images = vec![storage::StoredImage {
+            id: "escaping-image".to_string(),
+            file_name: "../../outside.png".to_string(),
+            width: 10,
+            height: 10,
+            split: "train".to_string(),
+            status: "已标注".to_string(),
+            qa_status: String::new(),
+            review_note: None,
+        }];
+        storage::upsert_project_index(&paths.sqlite, &manifest, &images, &[]).unwrap();
+
+        let result = repository.create_dataset_snapshot(project_id, "must-reject-traversal");
+
+        assert!(result.is_err());
+        assert!(storage::list_snapshot_records(&paths.sqlite)
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read_dir(&paths.snapshots).unwrap().count(), 0);
+
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
 
     #[test]
     fn lists_images_that_contain_selected_class_with_match_counts() {

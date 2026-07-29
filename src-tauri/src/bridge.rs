@@ -1,6 +1,18 @@
+use crate::{project_fs::ProjectManifest, storage::StoredClass};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeSet,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Component, Path, PathBuf},
+};
 
 pub const BRIDGE_SCHEMA_VERSION: &str = "visualai.image-annotation.snapshot/v1";
+const BRIDGE_ANNOTATION_FORMAT: &str = "visualai.normalized/v1";
+const BRIDGE_MANIFEST_FILE_NAME: &str = "visualai-bridge.json";
+const BRIDGE_TEMPORARY_FILE_NAME: &str = ".visualai-bridge.json.tmp";
+const HASH_BUFFER_SIZE: usize = 1024 * 1024;
 const MAX_UNIX_TIMESTAMP_DIGITS: usize = 19;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -251,6 +263,296 @@ pub struct BridgePoint {
     pub y: f64,
 }
 
+pub struct BridgeBuildInput<'a> {
+    pub project: &'a ProjectManifest,
+    pub snapshot_id: &'a str,
+    pub snapshot_name: &'a str,
+    pub created_at: &'a str,
+    pub asset_root: &'a Path,
+    pub classes: &'a [StoredClass],
+    pub samples: &'a [BridgeSourceSample],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BridgeSourceSample {
+    pub id: String,
+    pub relative_path: String,
+    pub width: u32,
+    pub height: u32,
+    pub split: Option<BridgeSplit>,
+    pub revision: Option<String>,
+    pub objects: Vec<BridgeObject>,
+}
+
+pub fn write_bridge_manifest(
+    snapshot_dir: &Path,
+    input: BridgeBuildInput<'_>,
+) -> Result<PathBuf, String> {
+    let final_path = snapshot_dir.join(BRIDGE_MANIFEST_FILE_NAME);
+    let temporary_path = snapshot_dir.join(BRIDGE_TEMPORARY_FILE_NAME);
+    remove_temporary_file(&temporary_path);
+
+    let manifest = build_bridge_manifest(snapshot_dir, input)?;
+    manifest.validate()?;
+    if final_path.exists() {
+        return Err(format!(
+            "bridge manifest already exists: {}",
+            final_path.display()
+        ));
+    }
+
+    let publish_result = (|| {
+        let mut temporary = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .map_err(|error| {
+                format!(
+                    "create bridge temporary file {}: {error}",
+                    temporary_path.display()
+                )
+            })?;
+        serde_json::to_writer_pretty(&mut temporary, &manifest)
+            .map_err(|error| format!("serialize bridge manifest: {error}"))?;
+        temporary
+            .write_all(b"\n")
+            .map_err(|error| format!("finish bridge manifest: {error}"))?;
+        temporary
+            .flush()
+            .map_err(|error| format!("flush bridge manifest: {error}"))?;
+        temporary
+            .sync_all()
+            .map_err(|error| format!("sync bridge manifest: {error}"))?;
+        drop(temporary);
+        fs::rename(&temporary_path, &final_path).map_err(|error| {
+            format!("publish bridge manifest {}: {error}", final_path.display())
+        })?;
+        Ok::<(), String>(())
+    })();
+
+    if let Err(error) = publish_result {
+        remove_temporary_file(&temporary_path);
+        return Err(error);
+    }
+
+    Ok(final_path)
+}
+
+fn build_bridge_manifest(
+    snapshot_dir: &Path,
+    input: BridgeBuildInput<'_>,
+) -> Result<BridgeManifest, String> {
+    let task_type = match input.project.format.as_str() {
+        "yolo-detect" | "voc-detect" => BridgeTaskType::Detection,
+        "image-classification" => BridgeTaskType::Classification,
+        "yolo-seg" => BridgeTaskType::Segmentation,
+        format => return Err(format!("unsupported bridge project format: {format}")),
+    };
+    let asset_root = relative_asset_root(snapshot_dir, input.asset_root)?;
+
+    let mut class_ids = BTreeSet::new();
+    let mut classes = input
+        .classes
+        .iter()
+        .map(|class| {
+            let id = class.id.to_string();
+            if !class_ids.insert(id.clone()) {
+                return Err(format!("duplicate bridge class id: {id}"));
+            }
+            Ok(BridgeClass {
+                id,
+                label: class.label.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    classes.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+
+    let mut sample_ids = BTreeSet::new();
+    let mut sample_paths = BTreeSet::new();
+    let mut samples = Vec::with_capacity(input.samples.len());
+    for source in input.samples {
+        if !sample_ids.insert(source.id.clone()) {
+            return Err(format!("duplicate bridge sample id: {}", source.id));
+        }
+        validate_safe_relative_path(&source.relative_path)
+            .map_err(|error| format!("sample '{}': {error}", source.id))?;
+        if !sample_paths.insert(source.relative_path.clone()) {
+            return Err(format!(
+                "duplicate bridge sample path: {}",
+                source.relative_path
+            ));
+        }
+
+        let asset_path = input.asset_root.join(Path::new(&source.relative_path));
+        let (size_bytes, sha256) = stream_file_integrity(&asset_path)?;
+        let mut objects = source.objects.clone();
+        let mut object_ids = BTreeSet::new();
+        for object in &objects {
+            let id = bridge_object_id(object);
+            if !object_ids.insert(id.to_string()) {
+                return Err(format!(
+                    "duplicate bridge object id '{}' in sample '{}'",
+                    id, source.id
+                ));
+            }
+            let class_id = bridge_object_class_id(object);
+            if !class_ids.contains(class_id) {
+                return Err(format!(
+                    "bridge object '{}' references unknown class '{}'",
+                    id, class_id
+                ));
+            }
+            if !bridge_object_matches_task(&task_type, object) {
+                return Err(format!(
+                    "bridge object '{}' is incompatible with project task {:?}",
+                    id, task_type
+                ));
+            }
+        }
+        objects.sort_by(|left, right| {
+            bridge_object_id(left)
+                .cmp(bridge_object_id(right))
+                .then_with(|| bridge_object_kind(left).cmp(&bridge_object_kind(right)))
+        });
+        samples.push(BridgeSample {
+            id: source.id.clone(),
+            relative_path: source.relative_path.clone(),
+            width: source.width,
+            height: source.height,
+            size_bytes,
+            sha256,
+            split: source.split.clone(),
+            revision: source.revision.clone(),
+            objects,
+        });
+    }
+    samples.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+
+    Ok(BridgeManifest {
+        schema_version: BRIDGE_SCHEMA_VERSION.to_string(),
+        project_id: input.project.id.clone(),
+        snapshot_id: input.snapshot_id.to_string(),
+        snapshot_name: input.snapshot_name.to_string(),
+        created_at: input.created_at.to_string(),
+        task_type,
+        annotation_format: BRIDGE_ANNOTATION_FORMAT.to_string(),
+        asset_root,
+        classes,
+        samples,
+    })
+}
+
+fn relative_asset_root(snapshot_dir: &Path, asset_root: &Path) -> Result<String, String> {
+    let relative = asset_root.strip_prefix(snapshot_dir).map_err(|_| {
+        format!(
+            "bridge asset root {} must be inside snapshot directory {}",
+            asset_root.display(),
+            snapshot_dir.display()
+        )
+    })?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value
+                .to_str()
+                .map(str::to_string)
+                .ok_or_else(|| "bridge asset root must be valid UTF-8".to_string()),
+            _ => Err("bridge asset root must be a normalized relative path".to_string()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let relative = components.join("/");
+    validate_safe_relative_path(&relative).map_err(str::to_string)?;
+    Ok(relative)
+}
+
+fn stream_file_integrity(path: &Path) -> Result<(u64, String), String> {
+    let mut file = File::open(path)
+        .map_err(|error| format!("open bridge asset {}: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0u64;
+    let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read bridge asset {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        size_bytes = size_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| format!("bridge asset is too large: {}", path.display()))?;
+        hasher.update(&buffer[..read]);
+    }
+    let metadata_size = file
+        .metadata()
+        .map_err(|error| format!("read bridge asset metadata {}: {error}", path.display()))?
+        .len();
+    if size_bytes != metadata_size {
+        return Err(format!(
+            "bridge asset changed while hashing: {}",
+            path.display()
+        ));
+    }
+    validate_positive_u64(size_bytes)
+        .map_err(|error| format!("bridge asset {}: {error}", path.display()))?;
+    Ok((size_bytes, format!("{:x}", hasher.finalize())))
+}
+
+fn bridge_object_id(object: &BridgeObject) -> &str {
+    match object {
+        BridgeObject::Bbox { id, .. }
+        | BridgeObject::Classification { id, .. }
+        | BridgeObject::Polygon { id, .. } => id,
+    }
+}
+
+fn bridge_object_class_id(object: &BridgeObject) -> &str {
+    match object {
+        BridgeObject::Bbox { class_id, .. }
+        | BridgeObject::Classification { class_id, .. }
+        | BridgeObject::Polygon { class_id, .. } => class_id,
+    }
+}
+
+fn bridge_object_matches_task(task_type: &BridgeTaskType, object: &BridgeObject) -> bool {
+    matches!(
+        (task_type, object),
+        (BridgeTaskType::Detection, BridgeObject::Bbox { .. })
+            | (
+                BridgeTaskType::Classification,
+                BridgeObject::Classification { .. }
+            )
+            | (
+                BridgeTaskType::Segmentation,
+                BridgeObject::Bbox { .. } | BridgeObject::Polygon { .. }
+            )
+    )
+}
+
+fn bridge_object_kind(object: &BridgeObject) -> u8 {
+    match object {
+        BridgeObject::Bbox { .. } => 0,
+        BridgeObject::Classification { .. } => 1,
+        BridgeObject::Polygon { .. } => 2,
+    }
+}
+
+fn remove_temporary_file(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
+}
+
 fn deserialize_schema_version<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -478,9 +780,41 @@ fn validate_polygon_points(points: &[BridgePoint]) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BridgeClass, BridgeManifest, BridgeObject, BridgePoint, BridgeSample, BridgeSplit,
-        BridgeTaskType, BRIDGE_SCHEMA_VERSION,
+        write_bridge_manifest, BridgeBuildInput, BridgeClass, BridgeManifest, BridgeObject,
+        BridgePoint, BridgeSample, BridgeSourceSample, BridgeSplit, BridgeTaskType,
+        BRIDGE_SCHEMA_VERSION,
     };
+    use crate::{project_fs::ProjectManifest, storage::StoredClass};
+    use sha2::{Digest, Sha256};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temporary_snapshot_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "image-annotation-bridge-{label}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    fn test_project(root: &Path, format: &str) -> ProjectManifest {
+        ProjectManifest {
+            id: "project-bridge".to_string(),
+            name: "Bridge Project".to_string(),
+            source_dataset_key: "local".to_string(),
+            format: format.to_string(),
+            root_path: root.to_string_lossy().to_string(),
+            created_at: "1785311000".to_string(),
+            class_count: 2,
+            image_count: 2,
+        }
+    }
 
     fn valid_manifest() -> BridgeManifest {
         BridgeManifest {
@@ -516,6 +850,386 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    #[test]
+    fn writes_bridge_manifest_with_streamed_image_hashes() {
+        let snapshot_dir = temporary_snapshot_dir("writes");
+        let asset_root = snapshot_dir.join("assets");
+        fs::create_dir_all(asset_root.join("images")).unwrap();
+        let image_a = b"first image bytes";
+        let mut image_z = vec![0x5a; super::HASH_BUFFER_SIZE + 17];
+        image_z[super::HASH_BUFFER_SIZE] = 0xa5;
+        fs::write(asset_root.join("images/a.png"), image_a).unwrap();
+        fs::write(asset_root.join("images/z.png"), &image_z).unwrap();
+
+        let project = test_project(&asset_root, "yolo-detect");
+        let classes = vec![
+            StoredClass {
+                id: 2,
+                label: "zebra".to_string(),
+                color: "#ffffff".to_string(),
+            },
+            StoredClass {
+                id: 1,
+                label: "antelope".to_string(),
+                color: "#000000".to_string(),
+            },
+        ];
+        let samples = vec![
+            BridgeSourceSample {
+                id: "sample-z".to_string(),
+                relative_path: "images/z.png".to_string(),
+                width: 20,
+                height: 10,
+                split: Some(BridgeSplit::Val),
+                revision: Some("revision-z".to_string()),
+                objects: vec![
+                    BridgeObject::Bbox {
+                        id: "object-z".to_string(),
+                        class_id: "2".to_string(),
+                        x: 2.0,
+                        y: 3.0,
+                        width: 4.0,
+                        height: 5.0,
+                    },
+                    BridgeObject::Bbox {
+                        id: "object-a".to_string(),
+                        class_id: "1".to_string(),
+                        x: 1.0,
+                        y: 2.0,
+                        width: 3.0,
+                        height: 4.0,
+                    },
+                ],
+            },
+            BridgeSourceSample {
+                id: "sample-a".to_string(),
+                relative_path: "images/a.png".to_string(),
+                width: 12,
+                height: 8,
+                split: Some(BridgeSplit::Train),
+                revision: None,
+                objects: Vec::new(),
+            },
+        ];
+
+        let final_path = write_bridge_manifest(
+            &snapshot_dir,
+            BridgeBuildInput {
+                project: &project,
+                snapshot_id: "snapshot-bridge-1",
+                snapshot_name: "Bridge Snapshot",
+                created_at: "1785312000",
+                asset_root: &asset_root,
+                classes: &classes,
+                samples: &samples,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(final_path, snapshot_dir.join("visualai-bridge.json"));
+        assert!(final_path.is_file());
+        assert!(!snapshot_dir.join(".visualai-bridge.json.tmp").exists());
+        let manifest: BridgeManifest =
+            serde_json::from_str(&fs::read_to_string(&final_path).unwrap()).unwrap();
+        assert_eq!(manifest.schema_version, BRIDGE_SCHEMA_VERSION);
+        assert_eq!(manifest.asset_root, "assets");
+        assert_eq!(
+            manifest
+                .classes
+                .iter()
+                .map(|class| class.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2"]
+        );
+        assert_eq!(
+            manifest
+                .samples
+                .iter()
+                .map(|sample| sample.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sample-a", "sample-z"]
+        );
+        assert_eq!(manifest.samples[0].relative_path, "images/a.png");
+        assert_eq!(manifest.samples[0].size_bytes, image_a.len() as u64);
+        assert_eq!(
+            manifest.samples[0].sha256,
+            format!("{:x}", Sha256::digest(image_a))
+        );
+        assert_eq!(manifest.samples[1].relative_path, "images/z.png");
+        assert_eq!(manifest.samples[1].size_bytes, image_z.len() as u64);
+        assert_eq!(
+            manifest.samples[1].sha256,
+            format!("{:x}", Sha256::digest(&image_z))
+        );
+        assert_eq!(
+            manifest.samples[1]
+                .objects
+                .iter()
+                .map(|object| match object {
+                    BridgeObject::Bbox { id, .. }
+                    | BridgeObject::Classification { id, .. }
+                    | BridgeObject::Polygon { id, .. } => id.as_str(),
+                })
+                .collect::<Vec<_>>(),
+            vec!["object-a", "object-z"]
+        );
+
+        let published_bytes = fs::read(&final_path).unwrap();
+        let second_publish = write_bridge_manifest(
+            &snapshot_dir,
+            BridgeBuildInput {
+                project: &project,
+                snapshot_id: "snapshot-bridge-1",
+                snapshot_name: "Bridge Snapshot",
+                created_at: "1785312000",
+                asset_root: &asset_root,
+                classes: &classes,
+                samples: &samples,
+            },
+        );
+        assert!(second_publish.is_err());
+        assert_eq!(fs::read(&final_path).unwrap(), published_bytes);
+        assert!(!snapshot_dir.join(".visualai-bridge.json.tmp").exists());
+
+        fs::remove_dir_all(snapshot_dir).unwrap();
+    }
+
+    #[test]
+    fn missing_asset_does_not_publish_bridge_manifest() {
+        let snapshot_dir = temporary_snapshot_dir("missing");
+        let asset_root = snapshot_dir.join("assets");
+        fs::create_dir_all(&asset_root).unwrap();
+        fs::write(
+            snapshot_dir.join(".visualai-bridge.json.tmp"),
+            b"stale partial manifest",
+        )
+        .unwrap();
+        let project = test_project(&asset_root, "yolo-detect");
+        let samples = vec![BridgeSourceSample {
+            id: "missing-image".to_string(),
+            relative_path: "images/missing.png".to_string(),
+            width: 10,
+            height: 10,
+            split: None,
+            revision: None,
+            objects: Vec::new(),
+        }];
+
+        let result = write_bridge_manifest(
+            &snapshot_dir,
+            BridgeBuildInput {
+                project: &project,
+                snapshot_id: "snapshot-missing",
+                snapshot_name: "Missing Asset Snapshot",
+                created_at: "1785312000",
+                asset_root: &asset_root,
+                classes: &[],
+                samples: &samples,
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!snapshot_dir.join("visualai-bridge.json").exists());
+        assert!(!snapshot_dir.join(".visualai-bridge.json.tmp").exists());
+        fs::remove_dir_all(snapshot_dir).unwrap();
+    }
+
+    #[test]
+    fn maps_supported_project_formats_to_bridge_task_types() {
+        for (format, expected) in [
+            ("yolo-detect", BridgeTaskType::Detection),
+            ("voc-detect", BridgeTaskType::Detection),
+            ("image-classification", BridgeTaskType::Classification),
+            ("yolo-seg", BridgeTaskType::Segmentation),
+        ] {
+            let snapshot_dir = temporary_snapshot_dir(format);
+            let asset_root = snapshot_dir.join("assets");
+            fs::create_dir_all(&asset_root).unwrap();
+            let project = test_project(&asset_root, format);
+            let final_path = write_bridge_manifest(
+                &snapshot_dir,
+                BridgeBuildInput {
+                    project: &project,
+                    snapshot_id: "snapshot-format",
+                    snapshot_name: "Format Snapshot",
+                    created_at: "1785312000",
+                    asset_root: &asset_root,
+                    classes: &[],
+                    samples: &[],
+                },
+            )
+            .unwrap();
+            let manifest: BridgeManifest =
+                serde_json::from_str(&fs::read_to_string(final_path).unwrap()).unwrap();
+            assert_eq!(manifest.task_type, expected);
+            assert_eq!(manifest.annotation_format, "visualai.normalized/v1");
+            fs::remove_dir_all(snapshot_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn producer_rejects_objects_incompatible_with_project_task() {
+        let snapshot_dir = temporary_snapshot_dir("incompatible-object");
+        let asset_root = snapshot_dir.join("assets");
+        fs::create_dir_all(asset_root.join("images")).unwrap();
+        fs::write(asset_root.join("images/sample.png"), b"sample bytes").unwrap();
+        let project = test_project(&asset_root, "image-classification");
+        let classes = vec![StoredClass {
+            id: 1,
+            label: "class".to_string(),
+            color: "#ffffff".to_string(),
+        }];
+        let samples = vec![BridgeSourceSample {
+            id: "sample-1".to_string(),
+            relative_path: "images/sample.png".to_string(),
+            width: 10,
+            height: 10,
+            split: None,
+            revision: None,
+            objects: vec![BridgeObject::Bbox {
+                id: "object-1".to_string(),
+                class_id: "1".to_string(),
+                x: 1.0,
+                y: 1.0,
+                width: 2.0,
+                height: 2.0,
+            }],
+        }];
+
+        let result = write_bridge_manifest(
+            &snapshot_dir,
+            BridgeBuildInput {
+                project: &project,
+                snapshot_id: "snapshot-incompatible",
+                snapshot_name: "Incompatible Object",
+                created_at: "1785312000",
+                asset_root: &asset_root,
+                classes: &classes,
+                samples: &samples,
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!snapshot_dir.join("visualai-bridge.json").exists());
+        assert!(!snapshot_dir.join(".visualai-bridge.json.tmp").exists());
+        fs::remove_dir_all(snapshot_dir).unwrap();
+    }
+
+    #[test]
+    fn producer_rejects_unknown_class_references() {
+        let snapshot_dir = temporary_snapshot_dir("unknown-class");
+        let asset_root = snapshot_dir.join("assets");
+        fs::create_dir_all(asset_root.join("images")).unwrap();
+        fs::write(asset_root.join("images/sample.png"), b"sample bytes").unwrap();
+        let project = test_project(&asset_root, "yolo-detect");
+        let classes = vec![StoredClass {
+            id: 1,
+            label: "class".to_string(),
+            color: "#ffffff".to_string(),
+        }];
+        let samples = vec![BridgeSourceSample {
+            id: "sample-1".to_string(),
+            relative_path: "images/sample.png".to_string(),
+            width: 10,
+            height: 10,
+            split: None,
+            revision: None,
+            objects: vec![BridgeObject::Bbox {
+                id: "object-1".to_string(),
+                class_id: "999".to_string(),
+                x: 1.0,
+                y: 1.0,
+                width: 2.0,
+                height: 2.0,
+            }],
+        }];
+
+        let result = write_bridge_manifest(
+            &snapshot_dir,
+            BridgeBuildInput {
+                project: &project,
+                snapshot_id: "snapshot-unknown-class",
+                snapshot_name: "Unknown Class",
+                created_at: "1785312000",
+                asset_root: &asset_root,
+                classes: &classes,
+                samples: &samples,
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!snapshot_dir.join("visualai-bridge.json").exists());
+        assert!(!snapshot_dir.join(".visualai-bridge.json.tmp").exists());
+        fs::remove_dir_all(snapshot_dir).unwrap();
+    }
+
+    #[test]
+    fn segmentation_producer_preserves_bbox_and_polygon_objects() {
+        let snapshot_dir = temporary_snapshot_dir("segmentation-objects");
+        let asset_root = snapshot_dir.join("assets");
+        fs::create_dir_all(asset_root.join("images")).unwrap();
+        fs::write(asset_root.join("images/sample.png"), b"sample bytes").unwrap();
+        let project = test_project(&asset_root, "yolo-seg");
+        let classes = vec![StoredClass {
+            id: 1,
+            label: "region".to_string(),
+            color: "#ffffff".to_string(),
+        }];
+        let samples = vec![BridgeSourceSample {
+            id: "sample-1".to_string(),
+            relative_path: "images/sample.png".to_string(),
+            width: 10,
+            height: 10,
+            split: None,
+            revision: None,
+            objects: vec![
+                BridgeObject::Polygon {
+                    id: "polygon-1".to_string(),
+                    class_id: "1".to_string(),
+                    points: vec![
+                        BridgePoint { x: 0.0, y: 0.0 },
+                        BridgePoint { x: 2.0, y: 0.0 },
+                        BridgePoint { x: 1.0, y: 2.0 },
+                    ],
+                },
+                BridgeObject::Bbox {
+                    id: "bbox-1".to_string(),
+                    class_id: "1".to_string(),
+                    x: 0.0,
+                    y: 0.0,
+                    width: 2.0,
+                    height: 2.0,
+                },
+            ],
+        }];
+
+        let final_path = write_bridge_manifest(
+            &snapshot_dir,
+            BridgeBuildInput {
+                project: &project,
+                snapshot_id: "snapshot-segmentation",
+                snapshot_name: "Segmentation",
+                created_at: "1785312000",
+                asset_root: &asset_root,
+                classes: &classes,
+                samples: &samples,
+            },
+        )
+        .unwrap();
+        let manifest: BridgeManifest =
+            serde_json::from_str(&fs::read_to_string(final_path).unwrap()).unwrap();
+
+        assert!(matches!(
+            manifest.samples[0].objects[0],
+            BridgeObject::Bbox { .. }
+        ));
+        assert!(matches!(
+            manifest.samples[0].objects[1],
+            BridgeObject::Polygon { .. }
+        ));
+        fs::remove_dir_all(snapshot_dir).unwrap();
     }
 
     #[test]

@@ -747,6 +747,15 @@ pub fn list_snapshot_records(path: &Path) -> Result<Vec<SnapshotRecord>, String>
     Ok(rows)
 }
 
+pub fn delete_snapshot_record(path: &Path, snapshot_id: &str) -> Result<(), String> {
+    initialize_project_database(path)?;
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    connection
+        .execute("DELETE FROM snapshots WHERE id = ?1", params![snapshot_id])
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 pub fn create_export_record(
     path: &Path,
     snapshot_id: &str,
