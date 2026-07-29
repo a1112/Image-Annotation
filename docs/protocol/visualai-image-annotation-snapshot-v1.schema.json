@@ -30,8 +30,7 @@
       "$ref": "#/$defs/nonEmptyString"
     },
     "created_at": {
-      "type": "string",
-      "format": "date-time"
+      "$ref": "#/$defs/unixTimestamp"
     },
     "task_type": {
       "enum": [
@@ -68,7 +67,13 @@
     "stableId": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^(?=\\S(?:.*\\S)?$)[^/\\\\\\u0000-\\u001f]+$"
+      "pattern": "^(?=\\S(?:.*\\S)?$)[^/\\\\\\u0000-\\u001f\\u007f-\\u009f]+$"
+    },
+    "unixTimestamp": {
+      "type": "string",
+      "description": "Canonical decimal Unix seconds with no leading zeroes.",
+      "maxLength": 19,
+      "pattern": "^(0|[1-9][0-9]*)$"
     },
     "safeRelativePath": {
       "type": "string",
@@ -112,15 +117,19 @@
         },
         "width": {
           "type": "integer",
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 4294967295
         },
         "height": {
           "type": "integer",
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 4294967295
         },
         "size_bytes": {
           "type": "integer",
-          "minimum": 1
+          "description": "Positive file size capped at the exact cross-language safe integer maximum.",
+          "minimum": 1,
+          "maximum": 9007199254740991
         },
         "sha256": {
           "type": "string",
