@@ -69,6 +69,7 @@ import {
   moveImageToProjectFolder,
   renameProjectFolder,
   submitImageAnnotations,
+  upgradeDatasetSnapshotBridge,
 } from "./api/tauri";
 import type { BackendConnection } from "./api/tauri";
 import type {
@@ -1888,6 +1889,7 @@ function ProjectWorkspace({
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [images, setImages] = useState<DatasetImage[]>([]);
   const [snapshots, setSnapshots] = useState<DatasetSnapshot[]>([]);
+  const [upgradingSnapshotId, setUpgradingSnapshotId] = useState<string | null>(null);
   const [exports, setExports] = useState<DatasetExport[]>([]);
   const [workflowMessage, setWorkflowMessage] = useState<string | null>(null);
   const [tab, setTab] = useState<ProjectTab>(routeTab ?? "概览");
@@ -2035,6 +2037,24 @@ function ProjectWorkspace({
     );
     setSnapshots((current) => [snapshot, ...current]);
     setWorkflowMessage(`已创建快照 ${snapshot.name}`);
+  }
+
+  async function handleUpgradeSnapshotBridge(snapshotId: string) {
+    setUpgradingSnapshotId(snapshotId);
+    setWorkflowMessage(null);
+    try {
+      const upgraded = await upgradeDatasetSnapshotBridge(projectId, snapshotId);
+      setSnapshots((current) =>
+        current.map((snapshot) => snapshot.id === upgraded.id ? upgraded : snapshot),
+      );
+      setWorkflowMessage(`训练桥接已就绪：${upgraded.name}`);
+    } catch (error) {
+      setWorkflowMessage(
+        `训练桥接升级失败：${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      setUpgradingSnapshotId(null);
+    }
   }
 
   async function handleExport(format: "yolo" | "coco") {
@@ -2206,9 +2226,11 @@ function ProjectWorkspace({
             selectedImageId,
             selectedClass,
             snapshots,
+            upgradingSnapshotId,
             workflowMessage,
             onClassSamplePageChange: setClassSamplePage,
             onCreateSnapshot: handleCreateSnapshot,
+            onUpgradeSnapshotBridge: handleUpgradeSnapshotBridge,
             onExport: handleExport,
             onImageClassFilterChange: setImageClassFilter,
             onImagePageChange: setImagePage,
@@ -2256,6 +2278,7 @@ function renderProjectTab(
     classSampleUrls: Record<string, string>;
     classSampleAnnotations: Record<string, AnnotationObject[]>;
     snapshots: DatasetSnapshot[];
+    upgradingSnapshotId: string | null;
     exports: DatasetExport[];
     imageClassFilter: string;
     imagePage: number;
@@ -2268,6 +2291,7 @@ function renderProjectTab(
     onOpenClassSample: (imageId: string) => void;
     onOpenAnnotation: (imageId: string) => void;
     onCreateSnapshot: () => void;
+    onUpgradeSnapshotBridge: (snapshotId: string) => void;
     onExport: (format: "yolo" | "coco") => void;
     onImageClassFilterChange: (value: string) => void;
     onImagePageChange: (page: number) => void;
@@ -2634,6 +2658,20 @@ function renderProjectTab(
                   <strong>{snapshot.name}</strong>
                   <span>{snapshot.imageCount} 张图片</span>
                   <span>{snapshot.createdAt}</span>
+                  <span>{snapshot.bridgeStatus === "ready" ? "训练桥接已就绪" : "训练桥接待生成"}</span>
+                  {snapshot.bridgeStatus !== "ready" ? (
+                    <button
+                      disabled={workflow.upgradingSnapshotId === snapshot.id}
+                      type="button"
+                      onClick={() => workflow.onUpgradeSnapshotBridge(snapshot.id)}
+                    >
+                      {workflow.upgradingSnapshotId === snapshot.id
+                        ? "正在生成训练桥接…"
+                        : snapshot.bridgeStatus === "invalid"
+                          ? "重新生成训练桥接"
+                          : "升级训练桥接"}
+                    </button>
+                  ) : null}
                 </div>
               ))}
             </div>

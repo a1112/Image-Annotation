@@ -237,6 +237,61 @@ fn legacy_bridge_status() -> String {
     "legacy".to_string()
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LegacySnapshotManifest {
+    project_id: String,
+    name: String,
+    image_count: u32,
+    annotations: Vec<LegacySnapshotAnnotation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LegacySnapshotAnnotation {
+    image_id: String,
+    file_name: String,
+    width: u32,
+    height: u32,
+    split: String,
+    status: String,
+    #[serde(default)]
+    revision: Option<String>,
+    objects: Vec<LegacySnapshotObject>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LegacySnapshotObject {
+    id: String,
+    class_id: u32,
+    label: String,
+    #[serde(rename = "type")]
+    object_type: String,
+    #[serde(default)]
+    bbox: Option<LegacySnapshotBbox>,
+    #[serde(default)]
+    polygon: Option<Vec<LegacySnapshotPoint>>,
+    #[serde(default)]
+    attributes: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LegacySnapshotBbox {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LegacySnapshotPoint {
+    x: f64,
+    y: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DatasetExport {
@@ -1414,6 +1469,213 @@ impl SampleRepository {
         })
     }
 
+    pub fn upgrade_dataset_snapshot_bridge(
+        &self,
+        project_id: &str,
+        snapshot_id: &str,
+    ) -> Result<DatasetSnapshot, String> {
+        validate_snapshot_stable_id(project_id)
+            .map_err(|error| format!("invalid project id: {error}"))?;
+        validate_snapshot_stable_id(snapshot_id)
+            .map_err(|error| format!("invalid snapshot id: {error}"))?;
+
+        let paths = project_fs::project_paths(project_id);
+        let record = storage::list_snapshot_records(&paths.sqlite)?
+            .into_iter()
+            .find(|record| record.id == snapshot_id)
+            .ok_or_else(|| format!("snapshot record not found: {snapshot_id}"))?;
+        let snapshot_dir = paths.snapshots.join(snapshot_id);
+        let manifest_path = snapshot_dir.join("manifest.json");
+        ensure_path_is_within_project(&paths.root, &snapshot_dir, "snapshot directory")?;
+        ensure_path_is_within_project(&paths.root, &manifest_path, "snapshot manifest")?;
+
+        if bridge_file_is_ready(project_id, snapshot_id, &snapshot_dir) {
+            return Ok(dataset_snapshot_from_record(&record, &snapshot_dir, true));
+        }
+
+        let project = storage::read_project_manifest(&paths.sqlite)?
+            .or_else(|| project_fs::read_manifest(project_id))
+            .ok_or_else(|| format!("project manifest not found: {project_id}"))?;
+        if project.id != project_id {
+            return Err(format!(
+                "project manifest id mismatch: expected {project_id}, got {}",
+                project.id
+            ));
+        }
+        let classes = storage::read_classes(&paths.sqlite)?;
+        let source_asset_root = PathBuf::from(&project.root_path);
+        let source_asset_root = if source_asset_root.exists() {
+            source_asset_root
+        } else {
+            paths.raw.clone()
+        };
+        let legacy_bytes = fs::read(&manifest_path).map_err(|error| {
+            format!(
+                "read legacy snapshot manifest {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+        let legacy: LegacySnapshotManifest =
+            serde_json::from_slice(&legacy_bytes).map_err(|error| {
+                format!(
+                    "invalid legacy snapshot manifest {}: {error}",
+                    manifest_path.display()
+                )
+            })?;
+        validate_legacy_snapshot_manifest(&legacy, project_id, &record)?;
+
+        let mut image_ids = BTreeSet::new();
+        let mut declared_paths = BTreeSet::new();
+        let mut source_paths = BTreeSet::new();
+        let mut prepared = Vec::with_capacity(legacy.annotations.len());
+        for annotation in legacy.annotations {
+            validate_snapshot_stable_id(&annotation.image_id).map_err(|error| {
+                format!("invalid legacy image id '{}': {error}", annotation.image_id)
+            })?;
+            if !image_ids.insert(annotation.image_id.clone()) {
+                return Err(format!(
+                    "duplicate legacy snapshot image id: {}",
+                    annotation.image_id
+                ));
+            }
+            validate_snapshot_relative_path(&annotation.file_name).map_err(|error| {
+                format!(
+                    "invalid legacy snapshot path for '{}': {error}",
+                    annotation.image_id
+                )
+            })?;
+            if !declared_paths.insert(annotation.file_name.clone()) {
+                return Err(format!(
+                    "duplicate legacy snapshot image path: {}",
+                    annotation.file_name
+                ));
+            }
+            if annotation.width == 0 || annotation.height == 0 {
+                return Err(format!(
+                    "legacy snapshot image '{}' has invalid dimensions",
+                    annotation.image_id
+                ));
+            }
+            validate_snapshot_text(&annotation.status).map_err(|error| {
+                format!(
+                    "invalid legacy snapshot status for '{}': {error}",
+                    annotation.image_id
+                )
+            })?;
+            if let Some(revision) = &annotation.revision {
+                validate_snapshot_stable_id(revision).map_err(|error| {
+                    format!(
+                        "invalid legacy snapshot revision for '{}': {error}",
+                        annotation.image_id
+                    )
+                })?;
+            }
+            let source_path = resolve_snapshot_image_path(
+                &source_asset_root,
+                &paths.raw,
+                &annotation.file_name,
+                &annotation.image_id,
+            )?;
+            if !source_paths.insert(source_path.clone()) {
+                return Err(format!(
+                    "multiple legacy snapshot entries resolve to the same source asset: {}",
+                    source_path.display()
+                ));
+            }
+            let actual_dimensions = crate::datasets::oriented_image_dimensions(&source_path)
+                .map_err(|error| {
+                    format!(
+                        "read oriented source dimensions for '{}': {error}",
+                        annotation.image_id
+                    )
+                })?;
+            if actual_dimensions != (annotation.width, annotation.height) {
+                return Err(format!(
+                    "legacy snapshot image '{}' dimensions changed: expected {}x{}, got {}x{}",
+                    annotation.image_id,
+                    annotation.width,
+                    annotation.height,
+                    actual_dimensions.0,
+                    actual_dimensions.1
+                ));
+            }
+            let relative_path = stable_snapshot_asset_path(&annotation.image_id, &source_path)?;
+            let objects = annotation
+                .objects
+                .into_iter()
+                .map(bridge_object_from_legacy)
+                .collect::<Result<Vec<_>, _>>()?;
+            prepared.push((
+                source_path,
+                BridgeSourceSample {
+                    id: annotation.image_id,
+                    relative_path,
+                    width: annotation.width,
+                    height: annotation.height,
+                    split: bridge_split(&annotation.split)?,
+                    revision: annotation.revision,
+                    objects,
+                },
+            ));
+        }
+
+        let staging_dir = paths.snapshots.join(format!(
+            ".{snapshot_id}-upgrade-stage-{}",
+            unique_operation_suffix()
+        ));
+        fs::create_dir(&staging_dir).map_err(|error| {
+            format!(
+                "create snapshot upgrade staging directory {}: {error}",
+                staging_dir.display()
+            )
+        })?;
+        let upgrade_result = (|| {
+            let staging_assets = staging_dir.join("assets");
+            fs::create_dir(&staging_assets).map_err(|error| {
+                format!(
+                    "create snapshot upgrade asset staging directory {}: {error}",
+                    staging_assets.display()
+                )
+            })?;
+            let mut bridge_samples = Vec::with_capacity(prepared.len());
+            for (source_path, sample) in prepared {
+                let target_path = staging_assets.join(Path::new(&sample.relative_path));
+                copy_file_and_sync(&source_path, &target_path)?;
+                verify_snapshot_asset_dimensions(&target_path, sample.width, sample.height)?;
+                bridge_samples.push(sample);
+            }
+            bridge::write_bridge_manifest(
+                &staging_dir,
+                BridgeBuildInput {
+                    project: &project,
+                    snapshot_id: &record.id,
+                    snapshot_name: &record.name,
+                    created_at: &record.created_at,
+                    asset_root: &staging_assets,
+                    classes: &classes,
+                    samples: &bridge_samples,
+                },
+            )?;
+            publish_staged_snapshot_bridge(&snapshot_dir, &staging_dir)
+        })();
+
+        let staging_cleanup = fs::remove_dir_all(&staging_dir);
+        if let Err(error) = upgrade_result {
+            if let Err(cleanup_error) = staging_cleanup {
+                if cleanup_error.kind() != io::ErrorKind::NotFound {
+                    return Err(format!(
+                        "{error}; cleanup staging directory {} failed: {cleanup_error}",
+                        staging_dir.display()
+                    ));
+                }
+            }
+            return Err(error);
+        }
+        let _ = staging_cleanup;
+
+        Ok(dataset_snapshot_from_record(&record, &snapshot_dir, true))
+    }
+
     pub fn dataset_snapshots(&self, project_id: &str) -> Result<Vec<DatasetSnapshot>, String> {
         let paths = project_fs::project_paths(project_id);
         Ok(storage::list_snapshot_records(&paths.sqlite)?
@@ -1676,6 +1938,277 @@ impl SampleRepository {
             })
             .collect())
     }
+}
+
+fn validate_legacy_snapshot_manifest(
+    manifest: &LegacySnapshotManifest,
+    project_id: &str,
+    record: &storage::SnapshotRecord,
+) -> Result<(), String> {
+    validate_snapshot_stable_id(&manifest.project_id)
+        .map_err(|error| format!("invalid legacy projectId: {error}"))?;
+    if manifest.project_id != project_id {
+        return Err(format!(
+            "legacy snapshot projectId mismatch: expected {project_id}, got {}",
+            manifest.project_id
+        ));
+    }
+    validate_snapshot_text(&manifest.name)
+        .map_err(|error| format!("invalid legacy snapshot name: {error}"))?;
+    if manifest.name != record.name {
+        return Err(format!(
+            "legacy snapshot name mismatch: expected {}, got {}",
+            record.name, manifest.name
+        ));
+    }
+    if manifest.image_count as usize != manifest.annotations.len() {
+        return Err(format!(
+            "legacy snapshot imageCount {} does not match {} annotations",
+            manifest.image_count,
+            manifest.annotations.len()
+        ));
+    }
+    if manifest.image_count != record.image_count {
+        return Err(format!(
+            "legacy snapshot imageCount {} does not match database record {}",
+            manifest.image_count, record.image_count
+        ));
+    }
+    Ok(())
+}
+
+fn bridge_object_from_legacy(object: LegacySnapshotObject) -> Result<BridgeObject, String> {
+    validate_snapshot_stable_id(&object.id)
+        .map_err(|error| format!("invalid legacy object id '{}': {error}", object.id))?;
+    validate_snapshot_text(&object.label)
+        .map_err(|error| format!("invalid legacy object label '{}': {error}", object.id))?;
+    let _attribute_count = object.attributes.len();
+    match object.object_type.as_str() {
+        "bbox" => {
+            if object.polygon.is_some() {
+                return Err(format!(
+                    "bbox legacy object '{}' must not contain polygon",
+                    object.id
+                ));
+            }
+            let bbox = object
+                .bbox
+                .ok_or_else(|| format!("bbox legacy object '{}' has no bbox", object.id))?;
+            Ok(BridgeObject::Bbox {
+                id: object.id,
+                class_id: object.class_id.to_string(),
+                x: bbox.x,
+                y: bbox.y,
+                width: bbox.width,
+                height: bbox.height,
+            })
+        }
+        "classification" => {
+            if object.bbox.is_some() || object.polygon.is_some() {
+                return Err(format!(
+                    "classification legacy object '{}' must not contain geometry",
+                    object.id
+                ));
+            }
+            Ok(BridgeObject::Classification {
+                id: object.id,
+                class_id: object.class_id.to_string(),
+            })
+        }
+        "polygon" => {
+            if object.bbox.is_some() {
+                return Err(format!(
+                    "polygon legacy object '{}' must not contain bbox",
+                    object.id
+                ));
+            }
+            let points = object
+                .polygon
+                .ok_or_else(|| format!("polygon legacy object '{}' has no points", object.id))?
+                .into_iter()
+                .map(|point| BridgePoint {
+                    x: point.x,
+                    y: point.y,
+                })
+                .collect();
+            Ok(BridgeObject::Polygon {
+                id: object.id,
+                class_id: object.class_id.to_string(),
+                points,
+            })
+        }
+        object_type => Err(format!(
+            "unsupported legacy annotation type '{}' for object '{}'",
+            object_type, object.id
+        )),
+    }
+}
+
+fn validate_snapshot_stable_id(value: &str) -> Result<(), &'static str> {
+    validate_snapshot_text(value)?;
+    if value
+        .chars()
+        .all(|character| character != '/' && character != '\\')
+    {
+        Ok(())
+    } else {
+        Err("stable ID must not contain path separators")
+    }
+}
+
+fn validate_snapshot_text(value: &str) -> Result<(), &'static str> {
+    let boundary_whitespace = value.chars().next().is_some_and(char::is_whitespace)
+        || value.chars().next_back().is_some_and(char::is_whitespace);
+    if !value.is_empty()
+        && !boundary_whitespace
+        && value.chars().all(|character| !character.is_control())
+    {
+        Ok(())
+    } else {
+        Err("value must be non-empty, have no boundary whitespace, and contain no controls")
+    }
+}
+
+fn validate_snapshot_relative_path(value: &str) -> Result<(), &'static str> {
+    let safe = !value.is_empty()
+        && !value.starts_with('/')
+        && !value.starts_with('\\')
+        && !value.contains(':')
+        && !value.contains('\\')
+        && !value.contains('\0')
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..");
+    if safe {
+        Ok(())
+    } else {
+        Err("path must be a normalized, portable relative path")
+    }
+}
+
+fn ensure_path_is_within_project(
+    project_root: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let canonical_root = fs::canonicalize(project_root)
+        .map_err(|error| format!("resolve project root {}: {error}", project_root.display()))?;
+    let canonical_path = fs::canonicalize(path)
+        .map_err(|error| format!("resolve {label} {}: {error}", path.display()))?;
+    if canonical_path.starts_with(canonical_root) {
+        Ok(())
+    } else {
+        Err(format!("{label} escapes project root: {}", path.display()))
+    }
+}
+
+fn bridge_file_is_ready(project_id: &str, snapshot_id: &str, snapshot_dir: &Path) -> bool {
+    fs::read_to_string(snapshot_dir.join("visualai-bridge.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<crate::bridge::BridgeManifest>(&text).ok())
+        .is_some_and(|manifest| {
+            manifest.validate().is_ok()
+                && manifest.project_id == project_id
+                && manifest.snapshot_id == snapshot_id
+        })
+}
+
+fn dataset_snapshot_from_record(
+    record: &storage::SnapshotRecord,
+    snapshot_dir: &Path,
+    bridge_ready: bool,
+) -> DatasetSnapshot {
+    DatasetSnapshot {
+        id: record.id.clone(),
+        name: record.name.clone(),
+        image_count: record.image_count,
+        manifest_path: snapshot_dir
+            .join("manifest.json")
+            .to_string_lossy()
+            .to_string(),
+        created_at: record.created_at.clone(),
+        bridge_manifest_path: bridge_ready.then(|| bridge_manifest_relative_path(&record.id)),
+        bridge_status: if bridge_ready {
+            "ready".to_string()
+        } else {
+            legacy_bridge_status()
+        },
+    }
+}
+
+fn unique_operation_suffix() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| format!("{}-{}", std::process::id(), duration.as_nanos()))
+        .unwrap_or_else(|_| format!("{}-0", std::process::id()))
+}
+
+fn publish_staged_snapshot_bridge(snapshot_dir: &Path, staging_dir: &Path) -> Result<(), String> {
+    let staged_assets = staging_dir.join("assets");
+    let staged_bridge = staging_dir.join("visualai-bridge.json");
+    if !staged_assets.is_dir() || !staged_bridge.is_file() {
+        return Err("snapshot bridge staging output is incomplete".to_string());
+    }
+
+    let final_assets = snapshot_dir.join("assets");
+    let final_bridge = snapshot_dir.join("visualai-bridge.json");
+    let suffix = unique_operation_suffix();
+    let backup_assets = snapshot_dir.join(format!(".upgrade-assets-backup-{suffix}"));
+    let backup_bridge = snapshot_dir.join(format!(".upgrade-bridge-backup-{suffix}"));
+    let had_assets = final_assets.exists();
+    let had_bridge = final_bridge.exists();
+
+    if had_assets {
+        fs::rename(&final_assets, &backup_assets).map_err(|error| {
+            format!(
+                "backup existing snapshot assets {}: {error}",
+                final_assets.display()
+            )
+        })?;
+    }
+    if let Err(error) = fs::rename(&staged_assets, &final_assets) {
+        if had_assets {
+            let _ = fs::rename(&backup_assets, &final_assets);
+        }
+        return Err(format!(
+            "publish upgraded snapshot assets {}: {error}",
+            final_assets.display()
+        ));
+    }
+
+    if had_bridge {
+        if let Err(error) = fs::rename(&final_bridge, &backup_bridge) {
+            let _ = fs::remove_dir_all(&final_assets);
+            if had_assets {
+                let _ = fs::rename(&backup_assets, &final_assets);
+            }
+            return Err(format!(
+                "backup existing bridge manifest {}: {error}",
+                final_bridge.display()
+            ));
+        }
+    }
+    if let Err(error) = fs::rename(&staged_bridge, &final_bridge) {
+        if had_bridge {
+            let _ = fs::rename(&backup_bridge, &final_bridge);
+        }
+        let _ = fs::remove_dir_all(&final_assets);
+        if had_assets {
+            let _ = fs::rename(&backup_assets, &final_assets);
+        }
+        return Err(format!(
+            "publish upgraded bridge manifest {}: {error}",
+            final_bridge.display()
+        ));
+    }
+
+    if had_assets {
+        let _ = fs::remove_dir_all(&backup_assets);
+    }
+    if had_bridge {
+        let _ = fs::remove_file(&backup_bridge);
+    }
+    Ok(())
 }
 
 fn bridge_manifest_relative_path(snapshot_id: &str) -> String {
@@ -3329,5 +3862,314 @@ mod tests {
         assert!(output_dir.join("images/train/sample.png").is_file());
 
         let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    struct LegacySnapshotFixture {
+        project_id: String,
+        paths: project_fs::ProjectPaths,
+        record: storage::SnapshotRecord,
+        manifest_bytes: Vec<u8>,
+    }
+
+    fn legacy_snapshot_fixture(label: &str) -> LegacySnapshotFixture {
+        let project_id = format!("legacy-upgrade-{label}");
+        let paths = project_fs::workspace_project_paths(&project_id);
+        let _ = std::fs::remove_dir_all(&paths.root);
+        project_fs::ensure_workspace_project_dirs(&project_id).unwrap();
+        image::RgbImage::from_pixel(12, 8, image::Rgb([11, 22, 33]))
+            .save(paths.raw.join("sample.png"))
+            .unwrap();
+        let project = project_fs::ProjectManifest {
+            id: project_id.clone(),
+            name: format!("Legacy {label}"),
+            source_dataset_key: "legacy-test".to_string(),
+            format: "yolo-detect".to_string(),
+            root_path: paths.raw.to_string_lossy().to_string(),
+            created_at: now_unix_string(),
+            class_count: 1,
+            image_count: 1,
+        };
+        storage::initialize_project_database(&paths.sqlite).unwrap();
+        storage::upsert_project_index(
+            &paths.sqlite,
+            &project,
+            &[storage::StoredImage {
+                id: "sample-1".to_string(),
+                file_name: "sample.png".to_string(),
+                width: 12,
+                height: 8,
+                split: "train".to_string(),
+                status: "已标注".to_string(),
+                qa_status: String::new(),
+                review_note: None,
+            }],
+            &[storage::StoredClass {
+                id: 0,
+                label: "box".to_string(),
+                color: "#1fa7ff".to_string(),
+            }],
+        )
+        .unwrap();
+        let record =
+            storage::create_snapshot_record(&paths.sqlite, "Legacy training", "{}", 1).unwrap();
+        let manifest_bytes = serde_json::to_vec_pretty(&json!({
+            "projectId": project_id,
+            "name": "Legacy training",
+            "imageCount": 1,
+            "annotations": [{
+                "imageId": "sample-1",
+                "fileName": "sample.png",
+                "width": 12,
+                "height": 8,
+                "split": "train",
+                "status": "已标注",
+                "revision": "snapshot-revision",
+                "objects": [{
+                    "id": "frozen-box",
+                    "classId": 0,
+                    "label": "box",
+                    "type": "bbox",
+                    "bbox": { "x": 1.0, "y": 2.0, "width": 4.0, "height": 3.0 },
+                    "attributes": {}
+                }]
+            }]
+        }))
+        .unwrap();
+        let snapshot_dir = paths.snapshots.join(&record.id);
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::write(snapshot_dir.join("manifest.json"), &manifest_bytes).unwrap();
+        LegacySnapshotFixture {
+            project_id,
+            paths,
+            record,
+            manifest_bytes,
+        }
+    }
+
+    #[test]
+    fn upgrades_legacy_snapshot_without_changing_snapshot_id() {
+        let fixture = legacy_snapshot_fixture("frozen");
+        storage::save_annotation_payload(
+            &fixture.paths.sqlite,
+            "sample-1",
+            None,
+            &serde_json::to_string(&vec![AnnotationObject::bbox(
+                "live-box".to_string(),
+                0,
+                "box".to_string(),
+                BBox {
+                    x: 5.0,
+                    y: 5.0,
+                    width: 2.0,
+                    height: 2.0,
+                },
+            )])
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upgraded = SampleRepository::new()
+            .upgrade_dataset_snapshot_bridge(&fixture.project_id, &fixture.record.id)
+            .unwrap();
+
+        assert_eq!(upgraded.id, fixture.record.id);
+        assert_eq!(upgraded.bridge_status, "ready");
+        assert_eq!(
+            upgraded.bridge_manifest_path.as_deref(),
+            Some(format!("snapshots/{}/visualai-bridge.json", fixture.record.id).as_str())
+        );
+        let bridge_path = fixture
+            .paths
+            .root
+            .join(upgraded.bridge_manifest_path.as_ref().unwrap());
+        assert!(bridge_path.is_file());
+        let bridge: crate::bridge::BridgeManifest =
+            serde_json::from_slice(&std::fs::read(bridge_path).unwrap()).unwrap();
+        assert!(matches!(
+            &bridge.samples[0].objects[0],
+            BridgeObject::Bbox { id, .. } if id == "frozen-box"
+        ));
+        assert_eq!(
+            std::fs::read(
+                fixture
+                    .paths
+                    .snapshots
+                    .join(&fixture.record.id)
+                    .join("manifest.json")
+            )
+            .unwrap(),
+            fixture.manifest_bytes
+        );
+        let _ = std::fs::remove_dir_all(fixture.paths.root);
+    }
+
+    #[test]
+    fn upgrades_legacy_snapshot_failure_preserves_record_manifest_and_invalid_bridge() {
+        let fixture = legacy_snapshot_fixture("rollback");
+        let snapshot_dir = fixture.paths.snapshots.join(&fixture.record.id);
+        let invalid_bridge = b"{\"schema_version\":\"broken\"}".to_vec();
+        std::fs::write(snapshot_dir.join("visualai-bridge.json"), &invalid_bridge).unwrap();
+        std::fs::remove_file(fixture.paths.raw.join("sample.png")).unwrap();
+
+        let result = SampleRepository::new()
+            .upgrade_dataset_snapshot_bridge(&fixture.project_id, &fixture.record.id);
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(snapshot_dir.join("manifest.json")).unwrap(),
+            fixture.manifest_bytes
+        );
+        assert_eq!(
+            std::fs::read(snapshot_dir.join("visualai-bridge.json")).unwrap(),
+            invalid_bridge
+        );
+        assert_eq!(
+            storage::list_snapshot_records(&fixture.paths.sqlite)
+                .unwrap()
+                .iter()
+                .filter(|record| record.id == fixture.record.id)
+                .count(),
+            1
+        );
+        assert!(!snapshot_dir.join(".visualai-bridge.json.tmp").exists());
+        assert!(std::fs::read_dir(&fixture.paths.snapshots)
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("upgrade-stage")));
+        let _ = std::fs::remove_dir_all(fixture.paths.root);
+    }
+
+    #[test]
+    fn upgrades_legacy_snapshot_rejects_changed_source_dimensions_without_outputs() {
+        let fixture = legacy_snapshot_fixture("changed-dimensions");
+        image::RgbImage::from_pixel(13, 8, image::Rgb([44, 55, 66]))
+            .save(fixture.paths.raw.join("sample.png"))
+            .unwrap();
+        let snapshot_dir = fixture.paths.snapshots.join(&fixture.record.id);
+
+        let result = SampleRepository::new()
+            .upgrade_dataset_snapshot_bridge(&fixture.project_id, &fixture.record.id);
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(snapshot_dir.join("manifest.json")).unwrap(),
+            fixture.manifest_bytes
+        );
+        assert!(!snapshot_dir.join("visualai-bridge.json").exists());
+        assert!(!snapshot_dir.join("assets").exists());
+        let _ = std::fs::remove_dir_all(fixture.paths.root);
+    }
+
+    #[test]
+    fn upgrades_legacy_snapshot_rejects_malformed_duplicate_and_incompatible_annotations() {
+        for (label, mutation) in [
+            ("malformed", "malformed"),
+            ("duplicate-id", "duplicate_id"),
+            ("duplicate-path", "duplicate_path"),
+            ("path-traversal", "path_traversal"),
+            ("unknown-field", "unknown_field"),
+            ("unknown-class", "unknown_class"),
+            ("task-mismatch", "task_mismatch"),
+        ] {
+            let fixture = legacy_snapshot_fixture(label);
+            let manifest_path = fixture
+                .paths
+                .snapshots
+                .join(&fixture.record.id)
+                .join("manifest.json");
+            let bytes = if mutation == "malformed" {
+                b"{not-json".to_vec()
+            } else {
+                let mut value: Value = serde_json::from_slice(&fixture.manifest_bytes).unwrap();
+                match mutation {
+                    "duplicate_id" => {
+                        let duplicate = value["annotations"][0].clone();
+                        value["annotations"].as_array_mut().unwrap().push(duplicate);
+                    }
+                    "duplicate_path" => {
+                        let mut duplicate = value["annotations"][0].clone();
+                        duplicate["imageId"] = json!("sample-2");
+                        value["annotations"].as_array_mut().unwrap().push(duplicate);
+                    }
+                    "path_traversal" => {
+                        value["annotations"][0]["fileName"] = json!("../sample.png");
+                    }
+                    "unknown_field" => {
+                        value["annotations"][0]["unexpected"] = json!(true);
+                    }
+                    "unknown_class" => {
+                        value["annotations"][0]["objects"][0]["classId"] = json!(99);
+                    }
+                    "task_mismatch" => {
+                        value["annotations"][0]["objects"][0] = json!({
+                            "id": "classification-1",
+                            "classId": 0,
+                            "label": "box",
+                            "type": "classification",
+                            "attributes": {}
+                        });
+                    }
+                    _ => unreachable!(),
+                }
+                serde_json::to_vec_pretty(&value).unwrap()
+            };
+            std::fs::write(&manifest_path, &bytes).unwrap();
+
+            let result = SampleRepository::new()
+                .upgrade_dataset_snapshot_bridge(&fixture.project_id, &fixture.record.id);
+
+            assert!(result.is_err(), "{mutation} unexpectedly succeeded");
+            assert_eq!(std::fs::read(&manifest_path).unwrap(), bytes);
+            assert!(!manifest_path
+                .parent()
+                .unwrap()
+                .join("visualai-bridge.json")
+                .exists());
+            assert_eq!(
+                storage::list_snapshot_records(&fixture.paths.sqlite)
+                    .unwrap()
+                    .iter()
+                    .filter(|record| record.id == fixture.record.id)
+                    .count(),
+                1
+            );
+            let _ = std::fs::remove_dir_all(fixture.paths.root);
+        }
+    }
+
+    #[test]
+    fn upgrades_legacy_snapshot_is_idempotent_and_replaces_invalid_bridge() {
+        let fixture = legacy_snapshot_fixture("replace-invalid");
+        let snapshot_dir = fixture.paths.snapshots.join(&fixture.record.id);
+        std::fs::write(
+            snapshot_dir.join("visualai-bridge.json"),
+            b"{\"schema_version\":\"broken\"}",
+        )
+        .unwrap();
+        let repository = SampleRepository::new();
+
+        let first = repository
+            .upgrade_dataset_snapshot_bridge(&fixture.project_id, &fixture.record.id)
+            .unwrap();
+        let first_bridge = std::fs::read(snapshot_dir.join("visualai-bridge.json")).unwrap();
+        let second = repository
+            .upgrade_dataset_snapshot_bridge(&fixture.project_id, &fixture.record.id)
+            .unwrap();
+
+        assert_eq!(first.bridge_status, "ready");
+        assert_eq!(second.bridge_status, "ready");
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            std::fs::read(snapshot_dir.join("visualai-bridge.json")).unwrap(),
+            first_bridge
+        );
+        assert_eq!(
+            std::fs::read(snapshot_dir.join("manifest.json")).unwrap(),
+            fixture.manifest_bytes
+        );
+        let _ = std::fs::remove_dir_all(fixture.paths.root);
     }
 }

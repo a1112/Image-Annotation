@@ -464,6 +464,13 @@ export async function createDatasetSnapshot(
   return invokeRequired("create_dataset_snapshot", { projectId, name });
 }
 
+export async function upgradeDatasetSnapshotBridge(
+  projectId: string,
+  snapshotId: string,
+): Promise<DatasetSnapshot> {
+  return invokeRequired("upgrade_dataset_snapshot_bridge", { projectId, snapshotId });
+}
+
 export async function listExports(projectId: string): Promise<DatasetExport[]> {
   return invokeRequired("list_exports", { projectId });
 }

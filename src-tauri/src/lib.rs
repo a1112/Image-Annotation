@@ -1027,6 +1027,16 @@ fn create_dataset_snapshot(
 }
 
 #[tauri::command]
+fn upgrade_dataset_snapshot_bridge(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    snapshot_id: String,
+) -> Result<DatasetSnapshot, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.upgrade_dataset_snapshot_bridge(&project_id, &snapshot_id)
+}
+
+#[tauri::command]
 fn list_snapshots(
     repository: State<'_, RepositoryState>,
     project_id: String,
@@ -1258,6 +1268,7 @@ pub fn run() {
                 review_task_item,
                 list_review_queue,
                 create_dataset_snapshot,
+                upgrade_dataset_snapshot_bridge,
                 list_snapshots,
                 export_dataset,
                 list_exports,
@@ -1358,6 +1369,7 @@ pub fn run() {
             review_task_item,
             list_review_queue,
             create_dataset_snapshot,
+            upgrade_dataset_snapshot_bridge,
             list_snapshots,
             export_dataset,
             list_exports,

@@ -9,6 +9,8 @@ const tauriState = vi.hoisted(() => ({
   builtinDownloaded: true,
   localOpened: false,
   analysisFormat: "voc-detect",
+  snapshotBridgeStatus: "none",
+  upgradeSnapshotShouldFail: false,
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -327,7 +329,20 @@ vi.mock("@tauri-apps/api/core", () => ({
     }
 
     if (command === "list_snapshots") {
-      return [];
+      if (tauriState.snapshotBridgeStatus === "none") {
+        return [];
+      }
+      return [{
+        id: "snapshot-legacy",
+        name: "Legacy snapshot",
+        imageCount: 1,
+        manifestPath: "snapshots/snapshot-legacy/manifest.json",
+        createdAt: "1778638138",
+        bridgeManifestPath: tauriState.snapshotBridgeStatus === "ready"
+          ? "snapshots/snapshot-legacy/visualai-bridge.json"
+          : undefined,
+        bridgeStatus: tauriState.snapshotBridgeStatus,
+      }];
     }
 
     if (command === "create_dataset_snapshot") {
@@ -337,6 +352,22 @@ vi.mock("@tauri-apps/api/core", () => ({
         imageCount: 3,
         manifestPath: "F:/project/Image-Annotation/data/workspaces/default/projects/coco128/snapshots/snapshot-1/manifest.json",
         createdAt: "1778638138",
+      };
+    }
+
+    if (command === "upgrade_dataset_snapshot_bridge") {
+      if (tauriState.upgradeSnapshotShouldFail) {
+        throw new Error("source asset changed");
+      }
+      tauriState.snapshotBridgeStatus = "ready";
+      return {
+        id: args?.snapshotId,
+        name: "Legacy snapshot",
+        imageCount: 1,
+        manifestPath: "snapshots/snapshot-legacy/manifest.json",
+        createdAt: "1778638138",
+        bridgeManifestPath: "snapshots/snapshot-legacy/visualai-bridge.json",
+        bridgeStatus: "ready",
       };
     }
 
@@ -508,6 +539,8 @@ beforeEach(() => {
   tauriState.builtinDownloaded = true;
   tauriState.localOpened = false;
   tauriState.analysisFormat = "voc-detect";
+  tauriState.snapshotBridgeStatus = "none";
+  tauriState.upgradeSnapshotShouldFail = false;
   vi.stubGlobal(
     "fetch",
     vi.fn(async () => {
@@ -1504,5 +1537,61 @@ describe("desktop shell", () => {
         format: "yolo",
       }),
     );
+  });
+
+  it("旧快照可升级训练桥接并在成功后隐藏升级入口", async () => {
+    const user = userEvent.setup();
+    tauriState.snapshotBridgeStatus = "legacy";
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("upgrade_dataset_snapshot_bridge", {
+        projectId: "coco128",
+        snapshotId: "snapshot-legacy",
+      }),
+    );
+    expect(await screen.findByText("训练桥接已就绪：Legacy snapshot")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "升级训练桥接" })).not.toBeInTheDocument();
+  });
+
+  it("旧快照升级失败显示工作流错误并保留重试入口", async () => {
+    const user = userEvent.setup();
+    tauriState.snapshotBridgeStatus = "legacy";
+    tauriState.upgradeSnapshotShouldFail = true;
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));
+
+    expect(await screen.findByText("训练桥接升级失败：source asset changed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "升级训练桥接" })).toBeInTheDocument();
+  });
+
+  it("ready 快照不显示升级入口", async () => {
+    const user = userEvent.setup();
+    tauriState.snapshotBridgeStatus = "ready";
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(screen.getByRole("button", { name: "快照" }));
+
+    expect(screen.queryByRole("button", { name: "升级训练桥接" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重新生成训练桥接" })).not.toBeInTheDocument();
+  });
+
+  it("invalid 快照显示重新生成训练桥接入口", async () => {
+    const user = userEvent.setup();
+    tauriState.snapshotBridgeStatus = "invalid";
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(screen.getByRole("button", { name: "快照" }));
+
+    expect(await screen.findByRole("button", { name: "重新生成训练桥接" })).toBeInTheDocument();
   });
 });
