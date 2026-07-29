@@ -275,10 +275,15 @@ where
 }
 
 fn validate_non_empty_string(value: &str) -> Result<(), &'static str> {
-    if !value.is_empty() && value.trim() == value {
+    let has_boundary_whitespace = value.chars().next().is_some_and(char::is_whitespace)
+        || value.chars().next_back().is_some_and(char::is_whitespace);
+    if !value.is_empty()
+        && !has_boundary_whitespace
+        && value.chars().all(|character| !character.is_control())
+    {
         Ok(())
     } else {
-        Err("value must be non-empty and have no surrounding whitespace")
+        Err("value must be non-empty, have no boundary whitespace, and contain no controls")
     }
 }
 
@@ -676,5 +681,57 @@ mod tests {
             manifest.validate().unwrap();
             serde_json::to_string(&manifest).unwrap();
         }
+    }
+
+    #[test]
+    fn manifest_strings_reject_controls_but_allow_internal_spaces() {
+        let mut invalid_manifests = Vec::new();
+
+        let mut snapshot_lf = valid_manifest();
+        snapshot_lf.snapshot_name = "Training\nsnapshot".to_string();
+        invalid_manifests.push(("snapshot_name internal LF", snapshot_lf));
+
+        let mut class_cr = valid_manifest();
+        class_cr.classes[0].label = "per\rson".to_string();
+        invalid_manifests.push(("class label internal CR", class_cr));
+
+        let mut format_control = valid_manifest();
+        format_control.annotation_format = "visualai\u{0085}normalized/v1".to_string();
+        invalid_manifests.push(("annotation_format internal control", format_control));
+
+        let mut snapshot_trailing_lf = valid_manifest();
+        snapshot_trailing_lf.snapshot_name = "Training snapshot\n".to_string();
+        invalid_manifests.push(("snapshot_name trailing LF", snapshot_trailing_lf));
+
+        let mut snapshot_leading_nbsp = valid_manifest();
+        snapshot_leading_nbsp.snapshot_name = "\u{00a0}Training snapshot".to_string();
+        invalid_manifests.push((
+            "snapshot_name leading Unicode whitespace",
+            snapshot_leading_nbsp,
+        ));
+
+        let mut label_trailing_ideographic_space = valid_manifest();
+        label_trailing_ideographic_space.classes[0].label = "person\u{3000}".to_string();
+        invalid_manifests.push((
+            "class label trailing Unicode whitespace",
+            label_trailing_ideographic_space,
+        ));
+
+        let mut project_id_control = valid_manifest();
+        project_id_control.project_id = "project\r1".to_string();
+        invalid_manifests.push(("stable ID internal control", project_id_control));
+
+        for (label, manifest) in invalid_manifests {
+            assert!(
+                serde_json::to_string(&manifest).is_err(),
+                "{label} unexpectedly serialized"
+            );
+        }
+
+        let mut internal_spaces = valid_manifest();
+        internal_spaces.snapshot_name = "Training snapshot".to_string();
+        internal_spaces.classes[0].label = "traffic light".to_string();
+        internal_spaces.annotation_format = "visualai normalized/v1".to_string();
+        serde_json::to_string(&internal_spaces).unwrap();
     }
 }
