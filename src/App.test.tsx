@@ -12,6 +12,7 @@ const tauriState = vi.hoisted(() => ({
   snapshotBridgeStatus: "none",
   upgradeSnapshotShouldFail: false,
   upgradeSnapshotPromise: null as Promise<Record<string, unknown>> | null,
+  includeSecondLegacySnapshot: false,
 }));
 
 function deferred<T>() {
@@ -353,7 +354,7 @@ vi.mock("@tauri-apps/api/core", () => ({
           bridgeStatus: "legacy",
         }];
       }
-      return [{
+      const snapshots = [{
         id: "snapshot-legacy",
         name: "Legacy snapshot",
         imageCount: 1,
@@ -364,6 +365,18 @@ vi.mock("@tauri-apps/api/core", () => ({
           : undefined,
         bridgeStatus: tauriState.snapshotBridgeStatus,
       }];
+      if (tauriState.includeSecondLegacySnapshot) {
+        snapshots.push({
+          id: "snapshot-legacy-2",
+          name: "Second legacy snapshot",
+          imageCount: 1,
+          manifestPath: "snapshots/snapshot-legacy-2/manifest.json",
+          createdAt: "1778638137",
+          bridgeManifestPath: undefined,
+          bridgeStatus: "legacy",
+        });
+      }
+      return snapshots;
     }
 
     if (command === "create_dataset_snapshot") {
@@ -566,6 +579,7 @@ beforeEach(() => {
   tauriState.snapshotBridgeStatus = "none";
   tauriState.upgradeSnapshotShouldFail = false;
   tauriState.upgradeSnapshotPromise = null;
+  tauriState.includeSecondLegacySnapshot = false;
   vi.stubGlobal(
     "fetch",
     vi.fn(async () => {
@@ -1675,5 +1689,50 @@ describe("desktop shell", () => {
 
     expect(screen.queryByText("训练桥接升级失败：old project upgrade failed")).not.toBeInTheDocument();
     expect(screen.getByText("Classification snapshot")).toBeInTheDocument();
+  });
+
+  it("同项目不同快照快速触发时只发送一个训练桥接升级请求", async () => {
+    const user = userEvent.setup();
+    const upgrade = deferred<Record<string, unknown>>();
+    tauriState.snapshotBridgeStatus = "legacy";
+    tauriState.includeSecondLegacySnapshot = true;
+    tauriState.upgradeSnapshotPromise = upgrade.promise;
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(screen.getByRole("button", { name: "快照" }));
+    const upgradeButtons = await screen.findAllByRole("button", { name: "升级训练桥接" });
+    fireEvent.click(upgradeButtons[0]);
+    fireEvent.click(upgradeButtons[1]);
+
+    expect(
+      vi.mocked(invoke).mock.calls.filter(
+        ([command]) => command === "upgrade_dataset_snapshot_bridge",
+      ),
+    ).toHaveLength(1);
+    await waitFor(() => {
+      const bridgeButtons = screen
+        .getAllByRole("button")
+        .filter((button) => button.textContent?.includes("训练桥接"));
+      expect(bridgeButtons).toHaveLength(2);
+      expect(
+        bridgeButtons.every((button) => (button as HTMLButtonElement).disabled),
+      ).toBe(true);
+    });
+
+    await act(async () => {
+      upgrade.resolve({
+        id: "snapshot-legacy",
+        name: "Legacy snapshot",
+        imageCount: 1,
+        manifestPath: "snapshots/snapshot-legacy/manifest.json",
+        createdAt: "1778638138",
+        bridgeManifestPath: "snapshots/snapshot-legacy/visualai-bridge.json",
+        bridgeStatus: "ready",
+      });
+      await Promise.resolve();
+    });
+
+    expect(await screen.findByRole("button", { name: "升级训练桥接" })).toBeEnabled();
   });
 });

@@ -1888,6 +1888,10 @@ function ProjectWorkspace({
 }) {
   const activeProjectIdRef = useRef(projectId);
   activeProjectIdRef.current = projectId;
+  const upgradeRequestRef = useRef<{ projectId: string; snapshotId: string } | null>(null);
+  if (upgradeRequestRef.current?.projectId !== projectId) {
+    upgradeRequestRef.current = null;
+  }
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [images, setImages] = useState<DatasetImage[]>([]);
   const [snapshots, setSnapshots] = useState<DatasetSnapshot[]>([]);
@@ -2043,7 +2047,12 @@ function ProjectWorkspace({
   }
 
   async function handleUpgradeSnapshotBridge(snapshotId: string) {
+    if (upgradeRequestRef.current) {
+      return;
+    }
     const requestProjectId = projectId;
+    const request = { projectId: requestProjectId, snapshotId };
+    upgradeRequestRef.current = request;
     setUpgradingSnapshotId(snapshotId);
     setWorkflowMessage(null);
     try {
@@ -2063,6 +2072,10 @@ function ProjectWorkspace({
         `训练桥接升级失败：${error instanceof Error ? error.message : String(error)}`,
       );
     } finally {
+      if (upgradeRequestRef.current !== request) {
+        return;
+      }
+      upgradeRequestRef.current = null;
       if (activeProjectIdRef.current === requestProjectId) {
         setUpgradingSnapshotId(null);
       }
@@ -2673,7 +2686,7 @@ function renderProjectTab(
                   <span>{snapshot.bridgeStatus === "ready" ? "训练桥接已就绪" : "训练桥接待生成"}</span>
                   {snapshot.bridgeStatus !== "ready" ? (
                     <button
-                      disabled={workflow.upgradingSnapshotId === snapshot.id}
+                      disabled={workflow.upgradingSnapshotId !== null}
                       type="button"
                       onClick={() => workflow.onUpgradeSnapshotBridge(snapshot.id)}
                     >
