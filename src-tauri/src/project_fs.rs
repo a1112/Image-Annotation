@@ -40,9 +40,20 @@ pub fn workspace_root() -> PathBuf {
 
 #[cfg(test)]
 pub fn workspace_root() -> PathBuf {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
+
+    let mut test_thread = DefaultHasher::new();
+    std::thread::current()
+        .name()
+        .unwrap_or("unnamed-test-thread")
+        .hash(&mut test_thread);
     std::env::temp_dir().join(format!(
-        "image-annotation-tests-{}",
-        std::process::id()
+        "image-annotation-tests-{}-{:016x}",
+        std::process::id(),
+        test_thread.finish()
     ))
 }
 
@@ -212,6 +223,29 @@ fn list_project_manifests_from(root: PathBuf) -> Vec<ProjectManifest> {
             serde_json::from_str(&data).ok()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_root_isolated_by_test_thread() {
+        let first = std::thread::Builder::new()
+            .name("workspace-root-test-a".to_string())
+            .spawn(workspace_root)
+            .unwrap()
+            .join()
+            .unwrap();
+        let second = std::thread::Builder::new()
+            .name("workspace-root-test-b".to_string())
+            .spawn(workspace_root)
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert_ne!(first, second);
+    }
 }
 
 pub fn safe_extract_path(root: &Path, entry_name: &str) -> Option<PathBuf> {

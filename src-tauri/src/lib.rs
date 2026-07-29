@@ -1560,17 +1560,34 @@ mod tests {
 
     #[test]
     fn backend_repository_exposes_dataset_project_details() {
+        let project_id = "repository-detail-unit";
+        let paths = project_fs::ensure_workspace_project_dirs(project_id).unwrap();
+        project_fs::write_manifest(&project_fs::ProjectManifest {
+            id: project_id.to_string(),
+            name: "Repository Detail Unit".to_string(),
+            source_dataset_key: "unit-fixture".to_string(),
+            format: "yolo-detect".to_string(),
+            root_path: paths.root.to_string_lossy().to_string(),
+            created_at: "0".to_string(),
+            class_count: 1,
+            image_count: 1,
+        })
+        .unwrap();
+
         let repository = domain::SampleRepository::new();
         let projects = repository.dataset_projects();
         assert!(projects.iter().all(|project| !project.id.is_empty()));
+        let project = projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .expect("fixture project is listed");
+        let detail = repository
+            .project_detail(&project.id)
+            .expect("project detail exists for listed project");
+        assert_eq!(detail.project.id, project.id);
+        assert!(detail.tag_groups.iter().any(|group| group.name == "train"));
 
-        if let Some(project) = projects.first() {
-            let detail = repository
-                .project_detail(&project.id)
-                .expect("project detail exists for listed project");
-            assert_eq!(detail.project.id, project.id);
-            assert!(detail.tag_groups.iter().any(|group| group.name == "train"));
-        }
+        let _ = std::fs::remove_dir_all(paths.root);
     }
 
     #[test]
