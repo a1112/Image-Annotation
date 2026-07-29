@@ -12,6 +12,7 @@ const tauriState = vi.hoisted(() => ({
   snapshotBridgeStatus: "none",
   upgradeSnapshotShouldFail: false,
   upgradeSnapshotPromise: null as Promise<Record<string, unknown>> | null,
+  upgradeSnapshotPromiseQueue: [] as Array<Promise<Record<string, unknown>>>,
   includeSecondLegacySnapshot: false,
 }));
 
@@ -390,6 +391,9 @@ vi.mock("@tauri-apps/api/core", () => ({
     }
 
     if (command === "upgrade_dataset_snapshot_bridge") {
+      if (tauriState.upgradeSnapshotPromiseQueue.length > 0) {
+        return await tauriState.upgradeSnapshotPromiseQueue.shift();
+      }
       if (tauriState.upgradeSnapshotPromise) {
         return await tauriState.upgradeSnapshotPromise;
       }
@@ -579,6 +583,7 @@ beforeEach(() => {
   tauriState.snapshotBridgeStatus = "none";
   tauriState.upgradeSnapshotShouldFail = false;
   tauriState.upgradeSnapshotPromise = null;
+  tauriState.upgradeSnapshotPromiseQueue = [];
   tauriState.includeSecondLegacySnapshot = false;
   vi.stubGlobal(
     "fetch",
@@ -1734,5 +1739,110 @@ describe("desktop shell", () => {
     });
 
     expect(await screen.findByRole("button", { name: "升级训练桥接" })).toBeEnabled();
+  });
+
+  it("A-B-A 后旧成功结果不能污染同项目的新升级请求", async () => {
+    const user = userEvent.setup();
+    const staleUpgrade = deferred<Record<string, unknown>>();
+    const currentUpgrade = deferred<Record<string, unknown>>();
+    tauriState.snapshotBridgeStatus = "legacy";
+    tauriState.upgradeSnapshotPromiseQueue = [
+      staleUpgrade.promise,
+      currentUpgrade.promise,
+    ];
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));
+
+    window.location.hash = "#/datasets/classification-demo";
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    expect(await screen.findByText("Classification snapshot")).toBeInTheDocument();
+    window.location.hash = "#/datasets/coco128";
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    expect(await screen.findByText("Legacy snapshot")).toBeInTheDocument();
+    await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));
+    expect(screen.getByRole("button", { name: "正在生成训练桥接…" })).toBeDisabled();
+
+    await act(async () => {
+      staleUpgrade.resolve({
+        id: "snapshot-legacy",
+        name: "Stale snapshot result",
+        imageCount: 1,
+        manifestPath: "snapshots/snapshot-legacy/manifest.json",
+        createdAt: "1778638138",
+        bridgeManifestPath: "snapshots/snapshot-legacy/visualai-bridge.json",
+        bridgeStatus: "ready",
+      });
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("训练桥接已就绪：Stale snapshot result")).not.toBeInTheDocument();
+    expect(screen.queryByText("Stale snapshot result")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "正在生成训练桥接…" })).toBeDisabled();
+
+    await act(async () => {
+      currentUpgrade.resolve({
+        id: "snapshot-legacy",
+        name: "Current snapshot result",
+        imageCount: 1,
+        manifestPath: "snapshots/snapshot-legacy/manifest.json",
+        createdAt: "1778638138",
+        bridgeManifestPath: "snapshots/snapshot-legacy/visualai-bridge.json",
+        bridgeStatus: "ready",
+      });
+      await Promise.resolve();
+    });
+
+    expect(await screen.findByText("训练桥接已就绪：Current snapshot result")).toBeInTheDocument();
+    expect(screen.getByText("Current snapshot result")).toBeInTheDocument();
+  });
+
+  it("A-B-A 后旧失败结果不能污染同项目的新升级请求", async () => {
+    const user = userEvent.setup();
+    const staleUpgrade = deferred<Record<string, unknown>>();
+    const currentUpgrade = deferred<Record<string, unknown>>();
+    tauriState.snapshotBridgeStatus = "legacy";
+    tauriState.upgradeSnapshotPromiseQueue = [
+      staleUpgrade.promise,
+      currentUpgrade.promise,
+    ];
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));
+
+    window.location.hash = "#/datasets/classification-demo";
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    expect(await screen.findByText("Classification snapshot")).toBeInTheDocument();
+    window.location.hash = "#/datasets/coco128";
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    expect(await screen.findByText("Legacy snapshot")).toBeInTheDocument();
+    await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));
+
+    await act(async () => {
+      staleUpgrade.reject(new Error("stale ABA upgrade failed"));
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("训练桥接升级失败：stale ABA upgrade failed")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "正在生成训练桥接…" })).toBeDisabled();
+
+    await act(async () => {
+      currentUpgrade.resolve({
+        id: "snapshot-legacy",
+        name: "Current snapshot result",
+        imageCount: 1,
+        manifestPath: "snapshots/snapshot-legacy/manifest.json",
+        createdAt: "1778638138",
+        bridgeManifestPath: "snapshots/snapshot-legacy/visualai-bridge.json",
+        bridgeStatus: "ready",
+      });
+      await Promise.resolve();
+    });
+
+    expect(await screen.findByText("训练桥接已就绪：Current snapshot result")).toBeInTheDocument();
   });
 });

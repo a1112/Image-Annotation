@@ -2057,7 +2057,10 @@ function ProjectWorkspace({
     setWorkflowMessage(null);
     try {
       const upgraded = await upgradeDatasetSnapshotBridge(requestProjectId, snapshotId);
-      if (activeProjectIdRef.current !== requestProjectId) {
+      if (
+        activeProjectIdRef.current !== requestProjectId
+        || upgradeRequestRef.current !== request
+      ) {
         return;
       }
       setSnapshots((current) =>
@@ -2065,7 +2068,10 @@ function ProjectWorkspace({
       );
       setWorkflowMessage(`训练桥接已就绪：${upgraded.name}`);
     } catch (error) {
-      if (activeProjectIdRef.current !== requestProjectId) {
+      if (
+        activeProjectIdRef.current !== requestProjectId
+        || upgradeRequestRef.current !== request
+      ) {
         return;
       }
       setWorkflowMessage(
