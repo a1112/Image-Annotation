@@ -54,21 +54,42 @@ impl BridgeManifest {
             .map_err(|error| format!("created_at: {error}"))?;
         validate_non_empty_string(&self.annotation_format)
             .map_err(|error| format!("annotation_format: {error}"))?;
+        if self.annotation_format != BRIDGE_ANNOTATION_FORMAT {
+            return Err(format!(
+                "unsupported bridge annotation format: {}",
+                self.annotation_format
+            ));
+        }
         validate_safe_relative_path(&self.asset_root)
             .map_err(|error| format!("asset_root: {error}"))?;
 
+        let mut class_ids = BTreeSet::new();
         for (class_index, class) in self.classes.iter().enumerate() {
             validate_stable_id(&class.id)
                 .map_err(|error| format!("classes[{class_index}].id: {error}"))?;
             validate_non_empty_string(&class.label)
                 .map_err(|error| format!("classes[{class_index}].label: {error}"))?;
+            if !class_ids.insert(class.id.as_str()) {
+                return Err(format!("duplicate class id: {}", class.id));
+            }
         }
 
+        let mut sample_ids = BTreeSet::new();
+        let mut sample_paths = BTreeSet::new();
         for (sample_index, sample) in self.samples.iter().enumerate() {
             let prefix = format!("samples[{sample_index}]");
             validate_stable_id(&sample.id).map_err(|error| format!("{prefix}.id: {error}"))?;
+            if !sample_ids.insert(sample.id.as_str()) {
+                return Err(format!("duplicate sample id: {}", sample.id));
+            }
             validate_safe_relative_path(&sample.relative_path)
                 .map_err(|error| format!("{prefix}.relative_path: {error}"))?;
+            if !sample_paths.insert(sample.relative_path.as_str()) {
+                return Err(format!(
+                    "duplicate sample relative_path: {}",
+                    sample.relative_path
+                ));
+            }
             validate_positive_u32(sample.width)
                 .map_err(|error| format!("{prefix}.width: {error}"))?;
             validate_positive_u32(sample.height)
@@ -86,8 +107,29 @@ impl BridgeManifest {
                 }
             }
 
+            let mut object_ids = BTreeSet::new();
             for (object_index, object) in sample.objects.iter().enumerate() {
                 let object_prefix = format!("{prefix}.objects[{object_index}]");
+                let object_id = bridge_object_id(object);
+                if !object_ids.insert(object_id) {
+                    return Err(format!(
+                        "duplicate object id '{}' in sample '{}'",
+                        object_id, sample.id
+                    ));
+                }
+                let class_id = bridge_object_class_id(object);
+                if !class_ids.contains(class_id) {
+                    return Err(format!(
+                        "object '{}' references unknown class '{}'",
+                        object_id, class_id
+                    ));
+                }
+                if !bridge_object_matches_task(&self.task_type, object) {
+                    return Err(format!(
+                        "object '{}' is incompatible with task {:?}",
+                        object_id, self.task_type
+                    ));
+                }
                 match object {
                     BridgeObject::Bbox {
                         id,
@@ -350,69 +392,28 @@ fn build_bridge_manifest(
     };
     let asset_root = relative_asset_root(snapshot_dir, input.asset_root)?;
 
-    let mut class_ids = BTreeSet::new();
     let mut classes = input
         .classes
         .iter()
-        .map(|class| {
-            let id = class.id.to_string();
-            if !class_ids.insert(id.clone()) {
-                return Err(format!("duplicate bridge class id: {id}"));
-            }
-            Ok(BridgeClass {
-                id,
-                label: class.label.clone(),
-            })
+        .map(|class| BridgeClass {
+            id: class.id.to_string(),
+            label: class.label.clone(),
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Vec<_>>();
     classes.sort_by(|left, right| {
         left.id
             .cmp(&right.id)
             .then_with(|| left.label.cmp(&right.label))
     });
 
-    let mut sample_ids = BTreeSet::new();
-    let mut sample_paths = BTreeSet::new();
     let mut samples = Vec::with_capacity(input.samples.len());
     for source in input.samples {
-        if !sample_ids.insert(source.id.clone()) {
-            return Err(format!("duplicate bridge sample id: {}", source.id));
-        }
         validate_safe_relative_path(&source.relative_path)
             .map_err(|error| format!("sample '{}': {error}", source.id))?;
-        if !sample_paths.insert(source.relative_path.clone()) {
-            return Err(format!(
-                "duplicate bridge sample path: {}",
-                source.relative_path
-            ));
-        }
 
         let asset_path = input.asset_root.join(Path::new(&source.relative_path));
         let (size_bytes, sha256) = stream_file_integrity(&asset_path)?;
         let mut objects = source.objects.clone();
-        let mut object_ids = BTreeSet::new();
-        for object in &objects {
-            let id = bridge_object_id(object);
-            if !object_ids.insert(id.to_string()) {
-                return Err(format!(
-                    "duplicate bridge object id '{}' in sample '{}'",
-                    id, source.id
-                ));
-            }
-            let class_id = bridge_object_class_id(object);
-            if !class_ids.contains(class_id) {
-                return Err(format!(
-                    "bridge object '{}' references unknown class '{}'",
-                    id, class_id
-                ));
-            }
-            if !bridge_object_matches_task(&task_type, object) {
-                return Err(format!(
-                    "bridge object '{}' is incompatible with project task {:?}",
-                    id, task_type
-                ));
-            }
-        }
         objects.sort_by(|left, right| {
             bridge_object_id(left)
                 .cmp(bridge_object_id(right))
@@ -1445,7 +1446,6 @@ mod tests {
         let mut internal_spaces = valid_manifest();
         internal_spaces.snapshot_name = "Training snapshot".to_string();
         internal_spaces.classes[0].label = "traffic light".to_string();
-        internal_spaces.annotation_format = "visualai normalized/v1".to_string();
         serde_json::to_string(&internal_spaces).unwrap();
     }
 }

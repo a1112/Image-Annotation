@@ -867,14 +867,15 @@ fn rebuild_sqlite_index_if_needed(source: &BuiltinDatasetSource) -> Result<(), S
         .ok_or_else(|| format!("project manifest not found: {}", source.key))?;
     let index_is_current = manifest.image_count == images.len() as u32
         && stored_images.len() == images.len()
-        && stored_images
+        && (stored_images
             .iter()
             .zip(images.iter())
             .all(|(stored, indexed)| {
                 stored.file_name == indexed.file_name
                     && stored.width == indexed.width
                     && stored.height == indexed.height
-            });
+            })
+            || legacy_basename_index_matches(&stored_images, &images));
     if index_is_current {
         return Ok(());
     }
@@ -882,6 +883,27 @@ fn rebuild_sqlite_index_if_needed(source: &BuiltinDatasetSource) -> Result<(), S
     project_fs::write_manifest(&manifest)?;
     storage::initialize_project_database(&paths.sqlite)?;
     storage::upsert_project_index(&paths.sqlite, &manifest, &images, &classes)
+}
+
+fn legacy_basename_index_matches(
+    stored_images: &[storage::StoredImage],
+    indexed_images: &[storage::StoredImage],
+) -> bool {
+    stored_images.iter().all(|stored| {
+        let stored_path = Path::new(&stored.file_name);
+        if stored_path.components().count() != 1 {
+            return false;
+        }
+        indexed_images
+            .iter()
+            .filter(|indexed| {
+                Path::new(&indexed.file_name).file_name() == stored_path.file_name()
+                    && indexed.width == stored.width
+                    && indexed.height == stored.height
+            })
+            .count()
+            == 1
+    })
 }
 
 fn count_images(raw_root: &Path) -> u32 {
@@ -912,13 +934,14 @@ fn indexed_images(raw_root: &Path) -> Vec<storage::StoredImage> {
         .map(|path| {
             let (width, height) = oriented_image_dimensions(&path);
             let file_name = path
-                .file_name()
-                .map(|value| value.to_string_lossy().to_string())
-                .unwrap_or_else(|| "image.jpg".to_string());
-            let id = path
-                .file_stem()
-                .map(|value| value.to_string_lossy().to_string())
-                .unwrap_or_else(|| file_name.clone());
+                .strip_prefix(raw_root)
+                .map(|value| value.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| {
+                    path.file_name()
+                        .map(|value| value.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "image.jpg".to_string())
+                });
+            let id = image_id_from_relative(&file_name);
             storage::StoredImage {
                 id,
                 file_name,
@@ -1391,6 +1414,66 @@ fn path_contains_segment(path: &Path, segment: &str) -> bool {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn rebuild_preserves_legacy_basename_ids_and_annotations() {
+        let source = BuiltinDatasetSource {
+            key: "legacy-rebuild-unit".to_string(),
+            name: "Legacy Rebuild".to_string(),
+            description: "fixture".to_string(),
+            task_type: "目标检测".to_string(),
+            format: "yolo-detect".to_string(),
+            download_url: "fixture://unit".to_string(),
+        };
+        let paths = project_fs::test_project_paths(&source.key);
+        let _ = fs::remove_dir_all(&paths.root);
+        project_fs::ensure_test_project_dirs(&source.key).unwrap();
+        fs::create_dir_all(paths.raw.join("images/train")).unwrap();
+        write_demo_image(&paths.raw.join("images/train/legacy.png"), 1).unwrap();
+        let manifest = project_fs::ProjectManifest {
+            id: source.key.clone(),
+            name: source.name.clone(),
+            source_dataset_key: "downloaded".to_string(),
+            format: source.format.clone(),
+            root_path: paths.root.to_string_lossy().to_string(),
+            created_at: now_unix_string(),
+            class_count: 1,
+            image_count: 1,
+        };
+        project_fs::write_manifest_to_path(&manifest, &paths.manifest).unwrap();
+        storage::initialize_project_database(&paths.sqlite).unwrap();
+        storage::upsert_project_index(
+            &paths.sqlite,
+            &manifest,
+            &[storage::StoredImage {
+                id: "legacy".to_string(),
+                file_name: "legacy.png".to_string(),
+                width: 640,
+                height: 420,
+                split: "train".to_string(),
+                status: "已标注".to_string(),
+                qa_status: String::new(),
+                review_note: None,
+            }],
+            &[storage::StoredClass {
+                id: 0,
+                label: "object".to_string(),
+                color: "#ffffff".to_string(),
+            }],
+        )
+        .unwrap();
+        storage::save_annotation_payload(&paths.sqlite, "legacy", None, "[]").unwrap();
+
+        rebuild_sqlite_index_if_needed(&source).unwrap();
+
+        let stored = storage::read_images(&paths.sqlite, None).unwrap();
+        assert_eq!(stored[0].id, "legacy");
+        assert_eq!(stored[0].file_name, "legacy.png");
+        assert!(storage::read_annotation_payload(&paths.sqlite, "legacy")
+            .unwrap()
+            .is_some());
+        let _ = fs::remove_dir_all(paths.root);
+    }
 
     #[test]
     fn imports_dataset_archive_into_manifest_and_sqlite_index() {

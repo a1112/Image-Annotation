@@ -812,6 +812,183 @@ impl SampleRepository {
         }
     }
 
+    fn snapshot_annotation_state_strict(
+        &self,
+        paths: &project_fs::ProjectPaths,
+        project: &project_fs::ProjectManifest,
+        classes: &[storage::StoredClass],
+        source_asset_root: &Path,
+        image: &DatasetImage,
+    ) -> Result<AnnotationState, String> {
+        let image_path = resolve_snapshot_image_path(
+            source_asset_root,
+            &paths.raw,
+            &image.file_name,
+            &image.id,
+        )?;
+        let (image_width, image_height) =
+            image::image_dimensions(&image_path).map_err(|error| {
+                format!(
+                    "read image dimensions for '{}' at {}: {error}",
+                    image.id,
+                    image_path.display()
+                )
+            })?;
+
+        if let Some(payload) = storage::read_annotation_payload(&paths.sqlite, &image.id)? {
+            let objects = serde_json::from_str::<Vec<AnnotationObject>>(&payload.object_json)
+                .map_err(|error| {
+                    format!(
+                        "invalid SQLite annotation payload for image '{}': {error}",
+                        image.id
+                    )
+                })?;
+            return Ok(AnnotationState {
+                image_id: image.id.clone(),
+                revision: Some(payload.revision),
+                objects,
+                status: image.status.clone(),
+                updated_at: Some(payload.updated_at),
+            });
+        }
+
+        let native_path = paths.annotations.join(format!("{}.json", image.id));
+        if native_path.exists() {
+            let data = fs::read_to_string(&native_path).map_err(|error| {
+                format!(
+                    "read native annotation for image '{}' at {}: {error}",
+                    image.id,
+                    native_path.display()
+                )
+            })?;
+            if let Ok(state) = serde_json::from_str::<AnnotationState>(&data) {
+                return Ok(state);
+            }
+            let objects =
+                serde_json::from_str::<Vec<AnnotationObject>>(&data).map_err(|error| {
+                    format!(
+                        "invalid native annotation JSON for image '{}' at {}: {error}",
+                        image.id,
+                        native_path.display()
+                    )
+                })?;
+            return Ok(AnnotationState {
+                image_id: image.id.clone(),
+                revision: None,
+                objects,
+                status: image.status.clone(),
+                updated_at: None,
+            });
+        }
+
+        if project.format == "image-classification" {
+            let objects = classification_for_image(&image_path, classes)
+                .map(|(class_id, label)| {
+                    vec![AnnotationObject::classification(
+                        format!("classification-{}", image.id),
+                        class_id,
+                        label,
+                    )]
+                })
+                .unwrap_or_default();
+            return Ok(AnnotationState {
+                image_id: image.id.clone(),
+                revision: None,
+                objects,
+                status: image.status.clone(),
+                updated_at: None,
+            });
+        }
+
+        let labels = classes
+            .iter()
+            .map(|class| class.label.clone())
+            .collect::<Vec<_>>();
+        if project.format == "voc-detect" {
+            let label_path = image_path.with_extension("xml");
+            let objects = if label_path.exists() {
+                let xml = fs::read_to_string(&label_path).map_err(|error| {
+                    format!(
+                        "read VOC annotation for image '{}' at {}: {error}",
+                        image.id,
+                        label_path.display()
+                    )
+                })?;
+                voc::parse_voc_annotations(&xml, &labels).map_err(|error| {
+                    format!(
+                        "invalid VOC annotation for image '{}' at {}: {error}",
+                        image.id,
+                        label_path.display()
+                    )
+                })?
+            } else {
+                Vec::new()
+            };
+            return Ok(AnnotationState {
+                image_id: image.id.clone(),
+                revision: None,
+                objects,
+                status: image.status.clone(),
+                updated_at: None,
+            });
+        }
+
+        let label_path = [Path::new(&project.root_path), paths.raw.as_path()]
+            .into_iter()
+            .filter_map(|root| fs::canonicalize(root).ok())
+            .find_map(|root| label_path_for_image(&root, &image_path))
+            .or_else(|| {
+                let adjacent = image_path.with_extension("txt");
+                adjacent.is_file().then_some(adjacent)
+            });
+        let Some(label_path) = label_path else {
+            return Ok(AnnotationState {
+                image_id: image.id.clone(),
+                revision: None,
+                objects: Vec::new(),
+                status: image.status.clone(),
+                updated_at: None,
+            });
+        };
+        let label_data = fs::read_to_string(&label_path).map_err(|error| {
+            format!(
+                "read YOLO annotation for image '{}' at {}: {error}",
+                image.id,
+                label_path.display()
+            )
+        })?;
+        let prefer_polygon = project.format == "yolo-seg";
+        let mut objects = Vec::new();
+        for (index, line) in label_data.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let object = yolo::line_to_annotation(
+                line,
+                image_width,
+                image_height,
+                &labels,
+                index,
+                prefer_polygon,
+            )
+            .map_err(|error| {
+                format!(
+                    "invalid YOLO annotation for image '{}' at line {}: {error}",
+                    image.id,
+                    index + 1
+                )
+            })?;
+            objects.push(object);
+        }
+        Ok(AnnotationState {
+            image_id: image.id.clone(),
+            revision: None,
+            objects,
+            status: image.status.clone(),
+            updated_at: None,
+        })
+    }
+
     pub fn save_image_annotations(
         &self,
         project_id: &str,
@@ -1073,11 +1250,40 @@ impl SampleRepository {
         name: &str,
     ) -> Result<DatasetSnapshot, String> {
         let paths = project_fs::ensure_project_dirs(project_id)?;
-        let images = self.project_images(project_id, None);
+        let project = storage::read_project_manifest(&paths.sqlite)?
+            .or_else(|| project_fs::read_manifest(project_id))
+            .ok_or_else(|| format!("project manifest not found: {project_id}"))?;
+        let classes = storage::read_classes(&paths.sqlite)?;
+        let source_asset_root = PathBuf::from(&project.root_path);
+        let source_asset_root = if source_asset_root.exists() {
+            source_asset_root
+        } else {
+            paths.raw.clone()
+        };
+        let images = storage::read_images(&paths.sqlite, None)?
+            .into_iter()
+            .map(|image| DatasetImage {
+                id: image.id,
+                file_name: image.file_name,
+                width: image.width,
+                height: image.height,
+                split: image.split.clone(),
+                status: image.status,
+                qa_status: image.qa_status,
+                review_note: image.review_note,
+                tags: vec![format!("split={}", image.split)],
+            })
+            .collect::<Vec<_>>();
         let snapshot_sources: Vec<_> = images
             .iter()
-            .map(|image| {
-                let state = self.image_annotation_state(project_id, &image.id);
+            .map(|image| -> Result<_, String> {
+                let state = self.snapshot_annotation_state_strict(
+                    &paths,
+                    &project,
+                    &classes,
+                    &source_asset_root,
+                    image,
+                )?;
                 let annotation = json!({
                     "imageId": image.id,
                     "fileName": image.file_name,
@@ -1088,9 +1294,9 @@ impl SampleRepository {
                     "revision": state.revision,
                     "objects": state.objects,
                 });
-                (image.clone(), state, annotation)
+                Ok((image.clone(), state, annotation))
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         let annotations = snapshot_sources
             .iter()
             .map(|(_, _, annotation)| annotation.clone())
@@ -1117,22 +1323,17 @@ impl SampleRepository {
             snapshot_dir_created = true;
             fs::write(&manifest_path, manifest_json).map_err(|err| err.to_string())?;
 
-            let project = project_manifest(project_id)
-                .ok_or_else(|| format!("project manifest not found: {project_id}"))?;
-            let classes = storage::read_classes(&paths.sqlite)?;
-            let source_asset_root = PathBuf::from(&project.root_path);
-            let source_asset_root = if source_asset_root.exists() {
-                source_asset_root
-            } else {
-                paths.raw.clone()
-            };
             let snapshot_asset_root = snapshot_dir.join("assets");
             fs::create_dir_all(&snapshot_asset_root).map_err(|err| err.to_string())?;
             let mut target_paths = BTreeSet::new();
             let mut bridge_samples = Vec::with_capacity(snapshot_sources.len());
             for (image, state, _) in &snapshot_sources {
-                let source_path =
-                    resolve_snapshot_image_path(&source_asset_root, &paths.raw, &image.file_name)?;
+                let source_path = resolve_snapshot_image_path(
+                    &source_asset_root,
+                    &paths.raw,
+                    &image.file_name,
+                    &image.id,
+                )?;
                 let relative_path = stable_snapshot_asset_path(&image.id, &source_path)?;
                 if !target_paths.insert(relative_path.clone()) {
                     return Err(format!(
@@ -1222,7 +1423,9 @@ impl SampleRepository {
                             serde_json::from_str::<crate::bridge::BridgeManifest>(&text).ok()
                         })
                         .is_some_and(|manifest| {
-                            manifest.project_id == project_id && manifest.snapshot_id == record.id
+                            manifest.validate().is_ok()
+                                && manifest.project_id == project_id
+                                && manifest.snapshot_id == record.id
                         });
                 let bridge_manifest_api_path = bridge_manifest_relative_path(&record.id);
                 DatasetSnapshot {
@@ -1515,6 +1718,7 @@ fn resolve_snapshot_image_path(
     asset_root: &Path,
     fallback_root: &Path,
     file_name: &str,
+    sample_id: &str,
 ) -> Result<PathBuf, String> {
     let relative = Path::new(file_name);
     if relative.as_os_str().is_empty()
@@ -1527,6 +1731,8 @@ fn resolve_snapshot_image_path(
         ));
     }
 
+    let roots = [asset_root, fallback_root];
+    let mut matches = BTreeSet::new();
     for (root, candidate) in [
         (asset_root, asset_root.join(relative)),
         (asset_root, asset_root.join("images").join(relative)),
@@ -1545,10 +1751,57 @@ fn resolve_snapshot_image_path(
             )
         })?;
         if canonical_candidate.starts_with(&canonical_root) {
-            return Ok(canonical_candidate);
+            matches.insert(canonical_candidate);
         }
     }
-    Err(format!("image asset not found for '{file_name}'"))
+    if matches.len() == 1 {
+        return Ok(matches.into_iter().next().unwrap());
+    }
+    if matches.len() > 1 {
+        return Err(format!(
+            "multiple image assets matched '{}' for sample '{}'",
+            file_name, sample_id
+        ));
+    }
+
+    if relative.components().count() == 1 {
+        let expected_name = relative.file_name();
+        for root in roots {
+            let Ok(canonical_root) = fs::canonicalize(root) else {
+                continue;
+            };
+            for entry in WalkDir::new(root)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file())
+            {
+                if entry.path().file_name() != expected_name
+                    || !image_id_matches(root, entry.path(), sample_id)
+                {
+                    continue;
+                }
+                let canonical_candidate = fs::canonicalize(entry.path()).map_err(|error| {
+                    format!(
+                        "resolve snapshot image asset {}: {error}",
+                        entry.path().display()
+                    )
+                })?;
+                if canonical_candidate.starts_with(&canonical_root) {
+                    matches.insert(canonical_candidate);
+                }
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => Err(format!("image asset not found for '{file_name}'")),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        _ => Err(format!(
+            "multiple image assets matched '{}' for sample '{}'",
+            file_name, sample_id
+        )),
+    }
 }
 
 fn copy_file_and_sync(source: &Path, target: &Path) -> Result<(), String> {
@@ -2111,6 +2364,126 @@ mod tests {
     use super::*;
 
     #[test]
+    fn demo_detection_project_publishes_ready_snapshot_bridge() {
+        let name = format!(
+            "Bridge Detection Demo {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let project =
+            crate::datasets::create_dataset_project(&name, "yolo-detect", "demo-bbox").unwrap();
+        let paths = project_fs::project_paths(&project.id);
+        let snapshot = SampleRepository::new()
+            .create_dataset_snapshot(&project.id, "training")
+            .unwrap();
+        let bridge_path = paths
+            .root
+            .join(snapshot.bridge_manifest_path.as_ref().unwrap());
+        let bridge: crate::bridge::BridgeManifest =
+            serde_json::from_str(&std::fs::read_to_string(bridge_path).unwrap()).unwrap();
+
+        assert_eq!(snapshot.bridge_status, "ready");
+        assert_eq!(bridge.task_type, crate::bridge::BridgeTaskType::Detection);
+        assert_eq!(bridge.samples.len(), 3);
+        assert!(bridge.samples.iter().all(|sample| paths
+            .snapshots
+            .join(&snapshot.id)
+            .join(&bridge.asset_root)
+            .join(&sample.relative_path)
+            .is_file()));
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn demo_classification_project_publishes_ready_snapshot_bridge() {
+        let name = format!(
+            "Bridge Classification Demo {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let project = crate::datasets::create_dataset_project(
+            &name,
+            "image-classification",
+            "demo-classification",
+        )
+        .unwrap();
+        let paths = project_fs::project_paths(&project.id);
+        let snapshot = SampleRepository::new()
+            .create_dataset_snapshot(&project.id, "training")
+            .unwrap();
+        let bridge_path = paths
+            .root
+            .join(snapshot.bridge_manifest_path.as_ref().unwrap());
+        let bridge: crate::bridge::BridgeManifest =
+            serde_json::from_str(&std::fs::read_to_string(bridge_path).unwrap()).unwrap();
+
+        assert_eq!(snapshot.bridge_status, "ready");
+        assert_eq!(
+            bridge.task_type,
+            crate::bridge::BridgeTaskType::Classification
+        );
+        assert_eq!(bridge.samples.len(), 3);
+        assert!(bridge.samples.iter().all(|sample| sample
+            .objects
+            .iter()
+            .all(|object| matches!(object, BridgeObject::Classification { .. }))));
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn legacy_basename_index_resolves_one_nested_asset_but_rejects_ambiguity() {
+        let repository = SampleRepository::new();
+        let project_id = "bridge-legacy-nested-unit";
+        let paths = project_fs::project_paths(project_id);
+        let _ = std::fs::remove_dir_all(&paths.root);
+        project_fs::ensure_workspace_project_dirs(project_id).unwrap();
+        storage::initialize_project_database(&paths.sqlite).unwrap();
+        std::fs::create_dir_all(paths.raw.join("images/train")).unwrap();
+        image::RgbImage::from_pixel(10, 10, image::Rgb([1, 2, 3]))
+            .save(paths.raw.join("images/train/nested.png"))
+            .unwrap();
+        let manifest = project_fs::ProjectManifest {
+            id: project_id.to_string(),
+            name: "Legacy Nested".to_string(),
+            source_dataset_key: "downloaded".to_string(),
+            format: "yolo-detect".to_string(),
+            root_path: paths.root.to_string_lossy().to_string(),
+            created_at: now_unix_string(),
+            class_count: 0,
+            image_count: 1,
+        };
+        let images = vec![storage::StoredImage {
+            id: "nested".to_string(),
+            file_name: "nested.png".to_string(),
+            width: 10,
+            height: 10,
+            split: "train".to_string(),
+            status: "已标注".to_string(),
+            qa_status: String::new(),
+            review_note: None,
+        }];
+        storage::upsert_project_index(&paths.sqlite, &manifest, &images, &[]).unwrap();
+
+        let snapshot = repository
+            .create_dataset_snapshot(project_id, "unique")
+            .unwrap();
+        assert_eq!(snapshot.bridge_status, "ready");
+
+        std::fs::create_dir_all(paths.raw.join("images/val")).unwrap();
+        image::RgbImage::from_pixel(10, 10, image::Rgb([4, 5, 6]))
+            .save(paths.raw.join("images/val/nested.png"))
+            .unwrap();
+        let ambiguous = repository.create_dataset_snapshot(project_id, "ambiguous");
+        assert!(ambiguous.is_err());
+        assert_eq!(repository.dataset_snapshots(project_id).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
     fn legacy_dataset_snapshot_json_defaults_bridge_fields() {
         let snapshot: DatasetSnapshot = serde_json::from_value(json!({
             "id": "snapshot-legacy",
@@ -2147,6 +2520,235 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].bridge_status, "invalid");
         assert_eq!(snapshots[0].bridge_manifest_path, None);
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn logically_invalid_bridge_manifests_are_not_listed_as_ready() {
+        let repository = SampleRepository::new();
+        let project_id = "bridge-logically-invalid-list-unit";
+        let paths = project_fs::project_paths(project_id);
+        let _ = std::fs::remove_dir_all(&paths.root);
+        project_fs::ensure_workspace_project_dirs(project_id).unwrap();
+        storage::initialize_project_database(&paths.sqlite).unwrap();
+        let base: serde_json::Value =
+            serde_json::from_str(include_str!("../../docs/protocol/fixtures/detection.json"))
+                .unwrap();
+        let mut snapshot_ids = Vec::new();
+
+        for (name, mutate) in [
+            ("duplicate-class", "duplicate_class"),
+            ("duplicate-sample-path", "duplicate_sample"),
+            ("duplicate-object", "duplicate_object"),
+            ("unknown-class", "unknown_class"),
+            ("task-object-mismatch", "task_mismatch"),
+            ("wrong-annotation-format", "wrong_format"),
+        ] {
+            let record = storage::create_snapshot_record(&paths.sqlite, name, "{}", 1).unwrap();
+            let mut value = base.clone();
+            value["project_id"] = json!(project_id);
+            value["snapshot_id"] = json!(record.id);
+            match mutate {
+                "duplicate_class" => {
+                    let duplicate = value["classes"][0].clone();
+                    value["classes"].as_array_mut().unwrap().push(duplicate);
+                }
+                "duplicate_sample" => {
+                    let duplicate = value["samples"][0].clone();
+                    value["samples"].as_array_mut().unwrap().push(duplicate);
+                }
+                "duplicate_object" => {
+                    let duplicate = value["samples"][0]["objects"][0].clone();
+                    value["samples"][0]["objects"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(duplicate);
+                }
+                "unknown_class" => {
+                    value["samples"][0]["objects"][0]["class_id"] = json!("missing-class");
+                }
+                "task_mismatch" => {
+                    value["task_type"] = json!("classification");
+                }
+                "wrong_format" => {
+                    value["annotation_format"] = json!("other.normalized/v1");
+                }
+                _ => unreachable!(),
+            }
+            let snapshot_dir = paths.snapshots.join(&record.id);
+            std::fs::create_dir_all(&snapshot_dir).unwrap();
+            std::fs::write(
+                snapshot_dir.join("visualai-bridge.json"),
+                serde_json::to_vec_pretty(&value).unwrap(),
+            )
+            .unwrap();
+            snapshot_ids.push(record.id);
+        }
+
+        let snapshots = repository.dataset_snapshots(project_id).unwrap();
+        for snapshot_id in snapshot_ids {
+            let snapshot = snapshots
+                .iter()
+                .find(|snapshot| snapshot.id == snapshot_id)
+                .unwrap();
+            assert_eq!(
+                snapshot.bridge_status, "invalid",
+                "{} unexpectedly ready",
+                snapshot.name
+            );
+            assert_eq!(snapshot.bridge_manifest_path, None);
+        }
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn snapshot_rejects_malformed_yolo_line_and_compensates() {
+        let name = format!(
+            "Bridge Malformed YOLO {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let project =
+            crate::datasets::create_dataset_project(&name, "yolo-detect", "demo-bbox").unwrap();
+        let paths = project_fs::project_paths(&project.id);
+        std::fs::write(
+            paths.raw.join("labels/train/demo_001.txt"),
+            "0 0.5 0.5 0.2 0.2\nthis line is malformed\n",
+        )
+        .unwrap();
+        let manifest = storage::read_project_manifest(&paths.sqlite)
+            .unwrap()
+            .unwrap();
+        let classes = storage::read_classes(&paths.sqlite).unwrap();
+        let image = SampleRepository::new()
+            .project_images(&project.id, None)
+            .into_iter()
+            .next()
+            .unwrap();
+        let strict = SampleRepository::new()
+            .snapshot_annotation_state_strict(&paths, &manifest, &classes, &paths.raw, &image);
+        assert!(
+            strict.is_err(),
+            "strict loader unexpectedly returned {strict:?}"
+        );
+
+        let result =
+            SampleRepository::new().create_dataset_snapshot(&project.id, "must-fail-strict");
+
+        assert!(result.is_err());
+        assert!(storage::list_snapshot_records(&paths.sqlite)
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read_dir(&paths.snapshots).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn snapshot_rejects_malformed_voc_xml_and_compensates() {
+        let source_root = std::env::temp_dir().join(format!(
+            "bridge-malformed-voc-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&source_root).unwrap();
+        image::RgbImage::from_pixel(10, 10, image::Rgb([1, 2, 3]))
+            .save(source_root.join("sample.png"))
+            .unwrap();
+        std::fs::write(source_root.join("sample.xml"), "<annotation><broken>").unwrap();
+        let project =
+            crate::datasets::open_local_dataset(&source_root.to_string_lossy(), "voc-detect")
+                .unwrap();
+        let paths = project_fs::project_paths(&project.id);
+
+        let result =
+            SampleRepository::new().create_dataset_snapshot(&project.id, "must-fail-strict");
+
+        assert!(result.is_err());
+        assert!(storage::list_snapshot_records(&paths.sqlite)
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read_dir(&paths.snapshots).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(paths.root);
+        let _ = std::fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn snapshot_rejects_malformed_sqlite_annotation_payload_and_compensates() {
+        let name = format!(
+            "Bridge Malformed SQLite {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let project =
+            crate::datasets::create_dataset_project(&name, "yolo-detect", "demo-bbox").unwrap();
+        let paths = project_fs::project_paths(&project.id);
+        let image = storage::read_images(&paths.sqlite, None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        storage::save_annotation_payload(&paths.sqlite, &image.id, None, "{malformed-json")
+            .unwrap();
+
+        let result =
+            SampleRepository::new().create_dataset_snapshot(&project.id, "must-fail-strict");
+
+        assert!(result.is_err());
+        assert!(storage::list_snapshot_records(&paths.sqlite)
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read_dir(&paths.snapshots).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn snapshot_rejects_unreadable_image_content() {
+        let repository = SampleRepository::new();
+        let project_id = "bridge-unreadable-image-unit";
+        let paths = project_fs::project_paths(project_id);
+        let _ = std::fs::remove_dir_all(&paths.root);
+        project_fs::ensure_workspace_project_dirs(project_id).unwrap();
+        storage::initialize_project_database(&paths.sqlite).unwrap();
+        std::fs::create_dir_all(paths.raw.join("images/train")).unwrap();
+        std::fs::write(
+            paths.raw.join("images/train/broken.png"),
+            b"not a real image",
+        )
+        .unwrap();
+        let manifest = project_fs::ProjectManifest {
+            id: project_id.to_string(),
+            name: "Unreadable Image".to_string(),
+            source_dataset_key: "downloaded".to_string(),
+            format: "yolo-detect".to_string(),
+            root_path: paths.root.to_string_lossy().to_string(),
+            created_at: now_unix_string(),
+            class_count: 0,
+            image_count: 1,
+        };
+        let images = vec![storage::StoredImage {
+            id: "images_train_broken".to_string(),
+            file_name: "images/train/broken.png".to_string(),
+            width: 10,
+            height: 10,
+            split: "train".to_string(),
+            status: "未标注".to_string(),
+            qa_status: String::new(),
+            review_note: None,
+        }];
+        storage::upsert_project_index(&paths.sqlite, &manifest, &images, &[]).unwrap();
+
+        let result = repository.create_dataset_snapshot(project_id, "must-fail-image");
+
+        assert!(result.is_err());
+        assert!(storage::list_snapshot_records(&paths.sqlite)
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_dir_all(paths.root);
     }
 
