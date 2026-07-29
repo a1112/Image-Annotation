@@ -1490,7 +1490,7 @@ impl SampleRepository {
         ensure_path_is_within_project(&paths.root, &snapshot_dir, "snapshot directory")?;
         ensure_path_is_within_project(&paths.root, &manifest_path, "snapshot manifest")?;
 
-        if bridge_file_is_ready(project_id, snapshot_id, &snapshot_dir) {
+        if bridge_file_is_ready(project_id, &record, &snapshot_dir) {
             return Ok(dataset_snapshot_from_record(&record, &snapshot_dir, true));
         }
 
@@ -1503,7 +1503,6 @@ impl SampleRepository {
                 project.id
             ));
         }
-        let classes = storage::read_classes(&paths.sqlite)?;
         let source_asset_root = PathBuf::from(&project.root_path);
         let source_asset_root = if source_asset_root.exists() {
             source_asset_root
@@ -1528,6 +1527,7 @@ impl SampleRepository {
         let mut image_ids = BTreeSet::new();
         let mut declared_paths = BTreeSet::new();
         let mut source_paths = BTreeSet::new();
+        let mut frozen_class_labels = BTreeMap::new();
         let mut prepared = Vec::with_capacity(legacy.annotations.len());
         for annotation in legacy.annotations {
             validate_snapshot_stable_id(&annotation.image_id).map_err(|error| {
@@ -1601,6 +1601,26 @@ impl SampleRepository {
                 ));
             }
             let relative_path = stable_snapshot_asset_path(&annotation.image_id, &source_path)?;
+            for object in &annotation.objects {
+                validate_snapshot_text(&object.label).map_err(|error| {
+                    format!(
+                        "invalid frozen label for class {} in object '{}': {error}",
+                        object.class_id, object.id
+                    )
+                })?;
+                match frozen_class_labels.get(&object.class_id) {
+                    Some(label) if label != &object.label => {
+                        return Err(format!(
+                            "conflicting frozen labels for class {}: {:?} and {:?}",
+                            object.class_id, label, object.label
+                        ))
+                    }
+                    Some(_) => {}
+                    None => {
+                        frozen_class_labels.insert(object.class_id, object.label.clone());
+                    }
+                }
+            }
             let objects = annotation
                 .objects
                 .into_iter()
@@ -1619,6 +1639,14 @@ impl SampleRepository {
                 },
             ));
         }
+        let frozen_classes = frozen_class_labels
+            .into_iter()
+            .map(|(id, label)| storage::StoredClass {
+                id,
+                label,
+                color: String::new(),
+            })
+            .collect::<Vec<_>>();
 
         let staging_dir = paths.snapshots.join(format!(
             ".{snapshot_id}-upgrade-stage-{}",
@@ -1653,7 +1681,7 @@ impl SampleRepository {
                     snapshot_name: &record.name,
                     created_at: &record.created_at,
                     asset_root: &staging_assets,
-                    classes: &classes,
+                    classes: &frozen_classes,
                     samples: &bridge_samples,
                 },
             )?;
@@ -1686,7 +1714,7 @@ impl SampleRepository {
                 let bridge_manifest_path = snapshot_dir.join("visualai-bridge.json");
                 let bridge_exists = bridge_manifest_path.is_file();
                 let bridge_ready =
-                    bridge_exists && bridge_file_is_ready(project_id, &record.id, &snapshot_dir);
+                    bridge_exists && bridge_file_is_ready(project_id, &record, &snapshot_dir);
                 let bridge_manifest_api_path = bridge_manifest_relative_path(&record.id);
                 DatasetSnapshot {
                     manifest_path: snapshot_dir
@@ -2155,7 +2183,11 @@ fn ensure_project_root_is_in_workspace(project_root: &Path) -> Result<(), String
     Ok(())
 }
 
-fn bridge_file_is_ready(project_id: &str, snapshot_id: &str, snapshot_dir: &Path) -> bool {
+fn bridge_file_is_ready(
+    project_id: &str,
+    record: &storage::SnapshotRecord,
+    snapshot_dir: &Path,
+) -> bool {
     let result = (|| -> Result<(), String> {
         let bridge_path = snapshot_dir.join("visualai-bridge.json");
         let text = fs::read_to_string(&bridge_path)
@@ -2163,8 +2195,18 @@ fn bridge_file_is_ready(project_id: &str, snapshot_id: &str, snapshot_dir: &Path
         let manifest: crate::bridge::BridgeManifest = serde_json::from_str(&text)
             .map_err(|error| format!("parse bridge manifest {}: {error}", bridge_path.display()))?;
         manifest.validate()?;
-        if manifest.project_id != project_id || manifest.snapshot_id != snapshot_id {
+        if manifest.project_id != project_id || manifest.snapshot_id != record.id {
             return Err("bridge manifest identity does not match snapshot".to_string());
+        }
+        if manifest.snapshot_name != record.name || manifest.created_at != record.created_at {
+            return Err("bridge manifest metadata does not match snapshot record".to_string());
+        }
+        if manifest.samples.len() != record.image_count as usize {
+            return Err(format!(
+                "bridge sample count {} does not match snapshot record {}",
+                manifest.samples.len(),
+                record.image_count
+            ));
         }
 
         let canonical_snapshot = fs::canonicalize(snapshot_dir).map_err(|error| {
@@ -4204,7 +4246,6 @@ mod tests {
             ("duplicate-path", "duplicate_path"),
             ("path-traversal", "path_traversal"),
             ("unknown-field", "unknown_field"),
-            ("unknown-class", "unknown_class"),
             ("task-mismatch", "task_mismatch"),
         ] {
             let fixture = legacy_snapshot_fixture(label);
@@ -4232,9 +4273,6 @@ mod tests {
                     }
                     "unknown_field" => {
                         value["annotations"][0]["unexpected"] = json!(true);
-                    }
-                    "unknown_class" => {
-                        value["annotations"][0]["objects"][0]["classId"] = json!(99);
                     }
                     "task_mismatch" => {
                         value["annotations"][0]["objects"][0] = json!({
@@ -4306,6 +4344,134 @@ mod tests {
         let _ = std::fs::remove_dir_all(fixture.paths.root);
     }
 
+    #[test]
+    fn legacy_upgrade_uses_frozen_referenced_classes_not_current_project_classes() {
+        let fixture = legacy_snapshot_fixture("frozen-classes");
+        let mut project = storage::read_project_manifest(&fixture.paths.sqlite)
+            .unwrap()
+            .unwrap();
+        project.class_count = 2;
+        let images = storage::read_images(&fixture.paths.sqlite, None).unwrap();
+        storage::upsert_project_index(
+            &fixture.paths.sqlite,
+            &project,
+            &images,
+            &[
+                storage::StoredClass {
+                    id: 0,
+                    label: "renamed-live-box".to_string(),
+                    color: "#000000".to_string(),
+                },
+                storage::StoredClass {
+                    id: 1,
+                    label: "live-only-unused".to_string(),
+                    color: "#ffffff".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let upgraded = SampleRepository::new()
+            .upgrade_dataset_snapshot_bridge(&fixture.project_id, &fixture.record.id)
+            .unwrap();
+        let bridge: crate::bridge::BridgeManifest = serde_json::from_slice(
+            &std::fs::read(
+                fixture
+                    .paths
+                    .root
+                    .join(upgraded.bridge_manifest_path.unwrap()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            bridge.classes,
+            vec![crate::bridge::BridgeClass {
+                id: "0".to_string(),
+                label: "box".to_string(),
+            }]
+        );
+        let _ = std::fs::remove_dir_all(fixture.paths.root);
+    }
+
+    #[test]
+    fn legacy_upgrade_with_only_negative_samples_has_deterministic_empty_classes() {
+        let fixture = legacy_snapshot_fixture("negative-classes");
+        let manifest_path = fixture
+            .paths
+            .snapshots
+            .join(&fixture.record.id)
+            .join("manifest.json");
+        let mut legacy: Value = serde_json::from_slice(&fixture.manifest_bytes).unwrap();
+        legacy["annotations"][0]["objects"] = json!([]);
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        let mut project = storage::read_project_manifest(&fixture.paths.sqlite)
+            .unwrap()
+            .unwrap();
+        project.class_count = 1;
+        let images = storage::read_images(&fixture.paths.sqlite, None).unwrap();
+        storage::upsert_project_index(
+            &fixture.paths.sqlite,
+            &project,
+            &images,
+            &[storage::StoredClass {
+                id: 9,
+                label: "current-only".to_string(),
+                color: "#ffffff".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let upgraded = SampleRepository::new()
+            .upgrade_dataset_snapshot_bridge(&fixture.project_id, &fixture.record.id)
+            .unwrap();
+        let bridge: crate::bridge::BridgeManifest = serde_json::from_slice(
+            &std::fs::read(
+                fixture
+                    .paths
+                    .root
+                    .join(upgraded.bridge_manifest_path.unwrap()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(bridge.classes.is_empty());
+        let _ = std::fs::remove_dir_all(fixture.paths.root);
+    }
+
+    #[test]
+    fn legacy_upgrade_rejects_conflicting_frozen_labels_for_same_class_id() {
+        let fixture = legacy_snapshot_fixture("conflicting-class-label");
+        let manifest_path = fixture
+            .paths
+            .snapshots
+            .join(&fixture.record.id)
+            .join("manifest.json");
+        let mut legacy: Value = serde_json::from_slice(&fixture.manifest_bytes).unwrap();
+        let mut conflicting = legacy["annotations"][0]["objects"][0].clone();
+        conflicting["id"] = json!("conflicting-box");
+        conflicting["label"] = json!("different-frozen-label");
+        legacy["annotations"][0]["objects"]
+            .as_array_mut()
+            .unwrap()
+            .push(conflicting);
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let error = SampleRepository::new()
+            .upgrade_dataset_snapshot_bridge(&fixture.project_id, &fixture.record.id)
+            .unwrap_err();
+
+        assert!(error.contains("conflicting frozen labels"), "{error}");
+        assert!(!manifest_path
+            .parent()
+            .unwrap()
+            .join("visualai-bridge.json")
+            .exists());
+        let _ = std::fs::remove_dir_all(fixture.paths.root);
+    }
+
     fn tamper_ready_snapshot_and_assert_rebuild(
         label: &str,
         tamper: impl FnOnce(&LegacySnapshotFixture, &Path, &mut crate::bridge::BridgeManifest),
@@ -4338,7 +4504,7 @@ mod tests {
         assert_eq!(rebuilt.bridge_status, "ready");
         assert!(bridge_file_is_ready(
             &fixture.project_id,
-            &fixture.record.id,
+            &fixture.record,
             &fixture.paths.snapshots.join(&fixture.record.id)
         ));
         let _ = std::fs::remove_dir_all(fixture.paths.root);
@@ -4455,6 +4621,50 @@ mod tests {
         }
         assert_eq!(std::fs::read(&marker_path).unwrap(), b"unchanged");
         let _ = std::fs::remove_file(marker_path);
+    }
+
+    #[test]
+    fn ready_snapshot_with_truncated_but_valid_samples_is_invalid_and_rebuilt() {
+        tamper_ready_snapshot_and_assert_rebuild("ready-truncated", |fixture, _, bridge| {
+            bridge.samples.clear();
+            bridge.classes.clear();
+            let bridge_path = fixture
+                .paths
+                .snapshots
+                .join(&fixture.record.id)
+                .join("visualai-bridge.json");
+            std::fs::write(bridge_path, serde_json::to_vec_pretty(&bridge).unwrap()).unwrap();
+        });
+    }
+
+    #[test]
+    fn ready_snapshot_with_record_name_mismatch_is_invalid_and_rebuilt() {
+        tamper_ready_snapshot_and_assert_rebuild("ready-name", |fixture, _, bridge| {
+            bridge.snapshot_name = "Different snapshot name".to_string();
+            let bridge_path = fixture
+                .paths
+                .snapshots
+                .join(&fixture.record.id)
+                .join("visualai-bridge.json");
+            std::fs::write(bridge_path, serde_json::to_vec_pretty(&bridge).unwrap()).unwrap();
+        });
+    }
+
+    #[test]
+    fn ready_snapshot_with_record_created_at_mismatch_is_invalid_and_rebuilt() {
+        tamper_ready_snapshot_and_assert_rebuild("ready-created-at", |fixture, _, bridge| {
+            bridge.created_at = if bridge.created_at == "1" {
+                "2".to_string()
+            } else {
+                "1".to_string()
+            };
+            let bridge_path = fixture
+                .paths
+                .snapshots
+                .join(&fixture.record.id)
+                .join("visualai-bridge.json");
+            std::fs::write(bridge_path, serde_json::to_vec_pretty(&bridge).unwrap()).unwrap();
+        });
     }
 
     #[test]

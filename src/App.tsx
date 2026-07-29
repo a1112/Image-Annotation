@@ -1886,6 +1886,8 @@ function ProjectWorkspace({
   routeTab?: ProjectTab;
   onProjectContextChange: (context: ProjectTopbarContext | null) => void;
 }) {
+  const activeProjectIdRef = useRef(projectId);
+  activeProjectIdRef.current = projectId;
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [images, setImages] = useState<DatasetImage[]>([]);
   const [snapshots, setSnapshots] = useState<DatasetSnapshot[]>([]);
@@ -1924,6 +1926,7 @@ function ProjectWorkspace({
     : images.filter((image) => folderForImage(image) === imageFolderFilter);
 
   useEffect(() => {
+    setUpgradingSnapshotId(null);
     setImagePage(0);
     setSelectedClass(null);
     setClassSamples([]);
@@ -2040,20 +2043,29 @@ function ProjectWorkspace({
   }
 
   async function handleUpgradeSnapshotBridge(snapshotId: string) {
+    const requestProjectId = projectId;
     setUpgradingSnapshotId(snapshotId);
     setWorkflowMessage(null);
     try {
-      const upgraded = await upgradeDatasetSnapshotBridge(projectId, snapshotId);
+      const upgraded = await upgradeDatasetSnapshotBridge(requestProjectId, snapshotId);
+      if (activeProjectIdRef.current !== requestProjectId) {
+        return;
+      }
       setSnapshots((current) =>
         current.map((snapshot) => snapshot.id === upgraded.id ? upgraded : snapshot),
       );
       setWorkflowMessage(`训练桥接已就绪：${upgraded.name}`);
     } catch (error) {
+      if (activeProjectIdRef.current !== requestProjectId) {
+        return;
+      }
       setWorkflowMessage(
         `训练桥接升级失败：${error instanceof Error ? error.message : String(error)}`,
       );
     } finally {
-      setUpgradingSnapshotId(null);
+      if (activeProjectIdRef.current === requestProjectId) {
+        setUpgradingSnapshotId(null);
+      }
     }
   }
 

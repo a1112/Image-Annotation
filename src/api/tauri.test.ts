@@ -1,7 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { detectBackendConnection, getFileAssetUrl, listClassSamples, listDatasetProjects, openAnnotationWindow } from "./tauri";
+import {
+  BackendUnavailableError,
+  detectBackendConnection,
+  getFileAssetUrl,
+  listClassSamples,
+  listDatasetProjects,
+  openAnnotationWindow,
+  upgradeDatasetSnapshotBridge,
+} from "./tauri";
 import { invoke } from "@tauri-apps/api/core";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -128,6 +136,75 @@ describe("backend fallback", () => {
     await openAnnotationWindow("coco128", "000000000009");
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("普通浏览器通过本地后端升级快照训练桥接并返回类型化结果", async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      expect(url).toBe(
+        "http://127.0.0.1:17310/api/invoke/upgrade_dataset_snapshot_bridge",
+      );
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toEqual({
+        projectId: "coco128",
+        snapshotId: "snapshot-legacy",
+      });
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          data: {
+            id: "snapshot-legacy",
+            name: "Legacy snapshot",
+            imageCount: 2,
+            manifestPath: "snapshots/snapshot-legacy/manifest.json",
+            createdAt: "2026-07-29T10:00:00Z",
+            bridgeManifestPath:
+              "snapshots/snapshot-legacy/visualai-bridge.json",
+            bridgeStatus: "ready",
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const snapshot = await upgradeDatasetSnapshotBridge(
+      "coco128",
+      "snapshot-legacy",
+    );
+
+    expect(snapshot.id).toBe("snapshot-legacy");
+    expect(snapshot.bridgeStatus).toBe("ready");
+    expect(snapshot.bridgeManifestPath).toBe(
+      "snapshots/snapshot-legacy/visualai-bridge.json",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("普通浏览器升级快照训练桥接时保留本地后端领域错误", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            ok: false,
+            error: "snapshot record not found: missing-snapshot",
+          }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        )),
+    );
+
+    let caught: unknown;
+    try {
+      await upgradeDatasetSnapshotBridge("coco128", "missing-snapshot");
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).not.toBeInstanceOf(BackendUnavailableError);
+    expect((caught as Error).message).toBe(
+      "snapshot record not found: missing-snapshot",
+    );
   });
 
   it("Tauri dev 启动时不先占用 standalone 后台端口", async () => {

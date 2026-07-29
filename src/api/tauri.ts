@@ -502,23 +502,25 @@ async function invokeLocalBackend<T>(
   args: Record<string, unknown> | undefined,
   tauriCause: unknown,
 ): Promise<T> {
+  let response: Response;
+  let payload: { data?: T; error?: string; ok?: boolean };
   try {
-    const response = await fetch(`${localBackendBaseUrl}/api/invoke/${command}`, {
+    response = await fetch(`${localBackendBaseUrl}/api/invoke/${command}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(args ?? {}),
     });
-    const payload = await response.json();
-    if (!response.ok || payload?.ok === false) {
-      throw new Error(payload?.error ?? `HTTP ${response.status}`);
-    }
-    return payload.data as T;
+    payload = await response.json();
   } catch (error) {
     throw new BackendUnavailableError(command, {
       tauri: tauriCause,
       http: error,
     });
   }
+  if (!response.ok || payload.ok === false) {
+    throw new Error(payload.error ?? `HTTP ${response.status}`);
+  }
+  return payload.data as T;
 }
 
 function looksLikeMissingTauriBackend(error: unknown) {

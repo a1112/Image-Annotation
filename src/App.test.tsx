@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -11,7 +11,18 @@ const tauriState = vi.hoisted(() => ({
   analysisFormat: "voc-detect",
   snapshotBridgeStatus: "none",
   upgradeSnapshotShouldFail: false,
+  upgradeSnapshotPromise: null as Promise<Record<string, unknown>> | null,
 }));
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((nextResolve, nextReject) => {
+    resolve = nextResolve;
+    reject = nextReject;
+  });
+  return { promise, reject, resolve };
+}
 
 vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: (path: string) => `asset://${path}`,
@@ -332,6 +343,16 @@ vi.mock("@tauri-apps/api/core", () => ({
       if (tauriState.snapshotBridgeStatus === "none") {
         return [];
       }
+      if (args?.projectId === "classification-demo") {
+        return [{
+          id: "snapshot-legacy",
+          name: "Classification snapshot",
+          imageCount: 1,
+          manifestPath: "snapshots/snapshot-legacy/manifest.json",
+          createdAt: "1778638139",
+          bridgeStatus: "legacy",
+        }];
+      }
       return [{
         id: "snapshot-legacy",
         name: "Legacy snapshot",
@@ -356,6 +377,9 @@ vi.mock("@tauri-apps/api/core", () => ({
     }
 
     if (command === "upgrade_dataset_snapshot_bridge") {
+      if (tauriState.upgradeSnapshotPromise) {
+        return await tauriState.upgradeSnapshotPromise;
+      }
       if (tauriState.upgradeSnapshotShouldFail) {
         throw new Error("source asset changed");
       }
@@ -541,6 +565,7 @@ beforeEach(() => {
   tauriState.analysisFormat = "voc-detect";
   tauriState.snapshotBridgeStatus = "none";
   tauriState.upgradeSnapshotShouldFail = false;
+  tauriState.upgradeSnapshotPromise = null;
   vi.stubGlobal(
     "fetch",
     vi.fn(async () => {
@@ -1593,5 +1618,62 @@ describe("desktop shell", () => {
     await user.click(screen.getByRole("button", { name: "快照" }));
 
     expect(await screen.findByRole("button", { name: "重新生成训练桥接" })).toBeInTheDocument();
+  });
+
+  it("切换项目后忽略旧项目训练桥接成功结果", async () => {
+    const user = userEvent.setup();
+    const upgrade = deferred<Record<string, unknown>>();
+    tauriState.snapshotBridgeStatus = "legacy";
+    tauriState.upgradeSnapshotPromise = upgrade.promise;
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));
+    expect(screen.getByRole("button", { name: "正在生成训练桥接…" })).toBeDisabled();
+
+    window.location.hash = "#/datasets/classification-demo";
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    expect(await screen.findByText("Classification snapshot")).toBeInTheDocument();
+
+    await act(async () => {
+      upgrade.resolve({
+        id: "snapshot-legacy",
+        name: "Legacy snapshot",
+        imageCount: 1,
+        manifestPath: "snapshots/snapshot-legacy/manifest.json",
+        createdAt: "1778638138",
+        bridgeManifestPath: "snapshots/snapshot-legacy/visualai-bridge.json",
+        bridgeStatus: "ready",
+      });
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("训练桥接已就绪：Legacy snapshot")).not.toBeInTheDocument();
+    expect(screen.getByText("Classification snapshot")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "升级训练桥接" })).toBeInTheDocument();
+  });
+
+  it("切换项目后忽略旧项目训练桥接失败结果", async () => {
+    const user = userEvent.setup();
+    const upgrade = deferred<Record<string, unknown>>();
+    tauriState.snapshotBridgeStatus = "legacy";
+    tauriState.upgradeSnapshotPromise = upgrade.promise;
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));
+
+    window.location.hash = "#/datasets/classification-demo";
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    expect(await screen.findByText("Classification snapshot")).toBeInTheDocument();
+    await act(async () => {
+      upgrade.reject(new Error("old project upgrade failed"));
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("训练桥接升级失败：old project upgrade failed")).not.toBeInTheDocument();
+    expect(screen.getByText("Classification snapshot")).toBeInTheDocument();
   });
 });

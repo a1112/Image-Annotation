@@ -720,6 +720,15 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
             serde_json::to_value(repository.create_dataset_snapshot(&project_id, &name)?)
                 .map_err(|err| err.to_string())
         }
+        "upgrade_dataset_snapshot_bridge" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let snapshot_id = string_arg(&args, "snapshotId")?;
+            let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
+            serde_json::to_value(
+                repository.upgrade_dataset_snapshot_bridge(&project_id, &snapshot_id)?,
+            )
+            .map_err(|err| err.to_string())
+        }
         "list_exports" => {
             let project_id = string_arg(&args, "projectId")?;
             let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
@@ -1021,3 +1030,76 @@ impl HttpResponse {
 
 #[allow(dead_code)]
 fn _download_job_type_guard(_: DownloadJob, _: DatasetSnapshot) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot_bridge_route_fixture() -> (DatasetProject, DatasetSnapshot) {
+        let name = format!(
+            "HTTP Snapshot Bridge {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let project = datasets::create_dataset_project(&name, "yolo-detect", "demo-bbox").unwrap();
+        let snapshot = SampleRepository::new()
+            .create_dataset_snapshot(&project.id, "HTTP bridge")
+            .unwrap();
+        (project, snapshot)
+    }
+
+    #[test]
+    fn http_upgrade_snapshot_bridge_route_returns_typed_snapshot() {
+        let (project, snapshot) = snapshot_bridge_route_fixture();
+        let response = route_request(
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/invoke/upgrade_dataset_snapshot_bridge".to_string(),
+                body: json!({
+                    "projectId": project.id,
+                    "snapshotId": snapshot.id,
+                })
+                .to_string(),
+            },
+            Arc::new(BackendRuntime::standalone()),
+        );
+
+        assert_eq!(response.status, 200);
+        let payload: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(payload["ok"], true);
+        let upgraded: DatasetSnapshot = serde_json::from_value(payload["data"].clone()).unwrap();
+        assert_eq!(upgraded.id, snapshot.id);
+        assert_eq!(upgraded.bridge_status, "ready");
+
+        let _ = fs::remove_dir_all(project_fs::project_paths(&project.id).root);
+    }
+
+    #[test]
+    fn http_upgrade_snapshot_bridge_route_preserves_domain_errors() {
+        let (project, _) = snapshot_bridge_route_fixture();
+        let response = route_request(
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/invoke/upgrade_dataset_snapshot_bridge".to_string(),
+                body: json!({
+                    "projectId": project.id,
+                    "snapshotId": "missing-snapshot",
+                })
+                .to_string(),
+            },
+            Arc::new(BackendRuntime::standalone()),
+        );
+
+        assert_eq!(response.status, 500);
+        let payload: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(payload["ok"], false);
+        assert!(payload["error"]
+            .as_str()
+            .unwrap()
+            .contains("snapshot record not found"));
+
+        let _ = fs::remove_dir_all(project_fs::project_paths(&project.id).root);
+    }
+}
