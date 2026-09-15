@@ -745,7 +745,7 @@ function RemoteConfigDialog({
   onConfigured: (resultMessage?: string) => Promise<void>;
 }) {
   const [action, setAction] = useState<"publish" | "link">("publish");
-  const [serverUrl, setServerUrl] = useState("http://127.0.0.1:8080");
+  const [serverUrl, setServerUrl] = useState("http://127.0.0.1:16423");
   const [remoteProjectId, setRemoteProjectId] = useState(projectId);
   const [mode, setMode] = useState<"cloud_linked" | "mirrored">("cloud_linked");
   const [cachePolicy, setCachePolicy] = useState<"thumbnail_only" | "on_demand" | "full_mirror">("on_demand");

@@ -12,6 +12,7 @@ export default defineConfig({
     include: ["src/**/*.test.{ts,tsx}"],
     exclude: ["**/._*"],
   },
+  preview: { port: 17012, strictPort: true },
   server: {
     port: 1440,
     strictPort: true,

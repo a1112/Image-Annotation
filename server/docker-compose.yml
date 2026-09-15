@@ -9,7 +9,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-image_annotation}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-image_annotation_dev}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${POSTGRES_PORT:-16420}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -28,8 +28,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-image_annotation}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-image_annotation_dev_secret}
     ports:
-      - "${MINIO_API_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "${MINIO_API_PORT:-16421}:9000"
+      - "${MINIO_CONSOLE_PORT:-16422}:9001"
     volumes:
       - minio-data:/data
     healthcheck:
@@ -89,7 +89,7 @@ services:
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-image_annotation_dev_secret}
       RUST_LOG: ${RUST_LOG:-image_annotation_server=info,tower_http=info}
     ports:
-      - "${API_PORT:-8080}:8080"
+      - "${API_PORT:-16423}:8080"
 
 volumes:
   postgres-data:

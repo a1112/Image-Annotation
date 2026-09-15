@@ -13,10 +13,10 @@ docker compose up --build
 
 Default endpoints:
 
-- API: `http://127.0.0.1:8080`
-- MinIO S3 API: `http://127.0.0.1:9000`
-- MinIO console: `http://127.0.0.1:9001`
-- PostgreSQL: `postgres://image_annotation:image_annotation_dev@127.0.0.1:5432/image_annotation`
+- API: `http://127.0.0.1:16423`
+- MinIO S3 API: `http://127.0.0.1:16421`
+- MinIO console: `http://127.0.0.1:16422`
+- PostgreSQL: `postgres://image_annotation:image_annotation_dev@127.0.0.1:16420/image_annotation`
 
 The compose stack waits for PostgreSQL and MinIO, creates the object bucket, then
 starts the API. SQLx migrations are applied by the server during startup.
@@ -43,7 +43,7 @@ production secrets in the deployment platform's secret manager rather than in
 
 1. Start the stack and confirm `GET /health` succeeds.
 2. Open the desktop application's synchronization settings.
-3. Set the server URL to `http://127.0.0.1:8080`.
+3. Set the server URL to `http://127.0.0.1:16423`.
 4. Store the access token through the desktop credential command. Tokens are kept
    in the macOS Keychain and are not written into project SQLite databases.
 5. Publish or link a project, then run the initial synchronization.
