@@ -1171,6 +1171,7 @@ fn open_backend_task_tray(app: AppHandle) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut app = tauri::Builder::default()
+        .plugin(project_resource_monitor::init())
         .manage(NativeBackdropState::new(NativeBackdropStatus::pending()))
         .manage(RepositoryState::new(SampleRepository::new()))
         .manage(BackendTaskState::new(Vec::new()))
@@ -1202,6 +1203,7 @@ pub fn run() {
                 }
             })
             .invoke_handler(tauri::generate_handler![
+            project_resource_monitor::project_resource_snapshot,
                 start_drag_window,
                 minimize_window,
                 toggle_maximize_window,
@@ -1310,6 +1312,7 @@ pub fn run() {
     #[cfg(mobile)]
     {
         app = app.invoke_handler(tauri::generate_handler![
+            project_resource_monitor::project_resource_snapshot,
             window_state,
             backend_health,
             list_dataset_projects,
@@ -1664,3 +1667,5 @@ mod tests {
         assert_eq!(tasks[0].id, "create-demo");
     }
 }
+
+mod project_resource_monitor;
