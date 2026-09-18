@@ -7,7 +7,9 @@
     "dev": "node scripts/dev-with-backend.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "vitest",
+    "test": "vitest run && npm run test:chrome",
+    "test:watch": "vitest",
+    "test:chrome": "node --test src-tauri/src/project-window-chrome.test.cjs",
     "tauri": "tauri"
   },
   "dependencies": {

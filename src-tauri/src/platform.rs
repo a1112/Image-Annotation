@@ -71,15 +71,14 @@ pub fn current_platform() -> &'static str {
     }
 }
 
+// Window corner rounding is owned by the project_window_chrome plugin, which
+// re-applies it on resize/focus/scale events. Only chrome enforcement and the
+// native backdrop live here.
 #[cfg(all(not(mobile), target_os = "windows"))]
 fn apply_platform_chrome(window: &WebviewWindow) {
     if let Err(error) = window.set_decorations(false) {
         eprintln!("failed to apply frameless chrome: {error}");
     }
-
-    if let Err(error) = apply_windows_corner_preference(window) {
-        eprintln!("failed to apply Windows corner preference: {error}");
-    }
 }
 
 #[cfg(all(not(mobile), target_os = "macos"))]
@@ -87,56 +86,10 @@ fn apply_platform_chrome(window: &WebviewWindow) {
     if let Err(error) = window.set_decorations(false) {
         eprintln!("failed to apply frameless chrome: {error}");
     }
-
-    if let Err(error) = apply_macos_window_corners(window) {
-        eprintln!("failed to apply macOS window corners: {error}");
-    }
-}
-
-#[cfg(all(not(mobile), target_os = "macos"))]
-fn apply_macos_window_corners(window: &WebviewWindow) -> Result<(), String> {
-    use objc2_app_kit::NSWindow;
-
-    let ns_window = window.ns_window().map_err(|error| error.to_string())?;
-    let ns_window = unsafe { &*(ns_window as *const NSWindow) };
-    let content_view = ns_window
-        .contentView()
-        .ok_or_else(|| "window content view is unavailable".to_string())?;
-
-    content_view.setWantsLayer(true);
-    let layer = content_view
-        .layer()
-        .ok_or_else(|| "window content layer is unavailable".to_string())?;
-    layer.setCornerRadius(MACOS_WINDOW_CORNER_RADIUS);
-    layer.setMasksToBounds(true);
-    ns_window.invalidateShadow();
-
-    Ok(())
 }
 
 #[cfg(all(not(mobile), not(any(target_os = "windows", target_os = "macos"))))]
 fn apply_platform_chrome(_window: &WebviewWindow) {}
-
-#[cfg(all(not(mobile), target_os = "windows"))]
-fn apply_windows_corner_preference(window: &WebviewWindow) -> Result<(), String> {
-    use std::mem::size_of_val;
-    use windows::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-    };
-
-    let hwnd = window.hwnd().map_err(|err| err.to_string())?;
-    unsafe {
-        DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &DWMWCP_ROUND as *const _ as *const _,
-            size_of_val(&DWMWCP_ROUND) as u32,
-        )
-        .map_err(|err| err.to_string())?;
-    }
-
-    Ok(())
-}
 
 #[cfg(all(not(mobile), target_os = "windows"))]
 fn apply_native_backdrop(window: &WebviewWindow) -> NativeBackdropStatus {

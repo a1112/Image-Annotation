@@ -1089,12 +1089,15 @@ fn get_file_asset_path(
 }
 
 #[tauri::command]
-fn open_annotation_window(
+async fn open_annotation_window(
     app: AppHandle,
     repository: State<'_, RepositoryState>,
     project_id: String,
     image_id: Option<String>,
 ) -> Result<(), String> {
+    // Must stay async: sync commands run on the main thread, and creating a
+    // webview there deadlocks on the WebView2 controller completion, leaving
+    // the window permanently blank and the whole app frozen.
     let first_image = {
         let repository = repository.lock().map_err(|err| err.to_string())?;
         image_id.or_else(|| {
@@ -1155,7 +1158,7 @@ fn retry_backend_task(tasks: State<'_, BackendTaskState>, task_id: String) -> Re
 }
 
 #[tauri::command]
-fn open_backend_task_tray(app: AppHandle) -> Result<(), String> {
+async fn open_backend_task_tray(app: AppHandle) -> Result<(), String> {
     #[cfg(not(mobile))]
     {
         windows::open_backend_tasks_window(&app)
@@ -1170,7 +1173,7 @@ fn open_backend_task_tray(app: AppHandle) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut app = tauri::Builder::default()
+    let mut app = tauri::Builder::default().plugin(project_window_chrome::init())
         .plugin(project_resource_monitor::init())
         .manage(NativeBackdropState::new(NativeBackdropStatus::pending()))
         .manage(RepositoryState::new(SampleRepository::new()))
@@ -1488,7 +1491,17 @@ fn apply_tray_action(app: &AppHandle, action: TrayAction) -> Result<(), String> 
         TrayAction::ShowWindow | TrayAction::StartAnnotation | TrayAction::Export => {
             show_main_window(app)
         }
-        TrayAction::BackendTasks => windows::open_backend_tasks_window(app),
+        TrayAction::BackendTasks => {
+            // Window creation must not run on the main thread (see
+            // open_annotation_window); defer to a worker thread.
+            let handle = app.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = windows::open_backend_tasks_window(&handle) {
+                    eprintln!("backend tasks window failed: {error}");
+                }
+            });
+            Ok(())
+        }
         TrayAction::HideWindow => hide_main_window(app),
         TrayAction::Quit => {
             app.exit(0);
@@ -1669,3 +1682,5 @@ mod tests {
 }
 
 mod project_resource_monitor;
+
+mod project_window_chrome;
