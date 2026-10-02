@@ -1,3 +1,10 @@
+-- Fresh deployment: reject any legacy rows before replacing the obsolete v1 table.
+DO $$ BEGIN
+ IF EXISTS (SELECT 1 FROM issue_attachments LIMIT 1) THEN
+   RAISE EXCEPTION 'legacy attachment data requires an explicit data migration';
+ END IF;
+END $$;
+DROP TABLE issue_attachments;
 CREATE TABLE issue_attachments (
     id UUID PRIMARY KEY,
     issue_id UUID NOT NULL REFERENCES issues(id) ON DELETE CASCADE,

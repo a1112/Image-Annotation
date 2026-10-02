@@ -41,7 +41,7 @@ export class BackendUnavailableError extends Error {
   }
 }
 
-const localBackendBaseUrl = "http://127.0.0.1:17310";
+const localBackendBaseUrl = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:17310";
 
 export type BackendRuntime = "tauri-desktop" | "standalone-backend";
 
