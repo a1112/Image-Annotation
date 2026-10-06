@@ -134,6 +134,12 @@ pub fn source_by_key(dataset_key: &str) -> Option<BuiltinDatasetSource> {
 
 pub fn pick_data_source(selection_type: &str) -> Result<Option<Vec<String>>, String> {
     let picked = match selection_type {
+        "labels" => rfd::FileDialog::new()
+            .add_filter("Annotation files", &["json", "xml", "txt"])
+            .pick_file().map(|path| vec![path]),
+        "model" => rfd::FileDialog::new()
+            .add_filter("ONNX models", &["onnx"])
+            .pick_file().map(|path| vec![path]),
         "files" => rfd::FileDialog::new()
             .add_filter(
                 "Images and labels",
@@ -2181,6 +2187,116 @@ mod tests {
 
         let _ = fs::remove_dir_all(paths.root);
         let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn keeps_native_annotation_without_overwriting_incompatible_yolo_labels() {
+        let source_root = std::env::temp_dir().join("image_annotation_yolo_native_only_test");
+        let _ = fs::remove_dir_all(&source_root);
+        fs::create_dir_all(source_root.join("images").join("train")).unwrap();
+        fs::create_dir_all(source_root.join("labels").join("train")).unwrap();
+        let image_path = source_root.join("images").join("train").join("sample.png");
+        write_demo_image(&image_path, 1).unwrap();
+        fs::write(source_root.join("classes.txt"), "region\n").unwrap();
+        let label_path = source_root.join("labels").join("train").join("sample.txt");
+        let original_label = "0 0.500000 0.500000 0.200000 0.200000\n";
+        fs::write(&label_path, original_label).unwrap();
+        let stale_project_id = linked_project_id(&fs::canonicalize(&source_root).unwrap());
+        let _ = fs::remove_dir_all(project_fs::project_paths(&stale_project_id).root);
+
+        let project = open_local_dataset(&source_root.to_string_lossy(), "yolo-detect").unwrap();
+        let paths = project_fs::project_paths(&project.id);
+        let repository = domain::SampleRepository::new();
+        let result = repository
+            .save_image_annotations_with_revision(
+                &project.id,
+                "images_train_sample",
+                None,
+                vec![domain::AnnotationObject::polygon(
+                    "poly-1".to_string(),
+                    0,
+                    "region".to_string(),
+                    vec![
+                        domain::Point { x: 1.0, y: 1.0 },
+                        domain::Point { x: 8.0, y: 1.0 },
+                        domain::Point { x: 1.0, y: 8.0 },
+                    ],
+                )],
+            )
+            .unwrap();
+
+        assert_eq!(serde_json::to_value(&result).unwrap()["sourceSync"], "native-only");
+        assert_eq!(fs::read_to_string(&label_path).unwrap(), original_label);
+        assert_eq!(repository.image_annotation_state(&project.id, "images_train_sample").objects[0].id, "poly-1");
+
+        let mut bbox = domain::AnnotationObject::bbox(
+            "bbox-with-metadata".to_string(), 0, "region".to_string(),
+            domain::BBox { x: 10.0, y: 10.0, width: 20.0, height: 20.0 },
+        );
+        bbox.attributes.insert("difficult".to_string(), serde_json::json!(true));
+        let metadata_result = repository.save_image_annotations_with_revision(
+            &project.id, "images_train_sample", Some(result.revision), vec![bbox],
+        ).unwrap();
+        assert_eq!(metadata_result.source_sync, "native-only");
+        assert!(metadata_result.source_sync_message.unwrap().contains("difficult"));
+        assert_eq!(fs::read_to_string(&label_path).unwrap(), original_label);
+
+        let _ = fs::remove_dir_all(paths.root);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn external_labelme_import_and_export_preserve_native_shapes() {
+        let project = create_dataset_project("External Format Unit", "yolo-detect", "demo-bbox").unwrap();
+        let paths = project_fs::project_paths(&project.id);
+        let repository = domain::SampleRepository::new();
+        let image_id = storage::read_images(&paths.sqlite, None).unwrap()[0].id.clone();
+        let image_path = repository.image_path(&project.id, &image_id).unwrap();
+        let classes = storage::read_classes(&paths.sqlite).unwrap();
+        let object = domain::AnnotationObject::polygon("poly-ext".into(), classes[0].id, classes[0].label.clone(), vec![
+            domain::Point { x: 10.0, y: 10.0 }, domain::Point { x: 30.0, y: 10.0 },
+            domain::Point { x: 20.0, y: 30.0 },
+        ]);
+        let source = crate::importers::labelme::write_labelme(&image_path, 640, 420, &[object], true).unwrap();
+        let source_path = paths.imports.join("external.json");
+        fs::write(&source_path, source).unwrap();
+        let imported = repository.load_external_annotations(&project.id, &image_id, &source_path.to_string_lossy()).unwrap();
+        assert!(imported.verified);
+        assert_eq!(imported.objects[0].object_type, "polygon");
+        let saved = repository.save_image_annotations_with_revision(&project.id, &image_id, None, imported.objects).unwrap();
+        assert_eq!(saved.source_sync, "native-only");
+        let output_path = paths.exports.join("roundtrip.json");
+        repository.export_annotation_file(&project.id, &image_id, "labelme", Some(output_path.to_string_lossy().to_string())).unwrap();
+        assert!(fs::read_to_string(&output_path).unwrap().contains("polygon"));
+        assert!(repository.export_annotation_file(&project.id, &image_id, "yolo", Some(paths.exports.join("lossy.txt").to_string_lossy().to_string())).is_err());
+        assert!(!paths.exports.join("lossy.txt").exists());
+        let mut mismatched: serde_json::Value = serde_json::from_str(&fs::read_to_string(&source_path).unwrap()).unwrap();
+        mismatched["imageWidth"] = serde_json::json!(10);
+        fs::write(&source_path, mismatched.to_string()).unwrap();
+        assert!(repository.load_external_annotations(&project.id, &image_id, &source_path.to_string_lossy())
+            .unwrap_err().contains("dimensions"));
+        let _ = fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn verification_remains_independent_of_review_status() {
+        let project = create_dataset_project("Verification State Unit", "yolo-detect", "demo-bbox").unwrap();
+        let paths = project_fs::project_paths(&project.id);
+        let repository = domain::SampleRepository::new();
+        let image_id = storage::read_images(&paths.sqlite, None).unwrap()[0].id.clone();
+        repository.set_image_verified(&project.id, &image_id, true).unwrap();
+        repository.submit_image_annotations(&project.id, &image_id).unwrap();
+        let state = repository.image_annotation_state(&project.id, &image_id);
+        assert!(state.verified);
+        assert_eq!(state.status, "待质检");
+        let snapshot = repository.create_dataset_snapshot(&project.id, "verified-snapshot").unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(
+            paths.snapshots.join(&snapshot.id).join("manifest.json"),
+        ).unwrap()).unwrap();
+        let image = manifest["annotations"].as_array().unwrap().iter()
+            .find(|item| item["imageId"] == image_id).unwrap();
+        assert_eq!(image["verified"], true);
+        let _ = fs::remove_dir_all(paths.root);
     }
 
     #[test]

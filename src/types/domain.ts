@@ -101,10 +101,12 @@ export type AnnotationObject = {
   id: string;
   classId: number;
   label: string;
-  type: "bbox" | "polygon" | "classification";
+  type: "bbox" | "polygon" | "classification" | "oriented_rectangle" | "circle" | "line" | "linestrip" | "point" | "points" | "mask";
   bbox?: BBox;
   polygon?: Point[];
-  attributes: Record<string, string | number | boolean>;
+  points?: Point[];
+  maskData?: string;
+  attributes: Record<string, unknown>;
 };
 
 export type AnnotationState = {
@@ -112,6 +114,7 @@ export type AnnotationState = {
   revision: string | null;
   objects: AnnotationObject[];
   status: string;
+  verified?: boolean;
   updatedAt: string | null;
 };
 
@@ -119,6 +122,8 @@ export type AnnotationSaveResult = {
   revision: string;
   savedAt: string;
   auditEventId: string;
+  sourceSync?: "synced" | "native-only" | "not-applicable";
+  sourceSyncMessage?: string | null;
 };
 
 export type AnnotationVersion = {

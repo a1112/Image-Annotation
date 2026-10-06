@@ -1,4 +1,5 @@
 pub mod annotations;
+pub mod ai;
 pub mod asset_cache;
 pub mod bridge;
 pub mod credentials;
@@ -575,6 +576,65 @@ fn submit_image_annotations(
 ) -> Result<(), String> {
     let repository = repository.lock().map_err(|err| err.to_string())?;
     repository.submit_image_annotations(&project_id, &image_id)
+}
+
+#[tauri::command]
+fn set_image_verified(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    image_id: String,
+    verified: bool,
+) -> Result<(), String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.set_image_verified(&project_id, &image_id, verified)
+}
+
+#[tauri::command]
+fn load_external_annotations(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    image_id: String,
+    source_path: String,
+) -> Result<crate::importers::labelme::ExternalAnnotations, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.load_external_annotations(&project_id, &image_id, &source_path)
+}
+
+#[tauri::command]
+fn export_annotation_file(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    image_id: String,
+    format: String,
+    output_path: Option<String>,
+) -> Result<Option<String>, String> {
+    let repository = repository.lock().map_err(|err| err.to_string())?;
+    repository.export_annotation_file(&project_id, &image_id, &format, output_path)
+}
+
+#[tauri::command]
+async fn run_ai_annotation(
+    repository: State<'_, RepositoryState>,
+    project_id: String,
+    image_id: String,
+    options: serde_json::Value,
+) -> Result<ai::AiRunResult, String> {
+    let context = {
+        let repository = repository.lock().map_err(|err| err.to_string())?;
+        ai::prepare(&repository, &project_id, &image_id)?
+    };
+    tauri::async_runtime::spawn_blocking(move || ai::run(context, options))
+        .await.map_err(|err| err.to_string())?
+}
+
+#[tauri::command]
+fn cancel_ai_annotation(job_id: String) -> Result<bool, String> {
+    ai::cancel(&job_id)
+}
+
+#[tauri::command]
+fn get_ai_job_status(job_id: String) -> Result<Option<serde_json::Value>, String> {
+    ai::status(&job_id)
 }
 
 #[tauri::command]
@@ -1237,6 +1297,12 @@ pub fn run() {
                 get_image_annotation_state,
                 save_image_annotations,
                 submit_image_annotations,
+                set_image_verified,
+                load_external_annotations,
+                export_annotation_file,
+                run_ai_annotation,
+                cancel_ai_annotation,
+                get_ai_job_status,
                 list_issues,
                 create_issue,
                 transition_issue,
@@ -1339,6 +1405,12 @@ pub fn run() {
             get_image_annotation_state,
             save_image_annotations,
             submit_image_annotations,
+            set_image_verified,
+            load_external_annotations,
+            export_annotation_file,
+            run_ai_annotation,
+            cancel_ai_annotation,
+            get_ai_job_status,
             list_issues,
             create_issue,
             transition_issue,

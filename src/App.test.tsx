@@ -14,6 +14,9 @@ const tauriState = vi.hoisted(() => ({
   upgradeSnapshotPromise: null as Promise<Record<string, unknown>> | null,
   upgradeSnapshotPromiseQueue: [] as Array<Promise<Record<string, unknown>>>,
   includeSecondLegacySnapshot: false,
+  largeImageQueue: false,
+  aiPromise: null as Promise<unknown> | null,
+  savePromise: null as Promise<unknown> | null,
 }));
 
 function deferred<T>() {
@@ -172,7 +175,10 @@ vi.mock("@tauri-apps/api/core", () => ({
             exportEnabled: true,
           },
         ],
-        classes: [{ id: 0, label: "person", color: "#cc54d8", count: 12, attributes: [] }],
+        classes: [
+          { id: 0, label: "person", color: "#cc54d8", count: 12, attributes: [] },
+          { id: 1, label: "car", color: "#3b82f6", count: 4, attributes: [] },
+        ],
         tasks: [],
         qualityChecks: [],
         exportPresets: [],
@@ -193,7 +199,9 @@ vi.mock("@tauri-apps/api/core", () => ({
           tags: ["split=train"],
         }];
       }
-      const imageIds = [
+      const imageIds = tauriState.largeImageQueue
+        ? Array.from({ length: 300 }, (_, index) => `image-${String(index + 1).padStart(3, "0")}`)
+        : [
         "000000000009",
         "000000000025",
         "000000000030",
@@ -330,7 +338,7 @@ vi.mock("@tauri-apps/api/core", () => ({
     }
 
     if (command === "save_image_annotations") {
-      return {
+      return tauriState.savePromise ?? {
         revision: "rev-2",
         savedAt: "1778638137",
         auditEventId: "audit-1",
@@ -340,6 +348,33 @@ vi.mock("@tauri-apps/api/core", () => ({
     if (command === "submit_image_annotations") {
       return null;
     }
+
+    if (command === "set_image_verified") {
+      return null;
+    }
+
+    if (command === "load_external_annotations") {
+      return { verified: true, objects: [{
+        id: "external-1", classId: 1, label: "car", type: "bbox",
+        bbox: { x: 10, y: 20, width: 30, height: 40 }, attributes: { source: "external" },
+      }] };
+    }
+
+    if (command === "export_annotation_file") {
+      return "C:/out/sample.json";
+    }
+
+    if (command === "run_ai_annotation") {
+      if (tauriState.aiPromise) return tauriState.aiPromise;
+      return { jobId: (args?.options as { jobId: string }).jobId, imageId: args?.imageId, objects: [{
+        id: "ai-result-1", classId: 1, label: "car", type: "bbox",
+        bbox: { x: 50, y: 60, width: 30, height: 20 },
+        attributes: { source: "ai", confidence: 0.92 },
+      }] };
+    }
+
+    if (command === "cancel_ai_annotation") return true;
+    if (command === "get_ai_job_status") return null;
 
     if (command === "list_snapshots") {
       if (tauriState.snapshotBridgeStatus === "none") {
@@ -462,6 +497,8 @@ vi.mock("@tauri-apps/api/core", () => ({
     }
 
     if (command === "pick_data_source") {
+      if (args?.selectionType === "labels") return ["C:/labels/sample.json"];
+      if (args?.selectionType === "model") return ["C:/models/detector.onnx"];
       return ["L:\\data_tool\\datas\\lg\\1580_2d\\新建文件夹\\2D数据标注原始\\out"];
     }
 
@@ -585,6 +622,9 @@ beforeEach(() => {
   tauriState.upgradeSnapshotPromise = null;
   tauriState.upgradeSnapshotPromiseQueue = [];
   tauriState.includeSecondLegacySnapshot = false;
+  tauriState.largeImageQueue = false;
+  tauriState.aiPromise = null;
+  tauriState.savePromise = null;
   vi.stubGlobal(
     "fetch",
     vi.fn(async () => {
@@ -593,6 +633,7 @@ beforeEach(() => {
   );
   vi.clearAllMocks();
   vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(() => ({
+    arc: vi.fn(),
     beginPath: vi.fn(),
     clearRect: vi.fn(),
     closePath: vi.fn(),
@@ -615,6 +656,136 @@ beforeEach(() => {
 });
 
 describe("desktop shell", () => {
+  it("首页打开和关闭数据提交不会重复加载所有数据集", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "标注", exact: true });
+    vi.mocked(invoke).mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "数据提交", exact: true }));
+    await screen.findByRole("dialog", { name: "数据提交" });
+    fireEvent.click(screen.getByRole("button", { name: "关闭数据提交" }));
+    expect(screen.queryByRole("dialog", { name: "数据提交" })).not.toBeInTheDocument();
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "list_builtin_datasets")).toHaveLength(0);
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "list_project_images")).toHaveLength(0);
+  });
+
+  it("概览仅加载可见预览和密度样本，图片页仍加载整页", async () => {
+    window.location.hash = "#/datasets/coco128";
+    render(<App />);
+    await screen.findByRole("heading", { name: "最近样本" });
+    await waitFor(() => expect(screen.getByAltText("000000000009.jpg")).toHaveAttribute("src"));
+    const calls = (command: string) => vi.mocked(invoke).mock.calls.filter(([name]) => name === command);
+    expect(calls("get_file_asset_path")).toHaveLength(6);
+    expect(calls("get_image_annotations")).toHaveLength(12);
+
+    vi.mocked(invoke).mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "图片", exact: true }));
+    await waitFor(() => expect(screen.getByAltText("000000000294.jpg")).toHaveAttribute("src"));
+    expect(calls("get_file_asset_path")).toHaveLength(48);
+    expect(calls("get_image_annotations")).toHaveLength(48);
+  });
+
+  it("直接进入快照页不加载不可见图片及其标注", async () => {
+    window.location.hash = "#/datasets/coco128/快照";
+    render(<App />);
+    await screen.findByRole("button", { name: "创建快照", exact: true });
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "get_file_asset_path")).toHaveLength(0);
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "get_image_annotations")).toHaveLength(0);
+  });
+
+  it("独立标注窗口不加载首页数据集预览", async () => {
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    await screen.findByLabelText("000000000009.jpg 标注画布");
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "list_builtin_datasets")).toHaveLength(0);
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "list_dataset_projects")).toHaveLength(0);
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "list_project_images")).toHaveLength(1);
+  });
+
+  it("连续缩放每帧只绘制最新状态且卸载取消待绘制帧", async () => {
+    const pending = new Map<number, FrameRequestCallback>();
+    let nextFrame = 0;
+    const request = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      pending.set(++nextFrame, callback);
+      return nextFrame;
+    });
+    const cancel = vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => { pending.delete(id); });
+    const paint = vi.fn();
+    const scale = vi.fn();
+    const context = HTMLCanvasElement.prototype.getContext.call(document.createElement("canvas"), "2d")!;
+    context.clearRect = paint;
+    context.scale = scale;
+    vi.mocked(HTMLCanvasElement.prototype.getContext).mockReturnValue(context);
+    window.location.hash = "#/annotate/coco128/000000000009";
+    const view = render(<App />);
+    try {
+      await screen.findByLabelText("000000000009.jpg 标注画布");
+      // Drain initial loading paint; only count the following zoom burst.
+      act(() => { const callbacks = [...pending.values()]; pending.clear(); callbacks.forEach((callback) => callback(0)); });
+      paint.mockClear();
+      scale.mockClear();
+      for (let i = 0; i < 8; i++) fireEvent.click(screen.getByRole("button", { name: "放大图像" }));
+      expect(paint).not.toHaveBeenCalled();
+      expect(pending.size).toBe(1);
+      act(() => { const callbacks = [...pending.values()]; pending.clear(); callbacks.forEach((callback) => callback(16)); });
+      expect(paint).toHaveBeenCalledTimes(1);
+      expect(scale).toHaveBeenLastCalledWith(1.25 ** 8, 1.25 ** 8);
+      fireEvent.click(screen.getByRole("button", { name: "放大图像" }));
+      view.unmount();
+      expect(pending.size).toBe(0);
+    } finally {
+      view.unmount();
+      request.mockRestore();
+      cancel.mockRestore();
+    }
+  });
+
+  it.each([
+    ["最小化", "minimize_window"],
+    ["最大化", "toggle_maximize_window"],
+    ["关闭到托盘", "close_window"],
+  ])("点击%s的 SVG 图标不会抢先触发窗口拖动", async (label, command) => {
+    render(<App />);
+    const button = await screen.findByRole("button", { name: label, exact: true });
+    const icon = button.querySelector("svg")!;
+    const target = icon.querySelector("path, line, polyline, rect") ?? icon;
+    vi.mocked(invoke).mockClear();
+
+    fireEvent.mouseDown(target, { button: 0 });
+    fireEvent.mouseUp(target, { button: 0 });
+    fireEvent.click(target);
+
+    expect(invoke).not.toHaveBeenCalledWith("start_drag_window");
+    expect(invoke).toHaveBeenCalledWith(command);
+  });
+
+  it("点对象可选中拖动，且一次撤销恢复原位置", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+
+    const canvas = await screen.findByTestId("annotation-canvas");
+    await user.selectOptions(screen.getByLabelText("更多形状工具"), "point");
+    fireEvent.mouseDown(canvas, { button: 0, clientX: 120, clientY: 120 });
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+    const savedObjects = (vi.mocked(invoke).mock.calls.filter(([name]) => name === "save_image_annotations")[0][1] as { objects: Array<{ type: string; points?: Array<{ x: number; y: number }> }> }).objects;
+    const originalX = savedObjects.find((object) => object.type === "point")?.points?.[0].x;
+
+    await user.click(screen.getByRole("button", { name: "选择" }));
+    fireEvent.mouseDown(canvas, { button: 0, clientX: 120, clientY: 120 });
+    fireEvent.mouseMove(canvas, { clientX: 150, clientY: 140 });
+    fireEvent.mouseUp(canvas, { clientX: 150, clientY: 140 });
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+    const calls = vi.mocked(invoke).mock.calls.filter(([name]) => name === "save_image_annotations");
+    const movedObjects = (calls[calls.length - 1][1] as { objects: typeof savedObjects }).objects;
+    expect(movedObjects.find((object) => object.type === "point")?.points?.[0].x).toBeGreaterThan(originalX ?? 0);
+
+    fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+    const finalCalls = vi.mocked(invoke).mock.calls.filter(([name]) => name === "save_image_annotations");
+    const restoredObjects = (finalCalls[finalCalls.length - 1][1] as { objects: typeof savedObjects }).objects;
+    expect(restoredObjects.find((object) => object.type === "point")?.points?.[0].x).toBe(originalX);
+  });
+
   it("后端可用但 COCO128 未下载时会自动下载真实测试数据", async () => {
     tauriState.builtinDownloaded = false;
 
@@ -1319,6 +1490,222 @@ describe("desktop shell", () => {
     expect(await screen.findByText(/已保存并写回标注文件/)).toBeInTheDocument();
   });
 
+  it("复制对象可一次撤销和重做", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+
+    await screen.findByRole("button", { name: "复制对象" });
+    expect(document.querySelectorAll(".object-row")).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "复制对象" }));
+    expect(document.querySelectorAll(".object-row")).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(document.querySelectorAll(".object-row")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "重做" })).toBeEnabled();
+    fireEvent.keyDown(window, { key: "z", ctrlKey: true, shiftKey: true });
+    expect(document.querySelectorAll(".object-row")).toHaveLength(2);
+  });
+
+  it("可直接打开第 121 张并继续浏览到第 122 张", async () => {
+    const user = userEvent.setup();
+    tauriState.largeImageQueue = true;
+    window.location.hash = "#/annotate/coco128/image-121";
+    render(<App />);
+
+    expect((await screen.findAllByText(/image-121.jpg/)).length).toBeGreaterThan(0);
+    await user.click(screen.getByRole("button", { name: "下一张" }));
+    expect((await screen.findAllByText(/image-122.jpg/)).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: /image-122.jpg/ })).toHaveClass("active");
+  });
+
+  it("大型项目按页加载并定位深链接图片", async () => {
+    tauriState.largeImageQueue = true;
+    window.location.hash = "#/annotate/coco128/image-275";
+    render(<App />);
+    expect((await screen.findAllByText(/image-275.jpg/)).length).toBeGreaterThan(0);
+    const pages = vi.mocked(invoke).mock.calls.filter(([name]) => name === "list_project_images");
+    expect(pages).toEqual(expect.arrayContaining([
+      ["list_project_images", expect.objectContaining({ offset: 0, limit: 256 })],
+      ["list_project_images", expect.objectContaining({ offset: 256, limit: 256 })],
+    ]));
+  });
+
+  it("缩略图切换遵守未保存标注确认", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+
+    await screen.findByRole("button", { name: "复制对象" });
+    await user.click(screen.getByRole("button", { name: "复制对象" }));
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await user.click(screen.getByRole("button", { name: /000000000025.jpg/ }));
+
+    expect(confirm).toHaveBeenCalled();
+    expect(screen.getAllByText(/000000000009.jpg/).length).toBeGreaterThan(0);
+    confirm.mockRestore();
+  });
+
+  it("离开标注路由时阻止丢弃未保存对象", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "复制对象" }));
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    window.location.hash = "#/datasets";
+    await waitFor(() => expect(confirm).toHaveBeenCalled());
+    expect(screen.getByTestId("annotation-canvas")).toBeInTheDocument();
+    await waitFor(() => expect(window.location.hash).toBe("#/annotate/coco128/000000000009"));
+    confirm.mockRestore();
+  });
+
+  it("保存过程中继续编辑时保持未保存状态并阻止自动切图", async () => {
+    const user = userEvent.setup();
+    const pending = deferred<unknown>();
+    tauriState.savePromise = pending.promise;
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "复制对象" }));
+    await user.click(screen.getByRole("button", { name: "保存并下一张" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("save_image_annotations", expect.anything()));
+    await user.click(screen.getByRole("button", { name: "复制对象" }));
+    await act(async () => pending.resolve({ revision: "rev-2", savedAt: "1778638137", auditEventId: "audit-1" }));
+    expect(screen.getByText("未保存")).toBeInTheDocument();
+    expect(screen.getByText(/保存期间又有新修改/)).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/annotate/coco128/000000000009");
+  });
+
+  it("对象类别与困难标记保存到当前标注", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+
+    await user.selectOptions(await screen.findByLabelText("对象类别"), "1");
+    await user.click(screen.getByRole("checkbox", { name: "困难样本" }));
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith(
+      "save_image_annotations",
+      expect.objectContaining({ objects: expect.arrayContaining([
+        expect.objectContaining({
+          id: "ann-1", classId: 1, label: "car",
+          attributes: expect.objectContaining({ difficult: true }),
+        }),
+      ]) }),
+    ));
+  });
+
+  it("隐藏对象只影响画布显示，不删除待保存标注", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "隐藏 person" }));
+    expect(document.querySelector(".object-row.hidden")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith(
+      "save_image_annotations",
+      expect.objectContaining({ objects: expect.arrayContaining([
+        expect.objectContaining({ id: "ann-1" }),
+      ]) }),
+    ));
+  });
+
+  it("对象分组、描述、标志和颜色可随标注保存", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    await screen.findByTestId("annotation-canvas");
+    await user.type(screen.getByLabelText("对象分组"), "7");
+    await user.type(screen.getByLabelText("对象描述"), "遮挡一半");
+    await user.type(screen.getByLabelText("对象标志"), "occluded");
+    fireEvent.change(screen.getByLabelText("对象颜色"), { target: { value: "#ff0000" } });
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith(
+      "save_image_annotations",
+      expect.objectContaining({ objects: expect.arrayContaining([
+        expect.objectContaining({ attributes: expect.objectContaining({
+          groupId: 7,
+          description: "遮挡一半",
+          flags: { occluded: true },
+          lineColor: "#ff0000",
+        }) }),
+      ]) }),
+    ));
+  });
+
+  it.each([
+    ["point", "point", false],
+    ["line", "line", true],
+    ["circle", "circle", true],
+  ])("可绘制并保存 %s 形状", async (tool, shapeType, drag) => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+
+    const canvas = await screen.findByTestId("annotation-canvas");
+    await user.selectOptions(screen.getByLabelText("更多形状工具"), tool);
+    fireEvent.mouseDown(canvas, { button: 0, clientX: 120, clientY: 120 });
+    if (drag) {
+      fireEvent.mouseMove(canvas, { clientX: 230, clientY: 210 });
+      fireEvent.mouseUp(canvas, { clientX: 230, clientY: 210 });
+    }
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith(
+      "save_image_annotations",
+      expect.objectContaining({ objects: expect.arrayContaining([
+        expect.objectContaining({ type: shapeType, points: expect.any(Array) }),
+      ]) }),
+    ));
+  });
+
+  it("可用掩码笔刷创建 PNG 掩码并保存", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(HTMLCanvasElement.prototype, "toDataURL").mockReturnValue("data:image/png;base64,cG5n");
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    const canvas = await screen.findByTestId("annotation-canvas");
+    await user.selectOptions(screen.getByLabelText("更多形状工具"), "mask");
+    fireEvent.mouseDown(canvas, { button: 0, clientX: 120, clientY: 120 });
+    fireEvent.mouseMove(canvas, { clientX: 180, clientY: 190 });
+    fireEvent.mouseUp(canvas, { clientX: 180, clientY: 190 });
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("save_image_annotations", expect.objectContaining({
+      objects: expect.arrayContaining([expect.objectContaining({ type: "mask", maskData: "cG5n", points: expect.any(Array) })]),
+    })));
+  });
+
+  it.each([
+    ["linestrip", 3, 3],
+    ["points", 2, 2],
+    ["oriented_rectangle", 3, 4],
+  ])("可逐点绘制并保存 %s", async (tool, clicks, expectedPoints) => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    const canvas = await screen.findByTestId("annotation-canvas");
+    await user.selectOptions(screen.getByLabelText("更多形状工具"), tool);
+    for (let index = 0; index < clicks; index += 1) {
+      const clientX = 120 + index * 45;
+      const clientY = tool === "oriented_rectangle" && index === 2 ? 230 : 120 + index * 30;
+      fireEvent.mouseDown(canvas, { button: 0, clientX, clientY });
+      fireEvent.mouseUp(canvas, { button: 0, clientX, clientY });
+    }
+    if (tool !== "oriented_rectangle") fireEvent.keyDown(window, { key: "Enter" });
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith(
+      "save_image_annotations",
+      expect.objectContaining({ objects: expect.arrayContaining([
+        expect.objectContaining({ type: tool, points: expect.any(Array) }),
+      ]) }),
+    ));
+    const calls = vi.mocked(invoke).mock.calls.filter(([name]) => name === "save_image_annotations");
+    const objects = (calls[calls.length - 1][1] as { objects: Array<{ type: string; points?: unknown[] }> }).objects;
+    expect(objects.find((object) => object.type === tool)?.points).toHaveLength(expectedPoints);
+  });
+
   it("标注控制台提交质检会调用后端状态流", async () => {
     const user = userEvent.setup();
     window.location.hash = "#/annotate/coco128/000000000009";
@@ -1335,6 +1722,199 @@ describe("desktop shell", () => {
     );
   });
 
+  it("空格和工具栏可持久化图片验证状态", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    await screen.findByTestId("annotation-canvas");
+
+    fireEvent.keyDown(window, { key: " " });
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("set_image_verified", {
+      projectId: "coco128", imageId: "000000000009", verified: true,
+    }));
+    await user.click(screen.getByRole("button", { name: "取消验证" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("set_image_verified", {
+      projectId: "coco128", imageId: "000000000009", verified: false,
+    }));
+  });
+
+  it("图片验证和质检状态分别展示", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "验证图片" }));
+    await user.click(screen.getByRole("button", { name: "提交质检" }));
+    await screen.findByText(/待质检 \/ 已验证/);
+    expect(screen.getByRole("button", { name: "取消验证" })).toBeInTheDocument();
+  });
+
+  it("可全选并一次删除所有对象，再撤销恢复", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    await screen.findByTestId("annotation-canvas");
+    await user.click(screen.getByRole("button", { name: "全选" }));
+    expect(screen.getByRole("button", { name: "person bbox" })).toHaveAttribute("aria-pressed", "true");
+    await user.click(screen.getByRole("button", { name: "删除全部" }));
+    expect(screen.queryByRole("button", { name: "person bbox" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(screen.getByRole("button", { name: "person bbox" })).toBeInTheDocument();
+  });
+
+  it("可加载外部标注并另存为 LabelMe", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    await screen.findByTestId("annotation-canvas");
+    await user.click(screen.getByRole("button", { name: "加载外部标注" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("load_external_annotations", expect.objectContaining({
+      projectId: "coco128", imageId: "000000000009",
+    })));
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("save_image_annotations", expect.objectContaining({
+      objects: [expect.objectContaining({ id: "external-1" })],
+    })));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("set_image_verified", expect.objectContaining({ verified: true })));
+    await user.selectOptions(screen.getByLabelText("标注导出格式"), "labelme");
+    await user.click(screen.getByRole("button", { name: "另存标注文件" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("export_annotation_file", expect.objectContaining({ format: "labelme" })));
+  });
+
+  it("开启自动保存后切换图片先保存当前改动", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    await screen.findByTestId("annotation-canvas");
+    await user.click(screen.getByRole("checkbox", { name: "自动保存" }));
+    await user.clear(screen.getByLabelText("对象标签"));
+    await user.type(screen.getByLabelText("对象标签"), "updated");
+    await user.click(screen.getByRole("button", { name: "下一张" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("save_image_annotations", expect.objectContaining({
+      imageId: "000000000009", objects: expect.arrayContaining([expect.objectContaining({ label: "updated" })]),
+    })));
+    await waitFor(() => expect(screen.getAllByText(/000000000025.jpg/).length).toBeGreaterThan(0));
+  });
+
+  it("可把上一张图片的框复制到当前图片", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    await screen.findByTestId("annotation-canvas");
+    await user.click(screen.getByRole("button", { name: "下一张" }));
+    await waitFor(() => expect(screen.getAllByText(/000000000025.jpg/).length).toBeGreaterThan(0));
+    await user.click(screen.getByRole("button", { name: "复制上一张框" }));
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("save_image_annotations", expect.objectContaining({
+      imageId: "000000000025", objects: expect.arrayContaining([
+        expect.objectContaining({ type: "bbox", attributes: expect.objectContaining({ source: "previous-image" }) }),
+      ]),
+    })));
+  });
+
+  it("Ctrl 可多选对象并一次删除及撤销", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    const canvas = await screen.findByTestId("annotation-canvas");
+    await user.click(screen.getByRole("button", { name: "BBox" }));
+    fireEvent.mouseDown(canvas, { button: 0, clientX: 120, clientY: 120 });
+    fireEvent.mouseMove(canvas, { clientX: 240, clientY: 220 });
+    fireEvent.mouseUp(canvas, { clientX: 240, clientY: 220 });
+    const rows = screen.getAllByRole("button", { name: /person.*bbox/i });
+    expect(rows).toHaveLength(2);
+    fireEvent.click(rows[0], { ctrlKey: true });
+    await user.click(screen.getByRole("button", { name: "删除对象" }));
+    expect(screen.queryAllByRole("button", { name: /person.*bbox/i })).toHaveLength(0);
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(screen.getAllByRole("button", { name: /person.*bbox/i })).toHaveLength(2);
+  });
+
+  it("对象列表搜索和排序不改变待保存对象", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    const canvas = await screen.findByTestId("annotation-canvas");
+    await user.click(screen.getByRole("button", { name: "BBox" }));
+    fireEvent.mouseDown(canvas, { button: 0, clientX: 120, clientY: 120 });
+    fireEvent.mouseMove(canvas, { clientX: 240, clientY: 220 });
+    fireEvent.mouseUp(canvas, { clientX: 240, clientY: 220 });
+    await user.selectOptions(screen.getByLabelText("对象类别"), "1");
+    await user.type(screen.getByLabelText("搜索对象"), "car");
+    await user.selectOptions(screen.getByLabelText("对象排序"), "class");
+    expect(screen.getAllByRole("button", { name: /car.*bbox/i })).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: /person.*bbox/i })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("save_image_annotations", expect.objectContaining({
+      objects: expect.arrayContaining([expect.objectContaining({ label: "person" }), expect.objectContaining({ label: "car" })]),
+    })));
+  });
+
+  it("ONNX AI 结果作为一次编辑加入当前标注", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    await screen.findByTestId("annotation-canvas");
+    await user.click(screen.getByRole("button", { name: "智能工具" }));
+    await user.click(screen.getByRole("button", { name: "选择 ONNX 模型" }));
+    await user.selectOptions(screen.getByLabelText("检测模型布局"), "yolo5");
+    await user.click(screen.getByRole("button", { name: /运行 AI 标注/ }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("run_ai_annotation", expect.objectContaining({
+      projectId: "coco128", imageId: "000000000009",
+      options: expect.objectContaining({ provider: "onnx", modelPath: "C:/models/detector.onnx", layout: "yolo5" }),
+    })));
+    await waitFor(() => expect(screen.getByRole("button", { name: /car.*bbox/i })).toBeInTheDocument());
+    await user.click(screen.getByRole("button", { name: "撤销" }));
+    expect(screen.queryByRole("button", { name: /car.*bbox/i })).not.toBeInTheDocument();
+  });
+
+  it("OSAM 支持正负点和框提示，以及文本类别提示", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    const canvas = await screen.findByTestId("annotation-canvas");
+    await user.click(screen.getByRole("button", { name: "智能工具" }));
+    await user.selectOptions(screen.getByLabelText("AI 推理方式"), "osam");
+    await user.click(screen.getByRole("button", { name: "正点" }));
+    fireEvent.mouseDown(canvas, { button: 0, clientX: 120, clientY: 120 });
+    await user.click(screen.getByRole("button", { name: "负点" }));
+    fireEvent.mouseDown(canvas, { button: 0, clientX: 150, clientY: 150 });
+    await user.click(screen.getByRole("button", { name: "提示框" }));
+    fireEvent.mouseDown(canvas, { button: 0, clientX: 180, clientY: 180 });
+    fireEvent.mouseMove(canvas, { clientX: 240, clientY: 240 });
+    fireEvent.mouseUp(canvas, { clientX: 240, clientY: 240 });
+    await user.click(screen.getByRole("button", { name: /运行 AI 标注/ }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("run_ai_annotation", expect.objectContaining({
+      options: expect.objectContaining({ provider: "osam", promptType: "points", pointLabels: [1, 0, 2, 3] }),
+    })));
+    await user.selectOptions(screen.getByLabelText("AI 提示类型"), "text");
+    await user.type(screen.getByLabelText("AI 文本提示"), "car");
+    await user.click(screen.getByRole("button", { name: /运行 AI 标注/ }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("run_ai_annotation", expect.objectContaining({
+      options: expect.objectContaining({ provider: "osam", promptType: "text", texts: ["car"] }),
+    })));
+  });
+
+  it("AI 推理可取消且不会把旧图结果加入新图", async () => {
+    const user = userEvent.setup();
+    const ai = deferred<{ jobId: string; imageId: string; objects: Array<{ id: string; classId: number; label: string; type: string; bbox: { x: number; y: number; width: number; height: number }; attributes: Record<string, unknown> }> }>();
+    tauriState.aiPromise = ai.promise;
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    await screen.findByTestId("annotation-canvas");
+    await user.click(screen.getByRole("button", { name: "智能工具" }));
+    await user.click(screen.getByRole("button", { name: "选择 ONNX 模型" }));
+    await user.click(screen.getByRole("button", { name: "运行 AI 标注" }));
+    await user.click(screen.getByRole("button", { name: "取消 AI 推理" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("cancel_ai_annotation", expect.objectContaining({ jobId: expect.any(String) })));
+    await user.click(screen.getByRole("button", { name: "下一张" }));
+    await act(async () => ai.resolve({ jobId: "old", imageId: "000000000009", objects: [{
+      id: "stale-ai", classId: 1, label: "car", type: "bbox",
+      bbox: { x: 10, y: 10, width: 20, height: 20 }, attributes: { source: "ai" },
+    }] }));
+    expect(screen.queryByRole("button", { name: /car.*bbox/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("丢弃旧图片");
+  });
+
   it("标注控制台支持绘制、选中、删除和保存 bbox", async () => {
     const user = userEvent.setup();
     window.location.hash = "#/annotate/coco128/000000000009";
@@ -1348,10 +1928,10 @@ describe("desktop shell", () => {
     fireEvent.mouseMove(canvas, { clientX: 240, clientY: 220 });
     fireEvent.mouseUp(canvas, { clientX: 240, clientY: 220 });
 
-    expect((await screen.findAllByText("object")).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("button", { name: /person.*bbox/i })).toHaveLength(2);
 
     await user.click(screen.getByRole("button", { name: "删除对象" }));
-    expect(screen.queryByText("object")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /person.*bbox/i })).toHaveLength(1);
 
     await user.click(screen.getByRole("button", { name: "保存标注" }));
     await waitFor(() =>
@@ -1359,9 +1939,7 @@ describe("desktop shell", () => {
         "save_image_annotations",
         expect.objectContaining({
           revision: "rev-1",
-          objects: expect.not.arrayContaining([
-            expect.objectContaining({ label: "object" }),
-          ]),
+          objects: [expect.objectContaining({ id: "ann-1", label: "person" })],
         }),
       ),
     );
@@ -1403,6 +1981,50 @@ describe("desktop shell", () => {
         }),
       ),
     );
+  });
+
+  it("多边形可在边上插入顶点并删除选中顶点", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    const canvas = await screen.findByTestId("annotation-canvas");
+    await user.click(screen.getByRole("button", { name: "Polygon" }));
+    for (const [clientX, clientY] of [[120, 120], [260, 130], [220, 260]]) {
+      fireEvent.mouseDown(canvas, { button: 0, clientX, clientY });
+      fireEvent.mouseUp(canvas, { button: 0, clientX, clientY });
+    }
+    fireEvent.keyDown(window, { key: "Enter" });
+    fireEvent.mouseDown(canvas, { button: 0, altKey: true, clientX: 190, clientY: 125 });
+    fireEvent.mouseUp(canvas, { button: 0, altKey: true, clientX: 190, clientY: 125 });
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+    let calls = vi.mocked(invoke).mock.calls.filter(([name]) => name === "save_image_annotations");
+    let polygons = (calls.at(-1)?.[1] as { objects: Array<{ polygon?: unknown[] }> }).objects;
+    expect(polygons.find((object) => object.polygon)?.polygon).toHaveLength(4);
+
+    fireEvent.mouseDown(canvas, { button: 0, ctrlKey: true, clientX: 190, clientY: 125 });
+    fireEvent.mouseUp(canvas, { button: 0, ctrlKey: true, clientX: 190, clientY: 125 });
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+    calls = vi.mocked(invoke).mock.calls.filter(([name]) => name === "save_image_annotations");
+    polygons = (calls.at(-1)?.[1] as { objects: Array<{ polygon?: unknown[] }> }).objects;
+    expect(polygons.find((object) => object.polygon)?.polygon).toHaveLength(3);
+  });
+
+  it("绘制多边形时 Ctrl+Z 撤销最后一个草稿顶点", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+    const canvas = await screen.findByTestId("annotation-canvas");
+    await user.click(screen.getByRole("button", { name: "Polygon" }));
+    for (const [clientX, clientY] of [[120, 120], [260, 130], [220, 260], [160, 280]]) {
+      fireEvent.mouseDown(canvas, { button: 0, clientX, clientY });
+      fireEvent.mouseUp(canvas, { button: 0, clientX, clientY });
+    }
+    fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+    fireEvent.keyDown(window, { key: "Enter" });
+    await user.click(screen.getByRole("button", { name: "保存标注" }));
+    const calls = vi.mocked(invoke).mock.calls.filter(([name]) => name === "save_image_annotations");
+    const saved = (calls.at(-1)?.[1] as { objects: Array<{ polygon?: unknown[] }> }).objects;
+    expect(saved.find((object) => object.polygon)?.polygon).toHaveLength(3);
   });
 
   it("分类数据集支持在工作台修改单标签分类并保存", async () => {

@@ -2016,6 +2016,7 @@ dependencies = [
 name = "image-annotation"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "image",
  "keyring",
  "objc2-app-kit",

@@ -171,6 +171,47 @@ export async function submitImageAnnotations(projectId: string, imageId: string)
   await invokeRequired("submit_image_annotations", { projectId, imageId });
 }
 
+export async function setImageVerified(projectId: string, imageId: string, verified: boolean): Promise<void> {
+  await invokeRequired("set_image_verified", { projectId, imageId, verified });
+}
+
+export async function loadExternalAnnotations(projectId: string, imageId: string, sourcePath: string): Promise<{ objects: AnnotationObject[]; verified: boolean }> {
+  return invokeRequired("load_external_annotations", { projectId, imageId, sourcePath });
+}
+
+export async function exportAnnotationFile(projectId: string, imageId: string, format: string, outputPath?: string): Promise<string | null> {
+  return invokeRequired("export_annotation_file", { projectId, imageId, format, outputPath: outputPath ?? null });
+}
+
+export type AiOptions = {
+  jobId: string;
+  provider: "onnx" | "osam";
+  modelPath?: string;
+  model?: string;
+  layout?: "yolo8" | "yolo5" | "xyxy";
+  inputSize?: number;
+  outputFormat?: "rectangle" | "polygon" | "mask" | "oriented_rectangle" | "circle";
+  promptType?: "points" | "text";
+  points?: Array<[number, number]>;
+  pointLabels?: number[];
+  texts?: string[];
+  defaultClass?: string;
+  scoreThreshold?: number;
+  iouThreshold?: number;
+};
+
+export async function runAiAnnotation(projectId: string, imageId: string, options: AiOptions): Promise<{ jobId: string; imageId: string; objects: AnnotationObject[] }> {
+  return invokeRequired("run_ai_annotation", { projectId, imageId, options });
+}
+
+export async function cancelAiAnnotation(jobId: string): Promise<boolean> {
+  return invokeRequired("cancel_ai_annotation", { jobId });
+}
+
+export async function getAiJobStatus(jobId: string): Promise<{ event: string; stage?: string; filename?: string; file_index?: number; file_count?: number; bytes_done?: number; bytes_total?: number; percent?: number | null } | null> {
+  return invokeRequired("get_ai_job_status", { jobId });
+}
+
 export async function listIssues(projectId: string, includeClosed = false): Promise<IssueRecord[]> {
   return invokeRequired("list_issues", { projectId, includeClosed });
 }
@@ -403,7 +444,7 @@ export async function importYoloDataset(
   return invokeRequired("import_yolo_dataset", { projectId, sourcePath });
 }
 
-export async function pickDataSource(selectionType: "folder" | "files"): Promise<string[] | null> {
+export async function pickDataSource(selectionType: "folder" | "files" | "labels" | "model"): Promise<string[] | null> {
   return invokeRequired("pick_data_source", { selectionType });
 }
 

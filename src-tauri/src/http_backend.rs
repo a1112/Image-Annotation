@@ -378,6 +378,52 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
             repository.submit_image_annotations(&project_id, &image_id)?;
             Ok(Value::Null)
         }
+        "set_image_verified" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let image_id = string_arg(&args, "imageId")?;
+            let verified = args.get("verified").and_then(Value::as_bool)
+                .ok_or_else(|| "missing boolean argument: verified".to_string())?;
+            let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
+            repository.set_image_verified(&project_id, &image_id, verified)?;
+            Ok(Value::Null)
+        }
+        "load_external_annotations" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let image_id = string_arg(&args, "imageId")?;
+            let source_path = string_arg(&args, "sourcePath")?;
+            let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
+            serde_json::to_value(repository.load_external_annotations(&project_id, &image_id, &source_path)?)
+                .map_err(|err| err.to_string())
+        }
+        "export_annotation_file" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let image_id = string_arg(&args, "imageId")?;
+            let format = string_arg(&args, "format")?;
+            let output_path = optional_string_arg(&args, "outputPath");
+            let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
+            serde_json::to_value(repository.export_annotation_file(&project_id, &image_id, &format, output_path)?)
+                .map_err(|err| err.to_string())
+        }
+        "run_ai_annotation" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let image_id = string_arg(&args, "imageId")?;
+            let options = args.get("options").cloned().ok_or("missing AI options")?;
+            let context = {
+                let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
+                crate::ai::prepare(&repository, &project_id, &image_id)?
+            };
+            serde_json::to_value(crate::ai::run(context, options)?)
+                .map_err(|err| err.to_string())
+        }
+        "cancel_ai_annotation" => {
+            let job_id = string_arg(&args, "jobId")?;
+            Ok(json!(crate::ai::cancel(&job_id)?))
+        }
+        "get_ai_job_status" => {
+            let job_id = string_arg(&args, "jobId")?;
+            serde_json::to_value(crate::ai::status(&job_id)?)
+                .map_err(|err| err.to_string())
+        }
         "list_issues" => {
             let project_id = string_arg(&args, "projectId")?;
             let include_closed = args

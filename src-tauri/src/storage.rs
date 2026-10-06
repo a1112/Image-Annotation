@@ -174,6 +174,10 @@ pub fn initialize_project_database(path: &Path) -> Result<(), String> {
                 note TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS image_verifications (
+                image_id TEXT PRIMARY KEY,
+                verified_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS snapshots (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -338,6 +342,15 @@ pub fn read_images(path: &Path, split: Option<&str>) -> Result<Vec<StoredImage>,
             .map_err(|err| err.to_string())?
     };
     Ok(rows)
+}
+
+pub fn read_image_status(path: &Path, image_id: &str) -> Result<Option<String>, String> {
+    if !path.exists() { return Ok(None); }
+    initialize_project_database(path)?;
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    connection.query_row(
+        "SELECT status FROM images WHERE id = ?1", params![image_id], |row| row.get(0),
+    ).optional().map_err(|err| err.to_string())
 }
 
 pub fn read_images_page(
@@ -565,6 +578,40 @@ pub fn submit_image_for_review(path: &Path, image_id: &str) -> Result<(), String
         .map_err(|err| err.to_string())?;
     hybrid::mark_submission_pending(&transaction, path, image_id)?;
     transaction.commit().map_err(|err| err.to_string())
+}
+
+pub fn set_image_verified(path: &Path, image_id: &str, verified: bool) -> Result<(), String> {
+    initialize_project_database(path)?;
+    let mut connection = Connection::open(path).map_err(|err| err.to_string())?;
+    let transaction = connection.transaction().map_err(|err| err.to_string())?;
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM images WHERE id = ?1)", params![image_id], |row| row.get(0),
+    ).map_err(|err| err.to_string())?;
+    if !exists { return Err(format!("image not found: {image_id}")); }
+    if verified {
+        transaction.execute(
+            "INSERT INTO image_verifications (image_id, verified_at) VALUES (?1, ?2) ON CONFLICT(image_id) DO UPDATE SET verified_at = excluded.verified_at",
+            params![image_id, now_unix_string()],
+        ).map_err(|err| err.to_string())?;
+    } else {
+        transaction.execute("DELETE FROM image_verifications WHERE image_id = ?1", params![image_id])
+            .map_err(|err| err.to_string())?;
+    }
+    transaction.execute(
+        "INSERT INTO audit_events (id, action, image_id, message, created_at) VALUES (?1, 'annotation.verify', ?2, ?3, ?4)",
+        params![unique_id("audit"), image_id, if verified { "验证标注" } else { "取消验证" }, now_unix_string()],
+    ).map_err(|err| err.to_string())?;
+    transaction.commit().map_err(|err| err.to_string())
+}
+
+pub fn read_image_verified(path: &Path, image_id: &str) -> Result<bool, String> {
+    if !path.exists() { return Ok(false); }
+    initialize_project_database(path)?;
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM image_verifications WHERE image_id = ?1)",
+        params![image_id], |row| row.get(0),
+    ).map_err(|err| err.to_string())
 }
 
 pub fn review_image(path: &Path, image_id: &str, decision: &str, note: &str) -> Result<(), String> {
@@ -1094,6 +1141,22 @@ mod tests {
         assert_eq!(image.qa_status, "通过");
         assert_eq!(image.review_note, Some("可以入库".to_string()));
         assert_eq!(read_review_queue(&path).unwrap().len(), 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn verification_survives_save_and_review_submission() {
+        let path = std::env::temp_dir().join(format!("image_annotation_verify_{}.sqlite", unique_id("test")));
+        initialize_project_database(&path).unwrap();
+        seed_test_image(&path, "img-1");
+        set_image_verified(&path, "img-1", true).unwrap();
+        save_annotation_payload(&path, "img-1", None, "[]").unwrap();
+        submit_image_for_review(&path, "img-1").unwrap();
+        assert!(read_image_verified(&path, "img-1").unwrap());
+        assert_eq!(read_image_status(&path, "img-1").unwrap().as_deref(), Some("待质检"));
+        assert_eq!(read_image_status(&path, "missing").unwrap(), None);
+        set_image_verified(&path, "img-1", false).unwrap();
+        assert!(!read_image_verified(&path, "img-1").unwrap());
         let _ = std::fs::remove_file(path);
     }
 

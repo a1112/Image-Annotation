@@ -2738,6 +2738,29 @@ button.object-row.selected {
   color: var(--accent);
 }
 
+.object-row-shell {
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid #edf2f7;
+}
+
+.object-row-shell .object-row {
+  flex: 1;
+  min-width: 0;
+  border-bottom: 0;
+}
+
+.object-row-shell .object-row.hidden {
+  opacity: 0.45;
+}
+
+.object-visibility {
+  border: 0;
+  background: transparent;
+  color: #718096;
+  cursor: pointer;
+}
+
 .object-row em {
   margin-left: auto;
   color: #718096;
@@ -2788,6 +2811,84 @@ dd input {
   border-radius: 6px;
   background: var(--surface-subtle);
 }
+
+.annotation-metadata-editor {
+  display: grid;
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.annotation-metadata-editor label {
+  display: grid;
+  gap: 5px;
+  color: #69788a;
+  font-size: 12px;
+}
+
+.annotation-metadata-editor input,
+.annotation-metadata-editor textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #d8e1eb;
+  border-radius: 7px;
+  padding: 6px 8px;
+  color: #25364c;
+  background: #fff;
+  font: inherit;
+}
+
+.annotation-metadata-editor textarea { resize: vertical; min-height: 54px; }
+.annotation-metadata-editor input[type="color"] { height: 34px; padding: 3px; }
+
+.annotation-export-field {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0;
+  color: #69788a;
+  font-size: 12px;
+}
+
+.object-list-controls { display: grid; grid-template-columns: minmax(0, 1fr) 88px; gap: 6px; margin: 8px 0; }
+.object-list-controls input,
+.object-list-controls select { box-sizing: border-box; min-width: 0; width: 100%; border: 1px solid #d8e1eb; border-radius: 6px; padding: 6px; background: #fff; color: #25364c; font-size: 11px; }
+
+.annotation-export-field select {
+  min-width: 0;
+  width: 100%;
+  border: 1px solid #d8e1eb;
+  border-radius: 7px;
+  padding: 7px 8px;
+  background: #fff;
+  color: #25364c;
+}
+
+.ai-annotation-panel {
+  display: grid;
+  gap: 9px;
+  padding: 12px;
+  margin-bottom: 14px;
+  border: 1px solid #cbdcf2;
+  border-radius: 10px;
+  background: #f7fbff;
+}
+
+.ai-annotation-panel h2 { margin: 0 0 2px; }
+.ai-annotation-panel label { display: grid; gap: 5px; color: #52637a; font-size: 12px; }
+.ai-annotation-panel input,
+.ai-annotation-panel select { box-sizing: border-box; width: 100%; min-width: 0; border: 1px solid #c9d8e9; border-radius: 6px; padding: 6px 8px; background: #fff; color: #1e3149; }
+.ai-annotation-panel p,
+.ai-model-path { margin: 0; color: #60748b; font-size: 11px; overflow-wrap: anywhere; }
+.ai-prompt-tools { display: flex; flex-wrap: wrap; gap: 5px; }
+.ai-prompt-tools button[aria-pressed="true"] { background: #1f6edb; color: #fff; }
+.ai-prompt-tools span { flex-basis: 100%; color: #60748b; font-size: 11px; }
+
+.mask-brush-size { display: grid; gap: 3px; padding: 4px; color: #60748b; font-size: 10px; }
+.mask-brush-size input { width: 100%; min-width: 0; box-sizing: border-box; }
+.canvas-brightness { display: inline-flex; align-items: center; gap: 5px; color: #e2e8f0; font-size: 11px; }
+.canvas-brightness input { width: 72px; }
+.object-view-actions { display: flex; gap: 4px; flex-wrap: wrap; margin: 8px 0; }
+.object-view-actions button { font-size: 11px; }
 
 .bbox-editor {
   display: grid;
