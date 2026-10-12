@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "units": {
+    "desktop": {
+      "canonical": {
+        "path": "package.json",
+        "adapter": "json",
+        "pointer": "/version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "src-tauri/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package"
+          ],
+          "key": "version",
+          "format": "semver"
+        },
+        {
+          "path": "src-tauri/tauri.conf.json",
+          "adapter": "json",
+          "pointer": "/version",
+          "format": "semver"
+        },
+        {
+          "path": "src-tauri/Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "image-annotation",
+          "format": "semver"
+        },
+        {
+          "path": "package-lock.json",
+          "adapter": "json",
+          "pointer": "/packages//version",
+          "format": "semver"
+        },
+        {
+          "path": "package-lock.json",
+          "adapter": "json",
+          "pointer": "/version",
+          "format": "semver"
+        }
+      ],
+      "notes": "One desktop build: existing frontend manifest authority with Tauri/Rust mirrors."
+    },
+    "server": {
+      "canonical": {
+        "path": "server/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "server/Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "image-annotation-server",
+          "format": "semver"
+        }
+      ],
+      "notes": "Existing independent Rust package authority."
+    }
+  },
+  "notes": "Version adoption preserves all existing version numbers and independent units. No tags/releases are created. See VERSIONING.md for exclusions."
+}
