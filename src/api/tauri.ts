@@ -51,6 +51,8 @@ export type BackendHealth = {
   version: string;
   runtime: BackendRuntime;
   capabilities: string[];
+  storageRoot?: string;
+  workspaceDataRoot?: string;
 };
 
 export type BackendConnection =

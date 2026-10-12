@@ -13,7 +13,10 @@ mod platform;
 pub mod project_fs;
 pub mod publisher;
 pub mod remote_admin;
+mod runtime_storage;
 pub mod storage;
+mod storage_setup;
+pub use runtime_storage::parse_data_root_args;
 pub mod sync_engine;
 pub mod windows;
 
@@ -1233,7 +1236,8 @@ async fn open_backend_task_tray(app: AppHandle) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut app = tauri::Builder::default().plugin(project_window_chrome::init())
+    let mut app = tauri::Builder::default()
+        .plugin(project_window_chrome::init())
         .plugin(project_resource_monitor::init())
         .manage(NativeBackdropState::new(NativeBackdropStatus::pending()))
         .manage(RepositoryState::new(SampleRepository::new()))
@@ -1266,7 +1270,7 @@ pub fn run() {
                 }
             })
             .invoke_handler(tauri::generate_handler![
-            project_resource_monitor::project_resource_snapshot,
+                project_resource_monitor::project_resource_snapshot,
                 start_drag_window,
                 minimize_window,
                 toggle_maximize_window,
@@ -1350,32 +1354,7 @@ pub fn run() {
                 clear_completed_backend_tasks,
                 retry_backend_task,
                 open_backend_task_tray
-            ])
-            .setup(|app| {
-                sync_engine::start_auto_sync();
-                if let Err(error) = http_backend::start_background_backend(app.handle().clone()) {
-                    eprintln!("local http backend failed to start: {error}");
-                }
-                setup_system_tray(app.handle())?;
-
-                if let Some(window) = app.get_webview_window("main") {
-                    let backdrop_status = platform::configure_window(&window);
-
-                    if let Ok(mut state) = app.state::<NativeBackdropState>().lock() {
-                        *state = backdrop_status;
-                    }
-
-                    let app_handle = app.handle().clone();
-                    window.on_window_event(move |event| {
-                        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                            api.prevent_close();
-                            let _ = hide_main_window(&app_handle);
-                        }
-                    });
-                }
-
-                Ok(())
-            });
+            ]);
     }
 
     #[cfg(mobile)]
@@ -1461,8 +1440,47 @@ pub fn run() {
         ]);
     }
 
-    app.run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    app = app.setup(|app| {
+        storage_setup::initialize(app.handle()).map_err(std::io::Error::other)?;
+        // Do not load the frontend (which starts dataset requests) until the
+        // user has resolved storage. A native modal may run a nested event loop.
+        let main_config = app
+            .config()
+            .app
+            .windows
+            .iter()
+            .find(|window| window.label == "main")
+            .ok_or_else(|| std::io::Error::other("main window config is missing"))?;
+        tauri::WebviewWindowBuilder::from_config(app.handle(), main_config)?.build()?;
+        #[cfg(not(mobile))]
+        {
+            sync_engine::start_auto_sync();
+            if let Err(error) = http_backend::start_background_backend(app.handle().clone()) {
+                eprintln!("local http backend failed to start: {error}");
+            }
+            setup_system_tray(app.handle())?;
+            if let Some(window) = app.get_webview_window("main") {
+                let backdrop_status = platform::configure_window(&window);
+                if let Ok(mut state) = app.state::<NativeBackdropState>().lock() {
+                    *state = backdrop_status;
+                }
+                let app_handle = app.handle().clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = hide_main_window(&app_handle);
+                    }
+                });
+            }
+        }
+        Ok(())
+    });
+
+    if let Err(error) = app.run(tauri::generate_context!()) {
+        // Storage cancellation/failure already has native recovery UI. Do not
+        // panic or start a backend against an implicit replacement directory.
+        eprintln!("Image Annotation did not start: {error}");
+    }
 }
 
 #[cfg(not(mobile))]

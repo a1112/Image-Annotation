@@ -1207,7 +1207,7 @@ function DatasetHome({
   );
 }
 
-function ProjectInfoDialog({ onClose }: { onClose: () => void }) {
+function ProjectInfoDialog({ onClose, workspaceDataRoot }: { onClose: () => void; workspaceDataRoot?: string }) {
   return (
     <div className="modal-backdrop">
       <section aria-labelledby="project-info-title" className="dataset-dialog info-dialog" role="dialog">
@@ -1220,7 +1220,8 @@ function ProjectInfoDialog({ onClose }: { onClose: () => void }) {
             <X size={16} />
           </button>
         </div>
-        <div className="info-path">data/workspaces/default</div>
+        <div className="info-path">{workspaceDataRoot ?? "数据目录位置尚未由后端报告"}</div>
+        <p>桌面发行版使用当前用户的应用数据目录，或启动时明确选择的已有工作目录。本机链接的图片目录保持原位置。</p>
         <section>
           <h3>
             <Tags size={16} />
@@ -5412,7 +5413,7 @@ export default function App() {
           onPickSource={handlePickDataSource}
         />
       ) : null}
-      {projectInfoOpen ? <ProjectInfoDialog onClose={() => setProjectInfoOpen(false)} /> : null}
+      {projectInfoOpen ? <ProjectInfoDialog onClose={() => setProjectInfoOpen(false)} workspaceDataRoot={backendConnection.health?.workspaceDataRoot} /> : null}
       {taskTrayOpen ? (
         <BackendTaskTray
           message={taskTrayMessage}

@@ -30,12 +30,54 @@ pub struct ProjectPaths {
     pub manifest: PathBuf,
 }
 
-#[cfg(not(test))]
-pub fn workspace_root() -> PathBuf {
+// The embedded repository path is used only for debug development and as a
+// read-only legacy-location hint. Packaged writes require startup selection.
+pub fn development_workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
         .to_path_buf()
+}
+
+static STORAGE_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+pub fn initialize_storage(root: PathBuf) -> Result<(), String> {
+    STORAGE_ROOT
+        .set(root)
+        .map_err(|_| "数据目录已初始化，不能在活动任务期间切换。".to_string())
+}
+
+pub fn initialize_development_storage() -> Result<(), String> {
+    #[cfg(all(dev, debug_assertions))]
+    {
+        initialize_storage(crate::runtime_storage::prepare_new(
+            &development_workspace_root(),
+        )?)
+    }
+    #[cfg(not(all(dev, debug_assertions)))]
+    {
+        Err("发行版独立后端需要明确的数据目录：使用 --data-root <工作目录>，或启动桌面应用选择数据目录。".to_string())
+    }
+}
+
+#[cfg(not(test))]
+pub fn workspace_root() -> PathBuf {
+    // Debug callers (including cargo integration tests) preserve the established
+    // development layout. Release callers must initialize before starting work.
+    #[cfg(all(dev, debug_assertions))]
+    {
+        STORAGE_ROOT
+            .get()
+            .cloned()
+            .unwrap_or_else(development_workspace_root)
+    }
+    #[cfg(not(all(dev, debug_assertions)))]
+    {
+        STORAGE_ROOT
+            .get()
+            .expect("storage must be selected before project access")
+            .clone()
+    }
 }
 
 #[cfg(test)]

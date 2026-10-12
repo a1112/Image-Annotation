@@ -53,7 +53,9 @@ fn health_payload_for(runtime: &str, capabilities: &[&str]) -> Value {
         "service": "image-annotation-rust-backend",
         "version": env!("CARGO_PKG_VERSION"),
         "runtime": runtime,
-        "capabilities": capabilities
+        "capabilities": capabilities,
+        "storageRoot": project_fs::workspace_root(),
+        "workspaceDataRoot": project_fs::workspace_data_root()
     })
 }
 
@@ -112,6 +114,17 @@ pub fn start_background_backend(app: AppHandle) -> Result<(), String> {
 }
 
 pub fn run_foreground_backend() -> Result<(), String> {
+    run_foreground_backend_at(None)
+}
+
+/// Standalone release launches must explicitly select their storage root.
+/// The desktop app instead resolves its root through Tauri and startup UI.
+pub fn run_foreground_backend_at(data_root: Option<std::path::PathBuf>) -> Result<(), String> {
+    if let Some(root) = data_root {
+        project_fs::initialize_storage(crate::runtime_storage::prepare_new(&root)?)?;
+    } else {
+        project_fs::initialize_development_storage()?;
+    }
     let listener = match TcpListener::bind(BACKEND_BIND_ADDR) {
         Ok(listener) => listener,
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {

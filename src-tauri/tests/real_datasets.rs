@@ -28,13 +28,7 @@ fn workspace_data_root_is_project_local_default_workspace() {
 
 #[test]
 fn tauri_asset_protocol_allows_project_test_data_images() {
-    let config_path = test_data_root()
-        .parent()
-        .expect("data directory exists")
-        .parent()
-        .expect("workspace root exists")
-        .join("src-tauri")
-        .join("tauri.conf.json");
+    let config_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json");
     let config: Value =
         serde_json::from_str(&std::fs::read_to_string(config_path).expect("tauri config exists"))
             .expect("tauri config is valid json");

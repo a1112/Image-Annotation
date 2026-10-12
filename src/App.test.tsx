@@ -7,6 +7,7 @@ import App from "./App";
 const tauriState = vi.hoisted(() => ({
   backendAvailable: true,
   builtinDownloaded: true,
+  workspaceDataRoot: "/Users/test/Library/Application Support/com.imageannotation.desktop/data/workspaces/default" as string | undefined,
   localOpened: false,
   analysisFormat: "voc-detect",
   snapshotBridgeStatus: "none",
@@ -57,6 +58,7 @@ vi.mock("@tauri-apps/api/core", () => ({
         version: "0.1.0",
         runtime: "tauri-desktop",
         capabilities: ["datasets", "assets", "annotations", "windows", "tray", "tasks"],
+        workspaceDataRoot: tauriState.workspaceDataRoot,
       };
     }
 
@@ -614,6 +616,7 @@ vi.mock("@tauri-apps/api/webview", () => ({
 beforeEach(() => {
   window.location.hash = "";
   tauriState.backendAvailable = true;
+  tauriState.workspaceDataRoot = "/Users/test/Library/Application Support/com.imageannotation.desktop/data/workspaces/default";
   tauriState.builtinDownloaded = true;
   tauriState.localOpened = false;
   tauriState.analysisFormat = "voc-detect";
@@ -1149,13 +1152,31 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    expect(screen.queryByText("data/workspaces/default")).not.toBeInTheDocument();
+    expect(screen.queryByText(tauriState.workspaceDataRoot!)).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "工程信息" }));
 
     expect(screen.getByRole("dialog", { name: "工程信息" })).toBeInTheDocument();
-    expect(screen.getByText("data/workspaces/default")).toBeInTheDocument();
+    expect(await screen.findByText(tauriState.workspaceDataRoot!)).toBeInTheDocument();
+    expect(screen.getByText(/本机链接的图片目录保持原位置/)).toBeInTheDocument();
     expect(screen.getByText("COCO/YOLO 小数据集导入")).toBeInTheDocument();
+  });
+
+  it("工程信息显示用户选择的旧目录而不假定仓库位置", async () => {
+    tauriState.workspaceDataRoot = "/Volumes/External/Existing Workspace/data/workspaces/default";
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(screen.getByRole("button", { name: "工程信息" }));
+    expect(await screen.findByText(tauriState.workspaceDataRoot)).toBeInTheDocument();
+  });
+
+  it("后端未报告目录时不展示误导性的默认路径", async () => {
+    tauriState.workspaceDataRoot = undefined;
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(screen.getByRole("button", { name: "工程信息" }));
+    expect(screen.getByText("数据目录位置尚未由后端报告")).toBeInTheDocument();
+    expect(screen.queryByText("data/workspaces/default")).not.toBeInTheDocument();
   });
 
   it("左侧主导航使用中文无障碍标签并保持图标化", () => {

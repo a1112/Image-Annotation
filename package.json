@@ -7,10 +7,11 @@
     "dev": "node scripts/dev-with-backend.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "vitest run && npm run test:chrome",
+    "test": "vitest run && npm run test:chrome && npm run test:storage",
     "test:watch": "vitest",
     "test:chrome": "node --test src-tauri/src/project-window-chrome.test.cjs",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:storage": "node --test src-tauri/src/runtime-storage.test.cjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

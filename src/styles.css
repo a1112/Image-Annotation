@@ -636,6 +636,8 @@ button:hover {
 .info-dialog .info-path {
   display: inline-flex;
   width: fit-content;
+  max-width: 100%;
+  overflow-wrap: anywhere;
   padding: 6px 9px;
   border: 1px solid #dfe5ee;
   border-radius: 7px;
