@@ -23,8 +23,8 @@
 
 body {
   margin: 0;
-  min-width: 1024px;
-  min-height: 720px;
+  min-width: 0;
+  min-height: 0;
   background: #eef1f5;
 }
 
@@ -5334,4 +5334,9 @@ button:disabled {
   .image-status-filter {
     order: 3;
   }
+}
+
+@media (max-width: 800px), (max-height: 520px) {
+  html, body, #root { overflow: auto; }
+  #root { min-width: 640px; min-height: 420px; }
 }

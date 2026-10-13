@@ -1,3 +1,4 @@
+mod window_geometry;
 pub mod annotations;
 pub mod ai;
 pub mod asset_cache;
@@ -1233,7 +1234,8 @@ async fn open_backend_task_tray(app: AppHandle) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut app = tauri::Builder::default().plugin(project_window_chrome::init())
+    let mut app = tauri::Builder::default()
+        .plugin(window_geometry::init()).plugin(project_window_chrome::init())
         .plugin(project_resource_monitor::init())
         .manage(NativeBackdropState::new(NativeBackdropStatus::pending()))
         .manage(RepositoryState::new(SampleRepository::new()))
