@@ -9,7 +9,8 @@ struct Geometry {
     height: f64,
 }
 
-fn fit(mut rect: Geometry, area: Geometry, first: bool) -> Geometry {
+#[cfg(test)]
+fn fit(rect: Geometry, area: Geometry, first: bool) -> Geometry {
     fit_with_minimum(rect, area, first, (0.0, 0.0))
 }
 
