@@ -244,11 +244,14 @@ fn apply<R: Runtime>(window: &Window<R>, restore: bool) {
     // A removed/smaller display must not be defeated by a large fixed minimum.
     // Use the target display's physical scale even while the native window is
     // still on its previous display; a logical minimum would use that old DPI.
-    let _ = window.set_min_size(Some(physical_minimum(min, width, height, scale)));
+    // Release a previous display's minimum before changing monitor. Native
+    // backends convert physical constraints using the window's current DPI.
+    let _ = window.set_min_size(None::<tauri::PhysicalSize<u32>>);
     let _ = window.set_position(tauri::PhysicalPosition::new(
         (fitted.x * scale).round() as i32,
         (fitted.y * scale).round() as i32,
     ));
+    let _ = window.set_min_size(Some(physical_minimum(min, width, height, scale)));
     let _ = window.set_size(tauri::PhysicalSize::new(
         (width * scale).round() as u32,
         (height * scale).round() as u32,
