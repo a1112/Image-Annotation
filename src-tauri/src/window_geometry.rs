@@ -407,6 +407,57 @@ mod tests {
         );
     }
     #[test]
+    fn macbook_air_and_large_display_matrix_stays_reachable() {
+        for (width, height) in [
+            (1024.0, 640.0),
+            (1280.0, 720.0),
+            (1280.0, 800.0),
+            (1440.0, 800.0),
+            (1470.0, 833.0),
+            (1920.0, 1040.0),
+            (2560.0, 1400.0),
+        ] {
+            for scale in [1.0, 2.0] {
+                let desktop = Geometry {
+                    x: -width,
+                    y: 32.0,
+                    width,
+                    height,
+                };
+                let preferred = Geometry {
+                    x: 9000.0,
+                    y: -9000.0,
+                    width: 1120.0,
+                    height: 720.0,
+                };
+                for first in [true, false] {
+                    let fitted = fit_with_minimum(preferred, desktop, first, (800.0, 520.0));
+                    assert!(fitted.x >= desktop.x && fitted.y >= desktop.y);
+                    assert!(fitted.x + fitted.width <= desktop.x + width + 0.001);
+                    assert!(fitted.y + fitted.height <= desktop.y + height + 0.001);
+                    let minimum =
+                        physical_minimum((800.0, 520.0), fitted.width, fitted.height, scale);
+                    assert!(minimum.width as f64 <= (fitted.width * scale).round());
+                    assert!(minimum.height as f64 <= (fitted.height * scale).round());
+                    if first {
+                        assert!(fitted.width < width && fitted.height < height);
+                    }
+                }
+                let saved = Geometry {
+                    x: desktop.x + 20.0,
+                    y: desktop.y + 20.0,
+                    width: 640.0,
+                    height: 400.0,
+                };
+                let fitted = fit_with_minimum(saved, desktop, false, (800.0, 520.0));
+                assert_eq!(
+                    (fitted.x, fitted.y, fitted.width, fitted.height),
+                    (saved.x, saved.y, saved.width, saved.height)
+                );
+            }
+        }
+    }
+    #[test]
     fn tiny_work_area_never_produces_negative_geometry() {
         let r = fit(
             Geometry {
