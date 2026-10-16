@@ -15,3 +15,5 @@ Validation on macOS arm64: all new geometry modules and the explicit Search Work
 The frontend production build passed after removing the root fixed desktop minimum. Small work areas retain scroll access. Annotation windows also use 1120 × 720 with an 800 × 520 minimum; the existing background-task utility stays 520 × 680 and is work-area fitted. Twelve native chrome source tests passed.
 
 Limits: full per-application Cargo checks and physical window tests were not completed for this batch. Windows/Linux, multi-monitor hot unplug and physical DPI transitions were not visually tested. The existing Tauri 2.11.5 source cache failed internally (`UnexpectedMenuKind` is referenced but missing from its Error enum); no shared cache or lockfile was patched. The successful harness uses a separate compatible dependency resolution.
+
+Review follow-up: the native minimum is expressed in the target monitor’s physical pixels, so moving a saved window from a display with a different scale cannot expand a valid small window. The added regression case covers a saved 640 × 400 window at 1× and 2×.

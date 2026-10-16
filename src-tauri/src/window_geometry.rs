@@ -149,6 +149,18 @@ fn save<R: Runtime>(window: &Window<R>) {
     }
 }
 
+fn physical_minimum(
+    minimum: (f64, f64),
+    width: f64,
+    height: f64,
+    scale: f64,
+) -> tauri::PhysicalSize<u32> {
+    tauri::PhysicalSize::new(
+        (minimum.0.min(width) * scale).round().max(1.0) as u32,
+        (minimum.1.min(height) * scale).round().max(1.0) as u32,
+    )
+}
+
 fn apply<R: Runtime>(window: &Window<R>, restore: bool) {
     if !restore
         && (window.is_maximized().unwrap_or(false) || window.is_fullscreen().unwrap_or(false))
@@ -230,10 +242,9 @@ fn apply<R: Runtime>(window: &Window<R>, restore: bool) {
     let width = (fitted.width - border_w).max(1.0);
     let height = (fitted.height - border_h).max(1.0);
     // A removed/smaller display must not be defeated by a large fixed minimum.
-    let _ = window.set_min_size(Some(tauri::LogicalSize::new(
-        min.0.min(width),
-        min.1.min(height),
-    )));
+    // Use the target display's physical scale even while the native window is
+    // still on its previous display; a logical minimum would use that old DPI.
+    let _ = window.set_min_size(Some(physical_minimum(min, width, height, scale)));
     let _ = window.set_position(tauri::PhysicalPosition::new(
         (fitted.x * scale).round() as i32,
         (fitted.y * scale).round() as i32,
@@ -373,6 +384,24 @@ mod tests {
         assert_eq!(rect.width, 1100.0);
         assert_eq!(rect.x, -2560.0);
         assert_eq!(scale, 2.0);
+    }
+    #[test]
+    fn target_dpi_minimum_keeps_small_saved_sizes() {
+        let minimum = physical_minimum((800.0, 520.0), 640.0, 400.0, 2.0);
+        assert_eq!((minimum.width, minimum.height), (1280, 800));
+        let minimum = physical_minimum((800.0, 520.0), 640.0, 400.0, 1.0);
+        assert_eq!((minimum.width, minimum.height), (640, 400));
+        let saved = Geometry {
+            x: -1100.0,
+            y: 80.0,
+            width: 640.0,
+            height: 400.0,
+        };
+        let fitted = fit_with_minimum(saved, area(), false, (800.0, 520.0));
+        assert_eq!(
+            (fitted.x, fitted.y, fitted.width, fitted.height),
+            (saved.x, saved.y, saved.width, saved.height)
+        );
     }
     #[test]
     fn tiny_work_area_never_produces_negative_geometry() {
