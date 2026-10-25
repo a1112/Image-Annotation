@@ -17,6 +17,7 @@ const tauriState = vi.hoisted(() => ({
   largeImageQueue: false,
   aiPromise: null as Promise<unknown> | null,
   savePromise: null as Promise<unknown> | null,
+  downloadPromise: null as Promise<unknown> | null,
 }));
 
 function deferred<T>() {
@@ -61,9 +62,6 @@ vi.mock("@tauri-apps/api/core", () => ({
     }
 
     if (command === "list_dataset_projects") {
-      if (!tauriState.builtinDownloaded) {
-        return [];
-      }
       const projects = [
         {
           id: "coco128",
@@ -96,7 +94,7 @@ vi.mock("@tauri-apps/api/core", () => ({
           tags: ["source: local-linked", "format: voc-detect", "split: train"],
         });
       }
-      return projects;
+      return tauriState.builtinDownloaded ? projects : projects.filter((project) => project.id !== "coco128");
     }
 
     if (command === "get_project_detail") {
@@ -467,7 +465,7 @@ vi.mock("@tauri-apps/api/core", () => ({
     }
 
     if (command === "download_test_dataset") {
-      await new Promise((resolve) => setTimeout(resolve, 80));
+      await (tauriState.downloadPromise ?? new Promise((resolve) => setTimeout(resolve, 80)));
       tauriState.builtinDownloaded = true;
       return {
         id: "download-coco128",
@@ -625,6 +623,7 @@ beforeEach(() => {
   tauriState.largeImageQueue = false;
   tauriState.aiPromise = null;
   tauriState.savePromise = null;
+  tauriState.downloadPromise = null;
   vi.stubGlobal(
     "fetch",
     vi.fn(async () => {
@@ -786,16 +785,57 @@ describe("desktop shell", () => {
     expect(restoredObjects.find((object) => object.type === "point")?.points?.[0].x).toBe(originalX);
   });
 
-  it("后端可用但 COCO128 未下载时会自动下载真实测试数据", async () => {
+  it("首次启动只读取本地项目，不会自动下载测试数据", async () => {
     tauriState.builtinDownloaded = false;
 
     render(<App />);
 
-    expect(await screen.findByText("正在下载 COCO128 测试数据...")).toBeInTheDocument();
-    await waitFor(() =>
-      expect(invoke).toHaveBeenCalledWith("download_test_dataset", { datasetKey: "coco128" }),
-    );
+    expect(await screen.findByRole("heading", { name: "暂无数据集" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "下载测试数据集" })).toBeEnabled();
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "download_test_dataset")).toHaveLength(0);
+  });
+
+  it("点击首页下载按钮才下载测试数据，并阻止重复点击", async () => {
+    const user = userEvent.setup();
+    const pending = deferred<unknown>();
+    tauriState.builtinDownloaded = false;
+    tauriState.downloadPromise = pending.promise;
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "下载测试数据集" }));
+
+    expect(invoke).toHaveBeenCalledWith("download_test_dataset", { datasetKey: "coco128" });
+    const downloading = screen.getByRole("button", { name: "正在下载测试数据" });
+    expect(downloading).toBeDisabled();
+    await user.click(downloading);
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "download_test_dataset")).toHaveLength(1);
+
+    await act(async () => pending.resolve(null));
     expect(await screen.findByRole("button", { name: "标注" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "测试数据已下载" })).toBeDisabled();
+  });
+
+  it("手动下载及失败重试期间保留已有本地项目", async () => {
+    const user = userEvent.setup();
+    const pending = deferred<unknown>();
+    tauriState.builtinDownloaded = false;
+    tauriState.localOpened = true;
+    tauriState.downloadPromise = pending.promise;
+    render(<App />);
+
+    expect(await screen.findByText("本机 out")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "下载测试数据集" }));
+    expect(screen.getByRole("heading", { name: "正在下载测试数据..." })).toBeInTheDocument();
+    expect(screen.getByText("本机 out")).toBeInTheDocument();
+
+    await act(async () => pending.reject(new Error("download timed out")));
+    expect(await screen.findByRole("heading", { name: "测试数据下载失败" })).toBeInTheDocument();
+    expect(screen.getByText("本机 out")).toBeInTheDocument();
+    tauriState.downloadPromise = null;
+    await user.click(screen.getByRole("button", { name: "重试下载" }));
+    expect(await screen.findByText("COCO128")).toBeInTheDocument();
+    expect(screen.getByText("本机 out")).toBeInTheDocument();
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "download_test_dataset")).toHaveLength(2);
   });
 
   it("普通浏览器无 Tauri 后端时显示后端未连接且不展示假数据", async () => {
@@ -980,12 +1020,13 @@ describe("desktop shell", () => {
     );
   });
 
-  it("数据集主页只展示高频项目入口，预设下载移动到数据提交弹窗", async () => {
+  it("数据集主页展示手动下载状态，其他内置下载仍位于数据提交弹窗", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     expect(screen.getByRole("heading", { name: "数据集" })).toBeInTheDocument();
     expect(await screen.findByText("COCO128")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "测试数据已下载" })).toBeDisabled();
     expect(screen.getByText("3 个保存分组")).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "内置下载" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "下载 COCO128" })).not.toBeInTheDocument();

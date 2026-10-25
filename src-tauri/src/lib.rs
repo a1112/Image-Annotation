@@ -176,7 +176,7 @@ fn list_builtin_datasets() -> Result<Vec<BuiltinDataset>, String> {
 }
 
 #[tauri::command]
-fn download_test_dataset(
+async fn download_test_dataset(
     tasks: State<'_, BackendTaskState>,
     dataset_key: String,
 ) -> Result<DownloadJob, String> {
@@ -192,7 +192,16 @@ fn download_test_dataset(
         ),
     )?;
 
-    match datasets::download_test_dataset(&dataset_key) {
+    // Network and archive I/O must not block the native event loop or async workers.
+    let download_key = dataset_key.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        datasets::download_test_dataset(&download_key)
+    })
+    .await
+    .map_err(|error| format!("dataset download worker failed: {error}"))
+    .and_then(|result| result);
+
+    match result {
         Ok(job) => {
             record_backend_task(
                 &tasks,

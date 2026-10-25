@@ -40,8 +40,9 @@ pub fn open_annotation_window(
         WebviewUrl::App(format!("index.html{route}").into()),
     )
     .title("标注工作台")
-    .inner_size(1440.0, 920.0)
-    .min_inner_size(1024.0, 720.0)
+    .inner_size(1120.0, 720.0)
+    .min_inner_size(960.0, 600.0)
+    .center()
     .resizable(true)
     .decorations(false)
     .transparent(true)

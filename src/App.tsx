@@ -1129,6 +1129,7 @@ function DatasetHome({
   projectImages,
   runtimeState,
   runtimeMessage,
+  testDatasetDownloaded,
   onDownload,
   onInfo,
   onAnnotate,
@@ -1138,6 +1139,7 @@ function DatasetHome({
   projectImages: Record<string, DatasetImage[]>;
   runtimeState: DataRuntimeState;
   runtimeMessage: string | null;
+  testDatasetDownloaded: boolean;
   onDownload: (datasetKey: string) => void;
   onInfo: () => void;
   onAnnotate: (project: DatasetProject) => void;
@@ -1152,6 +1154,14 @@ function DatasetHome({
             <p>管理本地数据工程、进入标注任务、查看标注进度。</p>
           </div>
           <div className="filter-row">
+            <button
+              type="button"
+              disabled={runtimeState === "loading" || runtimeState === "downloading" || runtimeState === "backend-unavailable" || testDatasetDownloaded}
+              onClick={() => onDownload(defaultTestDatasetKey)}
+            >
+              <Download size={16} />
+              {runtimeState === "downloading" ? "正在下载测试数据" : testDatasetDownloaded ? "测试数据已下载" : "下载测试数据集"}
+            </button>
             <button type="button" onClick={onInfo}>
               工程信息
             </button>
@@ -1169,8 +1179,8 @@ function DatasetHome({
           />
         ) : runtimeState === "downloading" ? (
           <RuntimeStatePanel
-            title="正在下载 COCO128 测试数据..."
-            message="首次启动会自动准备真实本地数据集，完成后将显示真实图片预览。"
+            title="正在下载测试数据..."
+            message="下载完成后会显示数据集和图片预览，期间可以继续使用本地项目。"
           />
         ) : runtimeState === "download-error" ? (
           <RuntimeStatePanel
@@ -1179,29 +1189,28 @@ function DatasetHome({
             actionLabel="重试下载"
             onAction={() => onDownload(defaultTestDatasetKey)}
           />
-        ) : (
-          <>
-            {projects.length === 0 ? (
-              <RuntimeStatePanel
-                title="正在准备测试数据"
-                message="尚未发现真实项目，应用会自动下载 COCO128。"
+        ) : runtimeState === "loading" ? (
+          <RuntimeStatePanel title="正在加载数据集" message="正在读取本地数据工程。" />
+        ) : projects.length === 0 ? (
+          <RuntimeStatePanel
+            title="暂无数据集"
+            message="可以新建或导入本地数据集，也可以点击“下载测试数据集”获取 COCO128 示例。"
+          />
+        ) : null}
+        {projects.length > 0 && runtimeState !== "backend-unavailable" ? (
+          <div className="dataset-grid">
+            {projects.map((dataset) => (
+              <DatasetCard
+                dataset={dataset}
+                key={dataset.id}
+                onAnnotate={() => onAnnotate(dataset)}
+                onOpen={() => navigate(`#/datasets/${dataset.id}`)}
+                onOpenWindow={() => onOpenWindow(dataset)}
+                previewImages={projectImages[dataset.id] ?? []}
               />
-            ) : (
-              <div className="dataset-grid">
-                {projects.map((dataset) => (
-                  <DatasetCard
-                    dataset={dataset}
-                    key={dataset.id}
-                    onAnnotate={() => onAnnotate(dataset)}
-                    onOpen={() => navigate(`#/datasets/${dataset.id}`)}
-                    onOpenWindow={() => onOpenWindow(dataset)}
-                    previewImages={projectImages[dataset.id] ?? []}
-                  />
-                ))}
-              </div>
-            )}
-          </>
-        )}
+            ))}
+          </div>
+        ) : null}
       </section>
     </main>
   );
@@ -5133,13 +5142,13 @@ export default function App() {
 
   useEffect(() => {
     if (route.name === "datasets") {
-      void refreshDatasets({ autoDownload: true });
+      void refreshDatasets();
     }
   }, [route.name]);
 
   useEffect(() => {
     if (dataSubmitOpen && route.name !== "datasets") {
-      void refreshDatasets({ autoDownload: false });
+      void refreshDatasets();
     }
   }, [route.name, dataSubmitOpen]);
 
@@ -5161,24 +5170,13 @@ export default function App() {
     }
   }, [route.name]);
 
-  async function refreshDatasets(options: { autoDownload: boolean }) {
+  async function refreshDatasets() {
     setRuntimeMessage(null);
     try {
       const [builtin, currentProjects] = await Promise.all([
         listBuiltinDatasets(),
         listDatasetProjects(),
       ]);
-      const defaultDataset = builtin.find((dataset) => dataset.key === defaultTestDatasetKey);
-      if (options.autoDownload && defaultDataset && !defaultDataset.downloaded) {
-        setBuiltinDatasets([]);
-        setProjects([]);
-        setProjectImages({});
-        setRuntimeState("downloading");
-        await downloadTestDataset(defaultTestDatasetKey);
-        await refreshDatasets({ autoDownload: false });
-        return;
-      }
-
       const imageEntries = await Promise.all(
         currentProjects.map(async (project) => [
           project.id,
@@ -5210,7 +5208,7 @@ export default function App() {
     setRuntimeMessage(null);
     try {
       await downloadTestDataset(datasetKey);
-      await refreshDatasets({ autoDownload: false });
+      await refreshDatasets();
     } catch (error) {
       if (isBackendUnavailableError(error)) {
         setRuntimeState("backend-unavailable");
@@ -5229,25 +5227,25 @@ export default function App() {
   async function handleImportImages(projectId: string, sourcePath: string) {
     await importImages(projectId, sourcePath);
     setDataSubmitOpen(false);
-    await refreshDatasets({ autoDownload: false });
+    await refreshDatasets();
   }
 
   async function handleImportYolo(projectId: string, sourcePath: string) {
     await importYoloDataset(projectId, sourcePath);
     setDataSubmitOpen(false);
-    await refreshDatasets({ autoDownload: false });
+    await refreshDatasets();
   }
 
   async function handleImportFiles(projectId: string, sourcePaths: string[]) {
     await importFiles(projectId, sourcePaths);
     setDataSubmitOpen(false);
-    await refreshDatasets({ autoDownload: false });
+    await refreshDatasets();
   }
 
   async function handleOpenLocalDataset(sourcePath: string, datasetType: string) {
     const project = await openLocalDataset(sourcePath, datasetType);
     setDataSubmitOpen(false);
-    await refreshDatasets({ autoDownload: false });
+    await refreshDatasets();
     navigate(`#/datasets/${project.id}`);
   }
 
@@ -5273,7 +5271,7 @@ export default function App() {
     await createDatasetProject(createForm.name, createForm.datasetType, createForm.demoTemplate);
     setCreateDialogOpen(false);
     setCreateForm(defaultDatasetCreationForm);
-    await refreshDatasets({ autoDownload: false });
+    await refreshDatasets();
   }
 
   async function loadBackendTasks() {
@@ -5380,6 +5378,7 @@ export default function App() {
             projects={projects}
             runtimeMessage={runtimeMessage}
             runtimeState={runtimeState}
+            testDatasetDownloaded={builtinDatasets.some((dataset) => dataset.key === defaultTestDatasetKey && dataset.downloaded)}
           />
         )}
         {route.name === "project" && (

@@ -7,7 +7,7 @@ use std::{
     hash::{Hash, Hasher},
     io::{self, Cursor},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use walkdir::WalkDir;
 
@@ -168,6 +168,9 @@ pub struct DownloadJob {
 }
 
 pub fn download_test_dataset(dataset_key: &str) -> Result<DownloadJob, String> {
+    // Startup effects and multiple windows can request the same cache concurrently.
+    static DOWNLOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _download_guard = DOWNLOAD_LOCK.lock().map_err(|err| err.to_string())?;
     project_fs::ensure_test_data_dirs()?;
     let source = source_by_key(dataset_key)
         .ok_or_else(|| format!("unknown builtin dataset: {dataset_key}"))?;
@@ -191,8 +194,14 @@ pub fn download_test_dataset(dataset_key: &str) -> Result<DownloadJob, String> {
     }
     let download_path = project_fs::downloads_dir().join(format!("{}.zip", source.key));
 
+    // Interrupted downloads must never be treated as reusable ZIP archives.
+    if download_path.exists() && !is_valid_dataset_archive(&download_path) {
+        fs::remove_file(&download_path).map_err(|err| err.to_string())?;
+    }
     if !download_path.exists() {
         let mut response = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(60))
             .no_gzip()
             .no_brotli()
             .no_zstd()
@@ -204,14 +213,32 @@ pub fn download_test_dataset(dataset_key: &str) -> Result<DownloadJob, String> {
             .send()
             .and_then(|response| response.error_for_status())
             .map_err(|err| err.to_string())?;
-        let mut output = fs::File::create(&download_path).map_err(|err| err.to_string())?;
-        response
-            .copy_to(&mut output)
-            .map_err(|err| err.to_string())?;
+        let partial_path = download_path.with_extension("zip.part");
+        let download_result = (|| -> Result<(), String> {
+            let mut output = fs::File::create(&partial_path).map_err(|err| err.to_string())?;
+            response.copy_to(&mut output).map_err(|err| err.to_string())?;
+            output.sync_all().map_err(|err| err.to_string())?;
+            drop(output);
+            if !is_valid_dataset_archive(&partial_path) {
+                return Err("downloaded dataset is not a complete ZIP archive".to_string());
+            }
+            fs::rename(&partial_path, &download_path).map_err(|err| err.to_string())
+        })();
+        if download_result.is_err() {
+            let _ = fs::remove_file(&partial_path);
+        }
+        download_result?;
     }
 
     let archive_bytes = fs::read(&download_path).map_err(|err| err.to_string())?;
     import_dataset_archive(&source, archive_bytes)
+}
+
+fn is_valid_dataset_archive(path: &Path) -> bool {
+    fs::File::open(path)
+        .ok()
+        .and_then(|file| zip::ZipArchive::new(file).ok())
+        .is_some()
 }
 
 pub fn import_dataset_archive(
@@ -1494,6 +1521,18 @@ fn path_contains_segment(path: &Path, segment: &str) -> bool {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn cached_dataset_archive_rejects_interrupted_downloads() {
+        project_fs::ensure_test_data_dirs().unwrap();
+        let path = project_fs::downloads_dir().join("archive-validation.zip");
+        let archive = fixture_zip();
+        fs::write(&path, &archive[..archive.len() / 2]).unwrap();
+        assert!(!is_valid_dataset_archive(&path));
+        fs::write(&path, &archive).unwrap();
+        assert!(is_valid_dataset_archive(&path));
+        fs::remove_file(&path).unwrap();
+    }
 
     #[test]
     fn rebuild_preserves_legacy_basename_ids_and_annotations() {

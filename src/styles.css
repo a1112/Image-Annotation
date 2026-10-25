@@ -23,8 +23,8 @@
 
 body {
   margin: 0;
-  min-width: 1024px;
-  min-height: 720px;
+  min-width: 960px;
+  min-height: 600px;
   background: #eef1f5;
 }
 
@@ -193,6 +193,7 @@ button:hover {
 
 .page-heading {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 18px;
@@ -216,11 +217,13 @@ button:hover {
 
 .filter-row {
   display: flex;
+  align-items: center;
   gap: 8px;
 }
 
 .filter-row button {
   color: #526173;
+  white-space: nowrap;
 }
 
 .filter-row .selected {
