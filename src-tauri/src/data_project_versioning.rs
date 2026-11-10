@@ -26,6 +26,10 @@ const OBJECT_BUFFER_SIZE: usize = 1024 * 1024;
 const DEFAULT_BRANCH: &str = "main";
 static VERSIONING_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+fn sqlite_byte_length(value: u64) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| "object is too large for SQLite integer".to_string())
+}
+
 fn operation_lock() -> Result<MutexGuard<'static, ()>, String> {
     VERSIONING_OPERATION_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -1327,6 +1331,7 @@ fn validate_object(hash: &str) -> Result<(), String> {
 
 fn record_object(hash: &str, byte_length: u64) -> Result<(), String> {
     let connection = open_db()?;
+    let byte_length = sqlite_byte_length(byte_length)?;
     connection
         .execute(
             "INSERT OR IGNORE INTO data_project_objects (hash, kind, byte_length, created_at) VALUES (?1, 'imported', ?2, ?3)",
@@ -4953,6 +4958,7 @@ pub fn import_data_project_graph_authorized(
         let size = fs::metadata(object_path(hash)?)
             .map_err(|error| error.to_string())?
             .len();
+        let size = sqlite_byte_length(size)?;
         transaction.execute(
             "INSERT OR IGNORE INTO data_project_objects (hash, kind, byte_length, created_at) VALUES (?1, 'imported', ?2, ?3)",
             params![hash, size, now_string()],

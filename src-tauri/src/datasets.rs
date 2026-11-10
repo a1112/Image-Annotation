@@ -265,7 +265,10 @@ pub fn import_dataset_archive(
         zip::ZipArchive::new(Cursor::new(archive_bytes)).map_err(|err| err.to_string())?;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).map_err(|err| err.to_string())?;
-        let Some(output_path) = project_fs::safe_extract_path(&paths.raw, file.name()) else {
+        let file_name = file.name().map_err(|err| err.to_string())?;
+        let Some(output_path) =
+            project_fs::safe_extract_path(&paths.raw, file_name.as_ref())
+        else {
             continue;
         };
 

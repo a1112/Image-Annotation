@@ -250,7 +250,7 @@ fn normalize_zip_path(raw: &str, limit: usize) -> Result<String, String> {
     Ok(components.join("/"))
 }
 
-fn is_zip_symlink(entry: &ZipFile<'_>) -> bool {
+fn is_zip_symlink<R: Read + ?Sized>(entry: &ZipFile<'_, R>) -> bool {
     entry
         .unix_mode()
         .is_some_and(|mode| mode & 0o170000 == 0o120000)
@@ -438,7 +438,10 @@ pub fn read_archive(input: &[u8], limits: ArchiveLimits) -> Result<Vec<ArchiveEn
         let mut entry = archive
             .by_index(index)
             .map_err(|error| format!("read ZIP entry {index}: {error}"))?;
-        let path = normalize_zip_path(entry.name(), limits.path_bytes)?;
+        let entry_name = entry
+            .name()
+            .map_err(|error| format!("read ZIP entry {index} name: {error}"))?;
+        let path = normalize_zip_path(entry_name.as_ref(), limits.path_bytes)?;
         if !paths.insert(path.clone()) {
             return Err(format!("duplicate archive entry path '{path}'"));
         }

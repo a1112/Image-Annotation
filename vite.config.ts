@@ -7,7 +7,6 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig({
   plugins: [react()],
   clearScreen: false,
-  // @ts-expect-error Vitest reads this Vite-compatible extension at test time.
   test: {
     include: ["src/**/*.test.{ts,tsx}"],
     exclude: ["**/._*"],

@@ -15,6 +15,8 @@
 
 安装依赖后，在仓库根目录运行：
 
+前端工具链（包括 Vitest 4）支持 Node.js 20、22 或 24 及更高版本，建议使用当前维护中的 Node.js LTS；npm 需与 Node.js 一起安装。
+
 ```sh
 npm install
 npm run dev         # 启动开发环境

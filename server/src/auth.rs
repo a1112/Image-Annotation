@@ -405,4 +405,38 @@ mod browser_origin_tests {
         );
         assert!(cookie_value(&headers, "ia_web_refresh").is_none());
     }
+
+    #[test]
+    fn access_tokens_round_trip_with_configured_crypto_provider() {
+        let config = Config {
+            bind_address: "127.0.0.1:8080".into(),
+            database_url: "unused".into(),
+            jwt_secret: "test-secret".into(),
+            s3_bucket: "unused".into(),
+            s3_endpoint: None,
+            public_base_url: "https://example.test/image-annotation".into(),
+            access_ttl_seconds: 900,
+            refresh_ttl_seconds: 2_592_000,
+        };
+        let user_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let (token, _) = issue_access_token(
+            &config,
+            user_id,
+            Some(Uuid::new_v4()),
+            session_id,
+            "device-test",
+        )
+        .expect("JWT provider should sign access tokens");
+        let claims = decode::<Claims>(
+            &token,
+            &DecodingKey::from_secret(config.jwt_secret.as_bytes()),
+            &Validation::new(Algorithm::HS256),
+        )
+        .expect("JWT provider should verify access tokens")
+        .claims;
+        assert_eq!(claims.sub, user_id);
+        assert_eq!(claims.sid, Some(session_id));
+        assert_eq!(claims.device_id.as_deref(), Some("device-test"));
+    }
 }

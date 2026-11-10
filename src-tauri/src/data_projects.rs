@@ -24,6 +24,10 @@ use uuid::Uuid;
 
 const HASH_BUFFER_SIZE: usize = 1024 * 1024;
 
+fn sqlite_byte_length(value: u64) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| "object is too large for SQLite integer".to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DataProject {
@@ -1429,6 +1433,7 @@ pub fn commit_data_project(project_id: &str, message: &str) -> Result<DataProjec
         .map_err(|error| format!("write data-project commit: {error}"))?;
     for (dataset_id, metadata_hash) in &current.dataset_metadata {
         if let Some(metadata_length) = current.dataset_metadata_lengths.get(dataset_id) {
+            let metadata_length = sqlite_byte_length(*metadata_length)?;
             transaction
                 .execute(
                     "INSERT OR IGNORE INTO data_project_objects (hash, kind, byte_length, created_at) VALUES (?1, 'dataset-metadata', ?2, ?3)",
@@ -1439,16 +1444,18 @@ pub fn commit_data_project(project_id: &str, message: &str) -> Result<DataProjec
     }
     for captured in &current.entries {
         let entry = &captured.entry;
+        let image_length = sqlite_byte_length(captured.image_length)?;
+        let annotation_length = sqlite_byte_length(captured.annotation_length)?;
         transaction
             .execute(
                 "INSERT OR IGNORE INTO data_project_objects (hash, kind, byte_length, created_at) VALUES (?1, 'image', ?2, ?3)",
-                params![entry.image_hash, captured.image_length, created_at],
+                params![entry.image_hash, image_length, created_at],
             )
             .map_err(|error| format!("record image object: {error}"))?;
         transaction
             .execute(
                 "INSERT OR IGNORE INTO data_project_objects (hash, kind, byte_length, created_at) VALUES (?1, 'annotation', ?2, ?3)",
-                params![entry.annotation_hash, captured.annotation_length, created_at],
+                params![entry.annotation_hash, annotation_length, created_at],
             )
             .map_err(|error| format!("record annotation object: {error}"))?;
         transaction
