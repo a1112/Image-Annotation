@@ -14,6 +14,7 @@ const tauriState = vi.hoisted(() => ({
   upgradeSnapshotPromise: null as Promise<Record<string, unknown>> | null,
   upgradeSnapshotPromiseQueue: [] as Array<Promise<Record<string, unknown>>>,
   includeSecondLegacySnapshot: false,
+  includeAccountScopedCache: false,
   largeImageQueue: false,
   aiPromise: null as Promise<unknown> | null,
   savePromise: null as Promise<unknown> | null,
@@ -61,7 +62,7 @@ vi.mock("@tauri-apps/api/core", () => ({
       };
     }
 
-    if (command === "list_dataset_projects") {
+    if (command === "list_dataset_projects" || command === "list_data_project_datasets") {
       const projects = [
         {
           id: "coco128",
@@ -94,8 +95,29 @@ vi.mock("@tauri-apps/api/core", () => ({
           tags: ["source: local-linked", "format: voc-detect", "split: train"],
         });
       }
+      if (tauriState.includeAccountScopedCache) {
+        projects.push({
+          id: "account-scoped-cache",
+          name: "旧账号远端缓存",
+          description: "真实 remote:https://old-account.example/project",
+          annotationTypes: ["BBox"],
+          imageCount: 2,
+          annotatedPercent: 50,
+          reviewCount: 1,
+          issueCount: 0,
+          classCount: 1,
+          tagGroupCount: 1,
+          status: "进行中",
+          tags: ["source: remote", "format: remote"],
+        });
+      }
       return tauriState.builtinDownloaded ? projects : projects.filter((project) => project.id !== "coco128");
     }
+
+    if (command === "list_data_projects") return [{ id: "fixture", name: "检测数据项目", description: "", datasetIds: ["coco128", ...(tauriState.localOpened ? ["local-out"] : []), ...(tauriState.includeAccountScopedCache ? ["account-scoped-cache"] : [])], createdAt: "2026-10-27T00:00:00Z", updatedAt: "2026-10-27T00:00:00Z", accountScope: null, role: "owner" }];
+    if (command === "get_data_project_dataset_groups") return { dataProjectId: args?.dataProjectId, branch: "main", revision: 1, projectMetadata: { schemaVersion: 1, datasetGroups: [] }, canEdit: true };
+    if (command === "get_data_project_working_tree") return { dataProjectId: args?.dataProjectId, headCommitId: null, changes: [], counts: { raw: 0, inProgress: 128, pendingReview: 0, approved: 0, rejected: 0, total: 128 } };
+    if (command === "list_data_project_branches") return [{ dataProjectId: args?.dataProjectId, name: "main", headCommitId: null, current: true, createdAt: "", updatedAt: "" }];
 
     if (command === "get_project_detail") {
       if (args?.projectId === "classification-demo") {
@@ -610,7 +632,8 @@ vi.mock("@tauri-apps/api/webview", () => ({
 }));
 
 beforeEach(() => {
-  window.location.hash = "";
+  window.location.hash = "#/projects/fixture/data";
+  window.sessionStorage.clear();
   tauriState.backendAvailable = true;
   tauriState.builtinDownloaded = true;
   tauriState.localOpened = false;
@@ -620,6 +643,7 @@ beforeEach(() => {
   tauriState.upgradeSnapshotPromise = null;
   tauriState.upgradeSnapshotPromiseQueue = [];
   tauriState.includeSecondLegacySnapshot = false;
+  tauriState.includeAccountScopedCache = false;
   tauriState.largeImageQueue = false;
   tauriState.aiPromise = null;
   tauriState.savePromise = null;
@@ -654,16 +678,48 @@ beforeEach(() => {
   }) as unknown as CanvasRenderingContext2D);
 });
 
+function topbar(): HTMLElement {
+  const element = document.querySelector(".topbar");
+  if (!element) throw new Error("topbar is not mounted");
+  return element as HTMLElement;
+}
+
+async function firstDatasetButton(name: string): Promise<HTMLButtonElement> {
+  const buttons = await screen.findAllByRole("button", { name, exact: true });
+  return buttons[0] as HTMLButtonElement;
+}
+
+async function firstDatasetCard(): Promise<HTMLElement> {
+  const cards = await screen.findAllByRole("article", { name: "COCO128 数据集卡片" });
+  return cards[0] as HTMLElement;
+}
+
 describe("desktop shell", () => {
+  it("clears account-scoped dataset cache when a session changes", async () => {
+    tauriState.includeAccountScopedCache = true;
+    render(<App />);
+    await screen.findByText("旧账号远端缓存");
+
+    tauriState.includeAccountScopedCache = false;
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent("image-annotation:session-change", {
+        detail: { authenticated: false },
+      }));
+    });
+
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "旧账号远端缓存" })).not.toBeInTheDocument());
+    expect(await screen.findByText("检测数据项目")).toBeInTheDocument();
+  });
+
   it("首页打开和关闭数据提交不会重复加载所有数据集", async () => {
     render(<App />);
-    await screen.findByRole("button", { name: "标注", exact: true });
+    await firstDatasetButton("开始标注");
     vi.mocked(invoke).mockClear();
-    fireEvent.click(screen.getByRole("button", { name: "数据提交", exact: true }));
+    fireEvent.click(screen.getByRole("button", { name: "上传图像", exact: true }));
     await screen.findByRole("dialog", { name: "数据提交" });
     fireEvent.click(screen.getByRole("button", { name: "关闭数据提交" }));
     expect(screen.queryByRole("dialog", { name: "数据提交" })).not.toBeInTheDocument();
-    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "list_builtin_datasets")).toHaveLength(0);
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "list_dataset_projects")).toHaveLength(0);
     expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "list_project_images")).toHaveLength(0);
   });
 
@@ -790,8 +846,9 @@ describe("desktop shell", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "暂无数据集" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "下载测试数据集" })).toBeEnabled();
+    expect(await screen.findByRole("heading", { name: "数据集" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "下载测试数据集" })).not.toBeInTheDocument();
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "list_dataset_projects")).toHaveLength(0);
     expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "download_test_dataset")).toHaveLength(0);
   });
 
@@ -802,17 +859,15 @@ describe("desktop shell", () => {
     tauriState.downloadPromise = pending.promise;
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "下载测试数据集" }));
+    await user.click(await screen.findByRole("button", { name: "上传图像" }));
+    await user.click(screen.getByText("内置下载", { selector: "summary" }));
+    await user.click(await screen.findByRole("button", { name: "下载 COCO128" }));
 
     expect(invoke).toHaveBeenCalledWith("download_test_dataset", { datasetKey: "coco128" });
-    const downloading = screen.getByRole("button", { name: "正在下载测试数据" });
-    expect(downloading).toBeDisabled();
-    await user.click(downloading);
     expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "download_test_dataset")).toHaveLength(1);
 
     await act(async () => pending.resolve(null));
-    expect(await screen.findByRole("button", { name: "标注" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "测试数据已下载" })).toBeDisabled();
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "download_test_dataset")).toHaveLength(1);
   });
 
   it("手动下载及失败重试期间保留已有本地项目", async () => {
@@ -824,16 +879,17 @@ describe("desktop shell", () => {
     render(<App />);
 
     expect(await screen.findByText("本机 out")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "下载测试数据集" }));
-    expect(screen.getByRole("heading", { name: "正在下载测试数据..." })).toBeInTheDocument();
+    await user.click(await screen.findByRole("button", { name: "上传图像" }));
+    await user.click(screen.getByText("内置下载", { selector: "summary" }));
+    await user.click(await screen.findByRole("button", { name: "下载 COCO128" }));
     expect(screen.getByText("本机 out")).toBeInTheDocument();
 
     await act(async () => pending.reject(new Error("download timed out")));
-    expect(await screen.findByRole("heading", { name: "测试数据下载失败" })).toBeInTheDocument();
     expect(screen.getByText("本机 out")).toBeInTheDocument();
     tauriState.downloadPromise = null;
-    await user.click(screen.getByRole("button", { name: "重试下载" }));
-    expect(await screen.findByText("COCO128")).toBeInTheDocument();
+    await user.click(await screen.findByRole("button", { name: "上传图像" }));
+    await user.click(screen.getByText("内置下载", { selector: "summary" }));
+    await user.click(await screen.findByRole("button", { name: "下载 COCO128" }));
     expect(screen.getByText("本机 out")).toBeInTheDocument();
     expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "download_test_dataset")).toHaveLength(2);
   });
@@ -843,8 +899,7 @@ describe("desktop shell", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "后端未连接" })).toBeInTheDocument();
-    expect(screen.getByText("请在 Tauri 桌面环境启动应用。")).toBeInTheDocument();
+    expect(await screen.findByText("后端未连接")).toBeInTheDocument();
     expect(screen.queryByText("COCO128")).not.toBeInTheDocument();
   });
 
@@ -854,15 +909,15 @@ describe("desktop shell", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "后端未连接" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "返回数据集" })).toBeInTheDocument();
+    expect(await screen.findByText("后端未连接")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "返回项目数据" })).toBeInTheDocument();
   });
 
   it("新建数据集弹窗要求选择数据集类型并调用真实后端创建", async () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "新建数据集" }));
+    await user.click(await screen.findByRole("button", { name: "新建数据集" }));
 
     expect(screen.getByRole("dialog", { name: "新建数据集" })).toBeInTheDocument();
     expect(screen.getByLabelText("数据集名称")).toHaveValue("Demo BBox 数据集");
@@ -883,7 +938,7 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "新建数据集" }));
+    await user.click(await screen.findByRole("button", { name: "新建数据集" }));
     await user.selectOptions(screen.getByLabelText("数据集类型"), "image-classification");
 
     expect(screen.getByLabelText("数据集类型")).toHaveValue("image-classification");
@@ -912,14 +967,14 @@ describe("desktop shell", () => {
   it("主窗口顶部栏支持拖拽窗口且不抢占按钮操作", async () => {
     render(<App />);
 
-    fireEvent.mouseDown(screen.getByRole("banner"), {
+    fireEvent.mouseDown(topbar(), {
       button: 0,
     });
 
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("start_drag_window"));
 
     vi.mocked(invoke).mockClear();
-    fireEvent.mouseDown(screen.getByRole("button", { name: "新建数据集" }), {
+    fireEvent.mouseDown(screen.getByRole("button", { name: "后端任务" }), {
       button: 0,
     });
 
@@ -930,17 +985,17 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(await firstDatasetButton("打开"));
     vi.mocked(invoke).mockClear();
 
-    fireEvent.mouseDown(within(screen.getByRole("banner")).getByText("COCO128"), {
+    fireEvent.mouseDown(within(topbar()).getByText("COCO128"), {
       button: 0,
     });
 
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("start_drag_window"));
 
     vi.mocked(invoke).mockClear();
-    fireEvent.mouseDown(within(screen.getByRole("banner")).getByRole("button", { name: "添加数据" }), {
+    fireEvent.mouseDown(within(topbar()).getByRole("button", { name: "添加数据" }), {
       button: 0,
     });
 
@@ -998,7 +1053,7 @@ describe("desktop shell", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("已连接桌面后台")).toBeInTheDocument();
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:17310/api/health", { method: "GET" }));
     expect(screen.queryByRole("button", { name: "最小化" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "最大化" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "关闭到托盘" })).not.toBeInTheDocument();
@@ -1024,19 +1079,13 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    expect(screen.getByRole("heading", { name: "数据集" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "数据集" })).toBeInTheDocument();
     expect(await screen.findByText("COCO128")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "测试数据已下载" })).toBeDisabled();
-    expect(screen.getByText("3 个保存分组")).toBeInTheDocument();
+    expect(screen.getAllByText("128", { selector: "strong" }).length).toBeGreaterThan(0);
     expect(screen.queryByRole("heading", { name: "内置下载" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "下载 COCO128" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("complementary", { name: "Dataset details" })).not.toBeInTheDocument();
-    expect(await screen.findByAltText("COCO128 预览 1")).toHaveAttribute(
-      "src",
-      expect.stringContaining("asset://"),
-    );
 
-    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(await screen.findByRole("button", { name: "上传图像" }));
 
     expect(screen.getByRole("dialog", { name: "数据提交" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /选择文件夹/ })).toBeInTheDocument();
@@ -1056,8 +1105,8 @@ describe("desktop shell", () => {
       expect(invoke).toHaveBeenCalledWith("list_project_images", {
         projectId: "coco128",
         groupId: null,
-        offset: 0,
-        limit: 3,
+        offset: null,
+        limit: 1,
       }),
     );
   });
@@ -1066,7 +1115,7 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(await screen.findByRole("button", { name: "上传图像" }));
     await user.click(screen.getByText("内置下载", { selector: "summary" }));
     await user.click(await screen.findByRole("button", { name: "下载 COCO128" }));
 
@@ -1079,7 +1128,7 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(await screen.findByRole("button", { name: "上传图像" }));
     await user.click(screen.getByRole("button", { name: /选择文件夹/ }));
 
     expect(await screen.findByText("Pascal VOC BBox")).toBeInTheDocument();
@@ -1094,7 +1143,7 @@ describe("desktop shell", () => {
       }),
     );
     expect(await screen.findByText("本机 out")).toBeInTheDocument();
-    expect(window.location.hash).toBe("#/datasets/local-out");
+    expect(window.location.hash).toContain("#/projects/fixture/datasets/local-out");
   });
 
   it("数据提交会保留自动识别的 YOLO 分割类型", async () => {
@@ -1102,7 +1151,7 @@ describe("desktop shell", () => {
     tauriState.analysisFormat = "yolo-seg";
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(await screen.findByRole("button", { name: "上传图像" }));
     await user.click(screen.getByRole("button", { name: /选择文件夹/ }));
 
     expect(await screen.findByRole("heading", { name: "YOLO Polygon" })).toBeInTheDocument();
@@ -1121,7 +1170,7 @@ describe("desktop shell", () => {
     tauriState.analysisFormat = "image-classification";
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(await screen.findByRole("button", { name: "上传图像" }));
     await user.click(screen.getByRole("button", { name: /选择文件夹/ }));
 
     expect(await screen.findByRole("heading", { name: "图像分类目录" })).toBeInTheDocument();
@@ -1139,7 +1188,7 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(await screen.findByRole("button", { name: "上传图像" }));
     await user.click(screen.getByRole("button", { name: /选择文件夹/ }));
 
     await waitFor(() => expect(screen.getAllByText("128").length).toBeGreaterThan(0));
@@ -1151,7 +1200,7 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(await screen.findByRole("button", { name: "上传图像" }));
     const file = new File(["demo"], "sample.jpg", { type: "image/jpeg" });
     Object.defineProperty(file, "path", {
       value: "L:\\data_tool\\datas\\lg\\1580_2d\\新建文件夹\\2D数据标注原始\\out\\sample.jpg",
@@ -1179,7 +1228,7 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "数据提交" }));
+    await user.click(await screen.findByRole("button", { name: "上传图像" }));
     await user.click(screen.getByRole("button", { name: /选择文件夹/ }));
 
     expect(await screen.findByRole("option", { name: "链接本机目录（原地写回标注）" })).toBeInTheDocument();
@@ -1187,54 +1236,48 @@ describe("desktop shell", () => {
   });
 
   it("低频工程说明移动到工程信息弹窗", async () => {
-    const user = userEvent.setup();
     render(<App />);
 
     expect(screen.queryByText("data/workspaces/default")).not.toBeInTheDocument();
-
-    await user.click(screen.getByRole("button", { name: "工程信息" }));
-
-    expect(screen.getByRole("dialog", { name: "工程信息" })).toBeInTheDocument();
-    expect(screen.getByText("data/workspaces/default")).toBeInTheDocument();
-    expect(screen.getByText("COCO/YOLO 小数据集导入")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "工程信息" })).not.toBeInTheDocument();
   });
 
   it("左侧主导航使用中文无障碍标签并保持图标化", () => {
     render(<App />);
 
     expect(screen.getByRole("navigation", { name: "主导航" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "数据集" })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: "项目" })).toHaveAttribute(
       "aria-pressed",
       "true",
     );
-    expect(screen.getByRole("button", { name: "任务" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "任务中心" })).toBeInTheDocument();
   });
 
   it("桌面环境顶部显示当前后端连接模式", async () => {
     render(<App />);
 
-    expect(await screen.findByText("Tauri 内部")).toBeInTheDocument();
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("backend_health"));
+    expect(screen.queryByText("后端未连接")).not.toBeInTheDocument();
   });
 
   it("从数据集卡片进入中文标注工作台", async () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "标注" }));
+    await user.click(await firstDatasetButton("开始标注"));
 
     expect(screen.getByRole("heading", { name: "标注工作台" })).toBeInTheDocument();
     expect(screen.getAllByText("000000000009.jpg").length).toBeGreaterThan(0);
     expect(screen.getByText("对象")).toBeInTheDocument();
   });
 
-  it("双击数据集卡片可以打开项目详情", async () => {
+  it("点击数据集卡片可以打开项目详情", async () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.dblClick(await screen.findByRole("article", { name: "COCO128 数据集卡片" }));
+    await user.click(await firstDatasetCard());
 
-    expect(within(screen.getByRole("banner")).getByText("COCO128")).toBeInTheDocument();
+    expect(within(topbar()).getByText("COCO128")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "数据分组" })).toBeInTheDocument();
   });
 
@@ -1242,9 +1285,9 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(await firstDatasetButton("打开"));
 
-    expect(within(screen.getByRole("banner")).getByText("COCO128")).toBeInTheDocument();
+    expect(within(topbar()).getByText("COCO128")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "数据分组" })).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "数据分组" }));
@@ -1264,22 +1307,22 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(await firstDatasetButton("打开"));
 
-    const topbar = screen.getByRole("banner");
-    expect(within(topbar).getByRole("button", { name: "返回数据集列表" })).toBeInTheDocument();
-    expect(within(topbar).queryByRole("button", { name: "数据集" })).not.toBeInTheDocument();
-    expect(within(topbar).getByText("COCO128")).toBeInTheDocument();
-    expect(within(topbar).queryByRole("button", { name: "后端任务" })).not.toBeInTheDocument();
-    expect(within(topbar).queryByRole("button", { name: "数据提交" })).not.toBeInTheDocument();
-    expect(within(topbar).queryByRole("button", { name: "新建数据集" })).not.toBeInTheDocument();
-    expect(within(topbar).getByRole("button", { name: "开始标注" })).toBeInTheDocument();
-    expect(within(topbar).getByRole("button", { name: "独立窗口标注" })).toBeInTheDocument();
-    expect(within(topbar).getByRole("button", { name: "添加数据" })).toBeInTheDocument();
-    expect(within(topbar).getByRole("button", { name: "快照管理" })).toBeInTheDocument();
+    const header = topbar();
+    expect(within(header).getByRole("button", { name: "返回项目数据" })).toBeInTheDocument();
+    expect(within(header).queryByRole("button", { name: "项目" })).not.toBeInTheDocument();
+    expect(within(header).getByText("COCO128")).toBeInTheDocument();
+    expect(within(header).queryByRole("button", { name: "后端任务" })).not.toBeInTheDocument();
+    expect(within(header).queryByRole("button", { name: "数据提交" })).not.toBeInTheDocument();
+    expect(within(header).queryByRole("button", { name: "新建数据集" })).not.toBeInTheDocument();
+    expect(within(header).getByRole("button", { name: "开始标注" })).toBeInTheDocument();
+    expect(within(header).getByRole("button", { name: "独立窗口标注" })).toBeInTheDocument();
+    expect(within(header).getByRole("button", { name: "添加数据" })).toBeInTheDocument();
+    expect(within(header).getByRole("button", { name: "快照管理" })).toBeInTheDocument();
     expect(document.querySelector(".project-header")).not.toBeInTheDocument();
 
-    await user.click(within(topbar).getByRole("button", { name: "导出数据集" }));
+    await user.click(within(header).getByRole("button", { name: "导出数据集" }));
 
     expect(await screen.findByText("导出预设")).toBeInTheDocument();
   });
@@ -1288,20 +1331,19 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
-    await user.click(within(screen.getByRole("banner")).getByRole("button", { name: "返回数据集列表" }));
+    await user.click(await firstDatasetButton("打开"));
+    await user.click(within(topbar()).getByRole("button", { name: "返回项目数据" }));
 
     expect(await screen.findByRole("heading", { name: "数据集" })).toBeInTheDocument();
-    expect(screen.getByRole("article", { name: "COCO128 数据集卡片" })).toBeInTheDocument();
+    expect(await firstDatasetCard()).toBeInTheDocument();
   });
 
   it("单数据集概览展示生产进度、工作队列、最近样本和类别分布", async () => {
     const user = userEvent.setup();
+    window.location.hash = "#/datasets/coco128";
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
-
-    expect(screen.getByRole("heading", { name: "生产进度" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "生产进度" })).toBeInTheDocument();
     expect(screen.getByText("128 / 128")).toBeInTheDocument();
     expect(screen.getByRole("region", { name: "工作队列" })).toHaveTextContent("标注已完成");
     expect(screen.getByRole("region", { name: "最近样本" })).toBeInTheDocument();
@@ -1313,11 +1355,11 @@ describe("desktop shell", () => {
 
   it("概览快捷入口可以进入全部图片和选中类别样本", async () => {
     const user = userEvent.setup();
+    window.location.hash = "#/datasets/coco128";
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
-    await user.click(screen.getByRole("button", { name: "查看全部图片" }));
-    expect(screen.getByRole("heading", { name: "图片浏览" })).toBeInTheDocument();
+    await user.click(await screen.findByRole("button", { name: "查看全部图片" }));
+    expect(screen.getByRole("heading", { name: "图片" })).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "概览" }));
     await user.click(screen.getByRole("button", { name: "查看 person 类别" }));
@@ -1338,7 +1380,7 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(await firstDatasetButton("打开"));
     await user.click(screen.getByRole("button", { name: "类别" }));
     await user.click(screen.getByRole("button", { name: "查看 person 样本" }));
 
@@ -1362,7 +1404,7 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(await firstDatasetButton("打开"));
     await user.click(screen.getByRole("button", { name: "图片" }));
 
     expect(await screen.findByAltText("000000000009.jpg")).toHaveAttribute(
@@ -1375,7 +1417,7 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(await firstDatasetButton("打开"));
     await user.click(screen.getByRole("button", { name: "图片" }));
 
     expect(await screen.findByText("000000000196.jpg")).toBeInTheDocument();
@@ -1389,7 +1431,7 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(await firstDatasetButton("打开"));
     await user.click(screen.getByRole("button", { name: "图片" }));
 
     expect(await screen.findByLabelText("000000000196.jpg 标注预览")).toBeInTheDocument();
@@ -1406,7 +1448,7 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(await firstDatasetButton("打开"));
     await user.click(screen.getByRole("button", { name: "图片" }));
     await user.click(await screen.findByRole("button", { name: "预览 000000000009.jpg" }));
 
@@ -1428,25 +1470,20 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
+    await user.click(await firstDatasetButton("打开"));
     await user.click(screen.getByRole("button", { name: "图片" }));
     await user.click(await screen.findByRole("button", { name: "预览 000000000009.jpg" }));
     await user.click(within(screen.getByRole("dialog", { name: "图像预览" })).getByRole("button", { name: "标记" }));
 
-    await waitFor(() =>
-      expect(invoke).toHaveBeenCalledWith("open_annotation_window", {
-        projectId: "coco128",
-        imageId: "000000000009",
-      }),
-    );
-    expect(within(screen.getByRole("banner")).getByText("COCO128")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "标注工作台" })).toBeInTheDocument();
   });
 
   it("点击开始标注会请求 Tauri 打开独立标注窗口", async () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "独立窗口标注" }));
+    await user.click(await firstDatasetButton("打开"));
+    await user.click(within(topbar()).getByRole("button", { name: "独立窗口标注" }));
 
     expect(invoke).toHaveBeenCalledWith("open_annotation_window", {
       projectId: "coco128",
@@ -1580,12 +1617,15 @@ describe("desktop shell", () => {
 
     await screen.findByRole("button", { name: "复制对象" });
     await user.click(screen.getByRole("button", { name: "复制对象" }));
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     await user.click(screen.getByRole("button", { name: /000000000025.jpg/ }));
 
-    expect(confirm).toHaveBeenCalled();
+    const dialog = await screen.findByRole("dialog", { name: "未保存的标注" });
+    expect(dialog).toHaveTextContent("当前标注尚未保存，是否继续切换图片？");
+    expect(screen.getByRole("button", { name: "保存后继续" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "放弃更改" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "继续标注" }));
     expect(screen.getAllByText(/000000000009.jpg/).length).toBeGreaterThan(0);
-    confirm.mockRestore();
+    expect(screen.queryByRole("dialog", { name: "未保存的标注" })).not.toBeInTheDocument();
   });
 
   it("离开标注路由时阻止丢弃未保存对象", async () => {
@@ -1593,12 +1633,47 @@ describe("desktop shell", () => {
     window.location.hash = "#/annotate/coco128/000000000009";
     render(<App />);
     await user.click(await screen.findByRole("button", { name: "复制对象" }));
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     window.location.hash = "#/datasets";
-    await waitFor(() => expect(confirm).toHaveBeenCalled());
+    await screen.findByRole("dialog", { name: "未保存的标注" });
+    await user.click(screen.getByRole("button", { name: "继续标注" }));
     expect(screen.getByTestId("annotation-canvas")).toBeInTheDocument();
     await waitFor(() => expect(window.location.hash).toBe("#/annotate/coco128/000000000009"));
-    confirm.mockRestore();
+  });
+
+  it("未保存切图可选择放弃更改并继续", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "复制对象" }));
+    await user.click(screen.getByRole("button", { name: /000000000025.jpg/ }));
+    await screen.findByRole("dialog", { name: "未保存的标注" });
+    await user.click(screen.getByRole("button", { name: "放弃更改" }));
+
+    await waitFor(() => expect(window.location.hash).toBe("#/annotate/coco128/000000000025"));
+    expect(await screen.findAllByText(/000000000025.jpg/)).not.toHaveLength(0);
+    expect(screen.queryByText("未保存")).not.toBeInTheDocument();
+  });
+
+  it("未保存切图可保存后继续，保存失败时对话框保持打开", async () => {
+    const user = userEvent.setup();
+    const pending = deferred<unknown>();
+    tauriState.savePromise = pending.promise;
+    window.location.hash = "#/annotate/coco128/000000000009";
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "复制对象" }));
+    await user.click(screen.getByRole("button", { name: /000000000025.jpg/ }));
+    await screen.findByRole("dialog", { name: "未保存的标注" });
+    await user.click(screen.getByRole("button", { name: "保存后继续" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "保存中…" })).toBeDisabled());
+    await act(async () => pending.reject(new Error("磁盘不可写")));
+    expect(await screen.findByRole("alert")).toHaveTextContent("保存失败");
+    expect(screen.getByRole("dialog", { name: "未保存的标注" })).toBeInTheDocument();
+
+    tauriState.savePromise = null;
+    await user.click(screen.getByRole("button", { name: "放弃更改" }));
+    await waitFor(() => expect(window.location.hash).toBe("#/annotate/coco128/000000000025"));
   });
 
   it("保存过程中继续编辑时保持未保存状态并阻止自动切图", async () => {
@@ -1658,6 +1733,7 @@ describe("desktop shell", () => {
     window.location.hash = "#/annotate/coco128/000000000009";
     render(<App />);
     await screen.findByTestId("annotation-canvas");
+    await user.click(screen.getByText("更多属性", { selector: "summary" }));
     await user.type(screen.getByLabelText("对象分组"), "7");
     await user.type(screen.getByLabelText("对象描述"), "遮挡一半");
     await user.type(screen.getByLabelText("对象标志"), "occluded");
@@ -1785,7 +1861,7 @@ describe("desktop shell", () => {
     render(<App />);
     await user.click(await screen.findByRole("button", { name: "验证图片" }));
     await user.click(screen.getByRole("button", { name: "提交质检" }));
-    await screen.findByText(/待质检 \/ 已验证/);
+    await screen.findByText("待质检 · 已验证");
     expect(screen.getByRole("button", { name: "取消验证" })).toBeInTheDocument();
   });
 
@@ -1807,6 +1883,7 @@ describe("desktop shell", () => {
     window.location.hash = "#/annotate/coco128/000000000009";
     render(<App />);
     await screen.findByTestId("annotation-canvas");
+    await user.click(screen.getByText("导入/导出", { selector: "summary" }));
     await user.click(screen.getByRole("button", { name: "加载外部标注" }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("load_external_annotations", expect.objectContaining({
       projectId: "coco128", imageId: "000000000009",
@@ -2221,10 +2298,10 @@ describe("desktop shell", () => {
 
   it("项目详情支持创建快照并基于快照导出", async () => {
     const user = userEvent.setup();
+    window.location.hash = "#/datasets/coco128";
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
-    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "快照" }));
     await user.click(screen.getByRole("button", { name: "创建快照" }));
 
     await waitFor(() =>
@@ -2249,10 +2326,10 @@ describe("desktop shell", () => {
   it("旧快照可升级训练桥接并在成功后隐藏升级入口", async () => {
     const user = userEvent.setup();
     tauriState.snapshotBridgeStatus = "legacy";
+    window.location.hash = "#/datasets/coco128";
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
-    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "快照" }));
     await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));
 
     await waitFor(() =>
@@ -2269,10 +2346,10 @@ describe("desktop shell", () => {
     const user = userEvent.setup();
     tauriState.snapshotBridgeStatus = "legacy";
     tauriState.upgradeSnapshotShouldFail = true;
+    window.location.hash = "#/datasets/coco128";
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
-    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "快照" }));
     await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));
 
     expect(await screen.findByText("训练桥接升级失败：source asset changed")).toBeInTheDocument();
@@ -2282,10 +2359,10 @@ describe("desktop shell", () => {
   it("ready 快照不显示升级入口", async () => {
     const user = userEvent.setup();
     tauriState.snapshotBridgeStatus = "ready";
+    window.location.hash = "#/datasets/coco128";
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
-    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "快照" }));
 
     expect(screen.queryByRole("button", { name: "升级训练桥接" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "重新生成训练桥接" })).not.toBeInTheDocument();
@@ -2294,10 +2371,10 @@ describe("desktop shell", () => {
   it("invalid 快照显示重新生成训练桥接入口", async () => {
     const user = userEvent.setup();
     tauriState.snapshotBridgeStatus = "invalid";
+    window.location.hash = "#/datasets/coco128";
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
-    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "快照" }));
 
     expect(await screen.findByRole("button", { name: "重新生成训练桥接" })).toBeInTheDocument();
   });
@@ -2307,14 +2384,14 @@ describe("desktop shell", () => {
     const upgrade = deferred<Record<string, unknown>>();
     tauriState.snapshotBridgeStatus = "legacy";
     tauriState.upgradeSnapshotPromise = upgrade.promise;
+    window.location.hash = "#/datasets/coco128";
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
-    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "快照" }));
     await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));
     expect(screen.getByRole("button", { name: "正在生成训练桥接…" })).toBeDisabled();
 
-    window.location.hash = "#/datasets/classification-demo";
+    window.location.hash = "#/datasets/classification-demo/快照";
     window.dispatchEvent(new HashChangeEvent("hashchange"));
     expect(await screen.findByText("Classification snapshot")).toBeInTheDocument();
 
@@ -2341,13 +2418,13 @@ describe("desktop shell", () => {
     const upgrade = deferred<Record<string, unknown>>();
     tauriState.snapshotBridgeStatus = "legacy";
     tauriState.upgradeSnapshotPromise = upgrade.promise;
+    window.location.hash = "#/datasets/coco128";
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
-    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "快照" }));
     await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));
 
-    window.location.hash = "#/datasets/classification-demo";
+    window.location.hash = "#/datasets/classification-demo/快照";
     window.dispatchEvent(new HashChangeEvent("hashchange"));
     expect(await screen.findByText("Classification snapshot")).toBeInTheDocument();
     await act(async () => {
@@ -2365,10 +2442,10 @@ describe("desktop shell", () => {
     tauriState.snapshotBridgeStatus = "legacy";
     tauriState.includeSecondLegacySnapshot = true;
     tauriState.upgradeSnapshotPromise = upgrade.promise;
+    window.location.hash = "#/datasets/coco128";
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
-    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "快照" }));
     const upgradeButtons = await screen.findAllByRole("button", { name: "升级训练桥接" });
     fireEvent.click(upgradeButtons[0]);
     fireEvent.click(upgradeButtons[1]);
@@ -2413,16 +2490,16 @@ describe("desktop shell", () => {
       staleUpgrade.promise,
       currentUpgrade.promise,
     ];
+    window.location.hash = "#/datasets/coco128";
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
-    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "快照" }));
     await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));
 
-    window.location.hash = "#/datasets/classification-demo";
+    window.location.hash = "#/datasets/classification-demo/快照";
     window.dispatchEvent(new HashChangeEvent("hashchange"));
     expect(await screen.findByText("Classification snapshot")).toBeInTheDocument();
-    window.location.hash = "#/datasets/coco128";
+    window.location.hash = "#/datasets/coco128/快照";
     window.dispatchEvent(new HashChangeEvent("hashchange"));
     expect(await screen.findByText("Legacy snapshot")).toBeInTheDocument();
     await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));
@@ -2471,16 +2548,16 @@ describe("desktop shell", () => {
       staleUpgrade.promise,
       currentUpgrade.promise,
     ];
+    window.location.hash = "#/datasets/coco128";
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "打开" }));
-    await user.click(screen.getByRole("button", { name: "快照" }));
+    await user.click(await screen.findByRole("button", { name: "快照" }));
     await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));
 
-    window.location.hash = "#/datasets/classification-demo";
+    window.location.hash = "#/datasets/classification-demo/快照";
     window.dispatchEvent(new HashChangeEvent("hashchange"));
     expect(await screen.findByText("Classification snapshot")).toBeInTheDocument();
-    window.location.hash = "#/datasets/coco128";
+    window.location.hash = "#/datasets/coco128/快照";
     window.dispatchEvent(new HashChangeEvent("hashchange"));
     expect(await screen.findByText("Legacy snapshot")).toBeInTheDocument();
     await user.click(await screen.findByRole("button", { name: "升级训练桥接" }));

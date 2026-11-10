@@ -1,0 +1,48 @@
+{
+  "passed": true,
+  "date": "2026-10-27",
+  "vitest": 240,
+  "chromeShell": 12,
+  "webBuild": "passed",
+  "productionStaticChecks": [
+    {
+      "file": "index.html",
+      "sha256": "9b3069a423960fb1e28d2834e0f1d61938488b95d36dc1ff1e20df1513e6a33d",
+      "passed": true
+    },
+    {
+      "file": "assets/index-BF9fMwgI.js",
+      "sha256": "d234f3e932128cc6bb790d2994c6fc4e9374fa8e28998543701f176a32da9895",
+      "passed": true
+    },
+    {
+      "file": "assets/index-BvC8MhLp.css",
+      "sha256": "4c5cec2dbffc9426b8c3018ad6dc0456c2fd6d217859187333fb2c901fcf75cb",
+      "passed": true
+    }
+  ],
+  "productionPid": 1358762,
+  "binaryUnchanged": true,
+  "stagingBrowserChecks": [
+    "dataset preview and primary annotate action",
+    "project settings and history expand",
+    "dataset details keyboard Enter",
+    "edit and save annotation",
+    "restore original x=103 and reload",
+    "save and next without returning home",
+    "previous image and reload canonical URL"
+  ],
+  "productionBrowserChecks": [
+    "current session restored on refresh",
+    "simplified toolbar and collapsed properties/transform panel",
+    "visible image with 2 existing boxes",
+    "next and previous image keep annotation workspace and canonical web URL"
+  ],
+  "desktopPackageRebuilt": false,
+  "screenshots": [
+    "screenshots/before-home.png",
+    "screenshots/after-home.png",
+    "screenshots/after-annotation.png",
+    "screenshots/production-annotation.png"
+  ]
+}

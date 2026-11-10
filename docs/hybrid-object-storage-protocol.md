@@ -7,23 +7,31 @@ PostgreSQL remains authoritative for metadata and authorization.
 
 1. The client computes SHA-256 and byte size before requesting a session.
 2. The client sends metadata and its stable local `clientKey`.
-3. The server creates an `uploading` metadata row and returns a 15-minute
-   presigned `PUT` URL.
-4. The client uploads bytes directly to object storage with the supplied
-   `Content-Type` and `x-amz-meta-sha256`.
+3. The server creates an `uploading` metadata row and returns a five-minute
+   single-use `PUT` object ticket under the public API prefix.
+4. The client uploads bytes to `PUT /api/v1/object-tickets/{token}` with the
+   supplied `Content-Type` and expected `Content-Length`. The API streams the
+   body to private MinIO; the client never receives storage credentials.
 5. The client calls the completion endpoint.
-6. The server uses `HEAD` to verify object size and hash metadata.
-7. In one database transaction, the server marks the object `ready`, writes an
-   audit event, and appends a synchronization change.
+6. The server uses `HEAD` and a streaming SHA-256 pass to verify object size
+   and bytes, then generates a 640px-bounded JPEG thumbnail under the private
+   project key.
+7. The server records independent thumbnail key, MIME, SHA-256, and byte size
+   metadata. In one database transaction, it marks the object `ready`, writes
+   an audit event, and appends a synchronization change.
 
 Metadata rows in `uploading` state are not downloadable. A periodic maintenance
 job may mark expired sessions failed and remove orphan objects.
 
 ## Download and cache
 
-1. The authenticated client requests a five-minute presigned download ticket.
-2. The ticket contains file name, MIME type, SHA-256, byte size, and URL.
-3. The desktop downloads to a process-specific temporary file.
+1. The authenticated client requests a five-minute download ticket. Pass
+   `variant=thumb` to `/api/v1/assets/{assetId}/download-url` for the generated
+   preview; the original and thumbnail each have their own integrity metadata.
+2. The ticket contains file name, MIME type, SHA-256, byte size, and a URL at
+   `/api/v1/object-tickets/{token}`.
+3. The client downloads through the ticket URL; the API streams from private
+   MinIO and applies the recorded MIME type and filename.
 4. SHA-256 and size are verified while streaming.
 5. The verified file is atomically renamed into the content-addressed cache:
    `cache/assets/<first-two-hash-bytes>/<sha256>.<extension>`.
@@ -59,8 +67,10 @@ only and are never interpolated into object keys.
 ## Security
 
 - Buckets are private.
-- The API never proxies full binary payloads.
-- Presigned URLs are scoped to one key and one method.
+- Object buckets remain private; the API streams the bytes and does not expose
+  S3/MinIO URLs.
+- Tickets are scoped to one key, one direction, a five-minute expiry, and (for
+  uploads) one successful use.
 - Access tokens are sent only to the API, never to object storage.
 - Production storage credentials are provided by the deployment secret manager.
 - Logs must not include presigned query strings or bearer tokens.

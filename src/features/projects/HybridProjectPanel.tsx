@@ -32,7 +32,7 @@ import {
   syncProject,
   transitionIssue,
   upsertRemoteProjectMember,
-} from "./api/tauri";
+} from "../../api/tauri";
 import type {
   IssueComment,
   IssueRecord,
@@ -43,7 +43,7 @@ import type {
   RemoteProjectMember,
   SyncConflict,
   SyncSummary,
-} from "./types/domain";
+} from "../../types/domain";
 
 type IssueView = "list" | "board" | "images";
 

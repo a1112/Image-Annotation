@@ -13,17 +13,27 @@ use std::{
     thread,
     time::Duration,
 };
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 const BACKEND_BIND_ADDR: &str = "127.0.0.1:17310";
-const BACKEND_BASE_URL: &str = "http://127.0.0.1:17310";
 
 pub fn backend_bind_addr() -> &'static str {
-    BACKEND_BIND_ADDR
+    static ADDRESS: OnceLock<String> = OnceLock::new();
+    ADDRESS.get_or_init(|| {
+        std::env::var("IMAGE_ANNOTATION_BACKEND_ADDR")
+            .ok()
+            .filter(|value| {
+                value
+                    .parse::<std::net::SocketAddr>()
+                    .is_ok_and(|address| address.ip().is_loopback())
+            })
+            .unwrap_or_else(|| BACKEND_BIND_ADDR.to_string())
+    })
 }
 
 pub fn backend_base_url() -> &'static str {
-    BACKEND_BASE_URL
+    static URL: OnceLock<String> = OnceLock::new();
+    URL.get_or_init(|| format!("http://{}", backend_bind_addr()))
 }
 
 pub fn health_payload() -> Value {
@@ -58,6 +68,7 @@ fn health_payload_for(runtime: &str, capabilities: &[&str]) -> Value {
 }
 
 pub struct BackendRuntime {
+    operations: Mutex<()>,
     repository: Mutex<SampleRepository>,
     tasks: Mutex<Vec<BackendTask>>,
     app: Option<AppHandle>,
@@ -66,6 +77,7 @@ pub struct BackendRuntime {
 impl BackendRuntime {
     fn standalone() -> Self {
         Self {
+            operations: Mutex::new(()),
             repository: Mutex::new(SampleRepository::new()),
             tasks: Mutex::new(Vec::new()),
             app: None,
@@ -74,6 +86,7 @@ impl BackendRuntime {
 
     fn tauri_desktop(app: AppHandle) -> Self {
         Self {
+            operations: Mutex::new(()),
             repository: Mutex::new(SampleRepository::new()),
             tasks: Mutex::new(Vec::new()),
             app: Some(app),
@@ -95,7 +108,7 @@ pub fn start_background_backend(app: AppHandle) -> Result<(), String> {
     if BACKEND_STARTED.get().is_some() {
         return Ok(());
     }
-    let listener = match TcpListener::bind(BACKEND_BIND_ADDR) {
+    let listener = match TcpListener::bind(backend_bind_addr()) {
         Ok(listener) => listener,
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
             let _ = BACKEND_STARTED.set(());
@@ -112,13 +125,13 @@ pub fn start_background_backend(app: AppHandle) -> Result<(), String> {
 }
 
 pub fn run_foreground_backend() -> Result<(), String> {
-    let listener = match TcpListener::bind(BACKEND_BIND_ADDR) {
+    let listener = match TcpListener::bind(backend_bind_addr()) {
         Ok(listener) => listener,
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-            println!("Rust backend already listening on {BACKEND_BASE_URL}");
-            loop {
-                thread::sleep(Duration::from_secs(3600));
-            }
+            return Err(format!(
+                "backend address is already in use: {}",
+                backend_bind_addr()
+            ));
         }
         Err(error) => return Err(error.to_string()),
     };
@@ -241,7 +254,317 @@ fn route_request(request: HttpRequest, runtime: Arc<BackendRuntime>) -> HttpResp
 }
 
 fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Result<Value, String> {
+    let _operation_guard = runtime
+        .operations
+        .lock()
+        .map_err(|error| error.to_string())?;
+    // Native WebView commands and local HTTP clients operate on the same
+    // files. Share the application repository guard so a checkout cannot
+    // interleave with an annotation write through the other transport.
+    let shared_repository = runtime
+        .app
+        .as_ref()
+        .map(|app| app.state::<crate::RepositoryState>());
+    let _shared_guard = shared_repository
+        .as_ref()
+        .map(|repository| repository.lock().map_err(|error| error.to_string()))
+        .transpose()?;
     match command {
+        "list_data_project_branches" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            serde_json::to_value(crate::data_project_versioning::list_data_project_branches(
+                &data_project_id,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "create_data_project_branch" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            let name = string_arg(&args, "name")?;
+            let from_commit_id = optional_string_arg(&args, "fromCommitId");
+            serde_json::to_value(crate::data_project_versioning::create_data_project_branch(
+                &data_project_id,
+                &name,
+                from_commit_id.as_deref(),
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "switch_data_project_branch" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            let branch = string_arg(&args, "branch")?;
+            if let Some(app) = runtime.app.as_ref() {
+                crate::ensure_data_project_annotators_closed(app, &data_project_id)?;
+            }
+            serde_json::to_value(crate::data_project_versioning::switch_data_project_branch(
+                &data_project_id,
+                &branch,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "delete_data_project_branch" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            let branch = string_arg(&args, "branch")?;
+            serde_json::to_value(crate::data_project_versioning::delete_data_project_branch(
+                &data_project_id,
+                &branch,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "data_project_checkout_status" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            serde_json::to_value(
+                crate::data_project_versioning::data_project_checkout_status(&data_project_id, None)?,
+            )
+            .map_err(|error| error.to_string())
+        }
+        "get_data_project_dataset_groups" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            let branch = optional_string_arg(&args, "branch");
+            serde_json::to_value(
+                crate::data_project_versioning::get_data_project_dataset_groups(
+                    &data_project_id,
+                    branch.as_deref(),
+                )?,
+            )
+            .map_err(|error| error.to_string())
+        }
+        "set_data_project_dataset_groups" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            let branch = optional_string_arg(&args, "branch");
+            let expected_revision = args
+                .get("expectedRevision")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| "missing integer argument: expectedRevision".to_string())?;
+            let groups = args
+                .get("groups")
+                .cloned()
+                .ok_or_else(|| "missing groups argument".to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<
+                        Vec<crate::data_project_versioning::DataProjectDatasetGroup>,
+                    >(value)
+                    .map_err(|error| format!("invalid groups argument: {error}"))
+                })?;
+            serde_json::to_value(
+                crate::data_project_versioning::set_data_project_dataset_groups(
+                    &data_project_id,
+                    branch.as_deref(),
+                    expected_revision,
+                    groups,
+                )?,
+            )
+            .map_err(|error| error.to_string())
+        }
+        "list_data_project_version_commits" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            let branch = optional_string_arg(&args, "branch");
+            serde_json::to_value(
+                crate::data_project_versioning::list_data_project_version_commits(
+                    &data_project_id,
+                    branch.as_deref(),
+                )?,
+            )
+            .map_err(|error| error.to_string())
+        }
+        "commit_data_project_branch" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            let branch = string_arg(&args, "branch")?;
+            let message = string_arg(&args, "message")?;
+            serde_json::to_value(crate::data_project_versioning::commit_data_project_branch(
+                &data_project_id,
+                &branch,
+                &message,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "preview_data_project_merge" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            let ours_branch = string_arg(&args, "oursBranch")?;
+            let theirs_branch = string_arg(&args, "theirsBranch")?;
+            serde_json::to_value(crate::data_project_versioning::preview_data_project_merge(
+                &data_project_id,
+                &ours_branch,
+                &theirs_branch,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "merge_data_project_branches" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            let ours_branch = string_arg(&args, "oursBranch")?;
+            let theirs_branch = string_arg(&args, "theirsBranch")?;
+            let message = string_arg(&args, "message")?;
+            if let Some(app) = runtime.app.as_ref() {
+                crate::ensure_data_project_annotators_closed(app, &data_project_id)?;
+            }
+            serde_json::to_value(crate::data_project_versioning::merge_data_project_branches(
+                &data_project_id,
+                &ours_branch,
+                &theirs_branch,
+                &message,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "resolve_data_project_merge" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            let session_id = string_arg(&args, "sessionId")?;
+            // Tauri callers use conflictKey; the standalone acceptance
+            // client historically used key. Accept both spellings so older
+            // merge-session clients remain compatible.
+            let conflict_key = args
+                .get("conflictKey")
+                .or_else(|| args.get("key"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing string argument: conflictKey".to_string())?;
+            let resolution = string_arg(&args, "resolution")?;
+            if let Some(app) = runtime.app.as_ref() {
+                crate::ensure_data_project_annotators_closed(app, &data_project_id)?;
+            }
+            serde_json::to_value(crate::data_project_versioning::resolve_data_project_merge(
+                &data_project_id,
+                &session_id,
+                &conflict_key,
+                &resolution,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "revert_data_project_commit" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            let branch = string_arg(&args, "branch")?;
+            let commit_id = string_arg(&args, "commitId")?;
+            let message = string_arg(&args, "message")?;
+            if let Some(app) = runtime.app.as_ref() {
+                crate::ensure_data_project_annotators_closed(app, &data_project_id)?;
+            }
+            serde_json::to_value(crate::data_project_versioning::revert_data_project_commit(
+                &data_project_id,
+                &branch,
+                &commit_id,
+                &message,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "list_remote_data_projects" => {
+            serde_json::to_value(crate::data_project_sync::list_remote_data_projects()?)
+                .map_err(|error| error.to_string())
+        }
+        "create_remote_data_project" => {
+            let name = string_arg(&args, "name")?;
+            let description = string_arg(&args, "description")?;
+            let organization_id = optional_string_arg(&args, "organizationId");
+            serde_json::to_value(crate::data_project_sync::create_remote_data_project(
+                &name,
+                &description,
+                organization_id.as_deref(),
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "connect_remote_data_project" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            let remote_project_id = string_arg(&args, "remoteProjectId")?;
+            serde_json::to_value(crate::data_project_sync::connect_remote_data_project(
+                &data_project_id,
+                &remote_project_id,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "get_data_project_sync_status" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            serde_json::to_value(crate::data_project_sync::get_data_project_sync_status(
+                &data_project_id,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "publish_data_project" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            if let Some(app) = runtime.app.as_ref() {
+                crate::ensure_data_project_annotators_closed(app, &data_project_id)?;
+            }
+            serde_json::to_value(crate::data_project_sync::publish_data_project(
+                &data_project_id,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "sync_data_project" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            if let Some(app) = runtime.app.as_ref() {
+                crate::ensure_data_project_annotators_closed(app, &data_project_id)?;
+            }
+            serde_json::to_value(crate::data_project_sync::sync_data_project(
+                &data_project_id,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "clone_remote_data_project" => {
+            let remote_project_id = string_arg(&args, "remoteProjectId")?;
+            serde_json::to_value(crate::data_project_sync::clone_remote_data_project(
+                &remote_project_id,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "list_data_project_cloud_members" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            serde_json::to_value(crate::data_project_sync::list_data_project_cloud_members(
+                &data_project_id,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "upsert_data_project_cloud_member" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            let user_id = string_arg(&args, "userId")?;
+            let role = string_arg(&args, "role")?;
+            serde_json::to_value(crate::data_project_sync::upsert_data_project_cloud_member(
+                &data_project_id,
+                &user_id,
+                &role,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "remove_data_project_cloud_member" => {
+            let data_project_id = string_arg(&args, "dataProjectId")?;
+            let user_id = string_arg(&args, "userId")?;
+            serde_json::to_value(crate::data_project_sync::remove_data_project_cloud_member(
+                &data_project_id,
+                &user_id,
+            )?)
+            .map_err(|error| error.to_string())
+        }
+        "list_data_projects" => serde_json::to_value(crate::data_projects::list_data_projects()?)
+            .map_err(|error| error.to_string()),
+        "list_data_project_datasets" => serde_json::to_value(
+            crate::data_projects::list_data_project_datasets(&string_arg(
+                &args,
+                "dataProjectId",
+            )?)?,
+        )
+        .map_err(|error| error.to_string()),
+        "create_data_project" => serde_json::to_value(crate::data_projects::create_data_project(
+            &string_arg(&args, "name")?,
+            &optional_string_arg(&args, "description").unwrap_or_default(),
+        )?)
+        .map_err(|error| error.to_string()),
+        "assign_dataset_to_data_project" => {
+            let data_project_id = optional_string_arg(&args, "dataProjectId");
+            crate::data_projects::assign_dataset_to_data_project(
+                data_project_id.as_deref(),
+                &string_arg(&args, "datasetId")?,
+            )?;
+            Ok(Value::Null)
+        }
+        "get_data_project_working_tree" => serde_json::to_value(
+            crate::data_project_versioning::get_data_project_versioned_working_tree(&string_arg(
+                &args,
+                "dataProjectId",
+            )?)?,
+        )
+        .map_err(|error| error.to_string()),
+        "commit_data_project" => serde_json::to_value(crate::data_projects::commit_data_project(
+            &string_arg(&args, "dataProjectId")?,
+            &string_arg(&args, "message")?,
+        )?)
+        .map_err(|error| error.to_string()),
+        "list_data_project_commits" => serde_json::to_value(
+            crate::data_projects::list_data_project_commits(&string_arg(&args, "dataProjectId")?)?,
+        )
+        .map_err(|error| error.to_string()),
         "backend_health" => Ok(runtime.health_payload()),
         "list_builtin_datasets" => {
             project_fs::ensure_test_data_dirs()?;
@@ -310,6 +633,18 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
                 .project_detail(&project_id)
                 .ok_or_else(|| format!("project not found: {project_id}"))?;
             serde_json::to_value(detail).map_err(|err| err.to_string())
+        }
+        "create_annotation_task" => {
+            let project_id = string_arg(&args, "projectId")?;
+            let name = string_arg(&args, "name")?;
+            let image_ids = optional_string_vec_arg(&args, "imageIds")?;
+            let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
+            serde_json::to_value(repository.create_annotation_task_for_images(
+                &project_id,
+                &name,
+                image_ids.as_deref(),
+            )?)
+            .map_err(|err| err.to_string())
         }
         "list_project_images" => {
             let project_id = string_arg(&args, "projectId")?;
@@ -381,7 +716,9 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
         "set_image_verified" => {
             let project_id = string_arg(&args, "projectId")?;
             let image_id = string_arg(&args, "imageId")?;
-            let verified = args.get("verified").and_then(Value::as_bool)
+            let verified = args
+                .get("verified")
+                .and_then(Value::as_bool)
                 .ok_or_else(|| "missing boolean argument: verified".to_string())?;
             let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
             repository.set_image_verified(&project_id, &image_id, verified)?;
@@ -392,8 +729,12 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
             let image_id = string_arg(&args, "imageId")?;
             let source_path = string_arg(&args, "sourcePath")?;
             let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
-            serde_json::to_value(repository.load_external_annotations(&project_id, &image_id, &source_path)?)
-                .map_err(|err| err.to_string())
+            serde_json::to_value(repository.load_external_annotations(
+                &project_id,
+                &image_id,
+                &source_path,
+            )?)
+            .map_err(|err| err.to_string())
         }
         "export_annotation_file" => {
             let project_id = string_arg(&args, "projectId")?;
@@ -401,8 +742,13 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
             let format = string_arg(&args, "format")?;
             let output_path = optional_string_arg(&args, "outputPath");
             let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
-            serde_json::to_value(repository.export_annotation_file(&project_id, &image_id, &format, output_path)?)
-                .map_err(|err| err.to_string())
+            serde_json::to_value(repository.export_annotation_file(
+                &project_id,
+                &image_id,
+                &format,
+                output_path,
+            )?)
+            .map_err(|err| err.to_string())
         }
         "run_ai_annotation" => {
             let project_id = string_arg(&args, "projectId")?;
@@ -412,8 +758,7 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
                 let repository = runtime.repository.lock().map_err(|err| err.to_string())?;
                 crate::ai::prepare(&repository, &project_id, &image_id)?
             };
-            serde_json::to_value(crate::ai::run(context, options)?)
-                .map_err(|err| err.to_string())
+            serde_json::to_value(crate::ai::run(context, options)?).map_err(|err| err.to_string())
         }
         "cancel_ai_annotation" => {
             let job_id = string_arg(&args, "jobId")?;
@@ -421,8 +766,7 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
         }
         "get_ai_job_status" => {
             let job_id = string_arg(&args, "jobId")?;
-            serde_json::to_value(crate::ai::status(&job_id)?)
-                .map_err(|err| err.to_string())
+            serde_json::to_value(crate::ai::status(&job_id)?).map_err(|err| err.to_string())
         }
         "list_issues" => {
             let project_id = string_arg(&args, "projectId")?;
@@ -498,12 +842,15 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
             let device_id = string_arg(&args, "deviceId")?;
             let mode = string_arg(&args, "mode")?;
             let cache_policy = string_arg(&args, "cachePolicy")?;
-            let auto_sync = args.get("autoSync").and_then(Value::as_bool).unwrap_or(true);
+            let auto_sync = args
+                .get("autoSync")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
             let paths = crate::project_fs::project_paths(&project_id);
             crate::storage::initialize_project_database(&paths.sqlite)?;
             let mut connection =
                 rusqlite::Connection::open(&paths.sqlite).map_err(|err| err.to_string())?;
-            serde_json::to_value(crate::hybrid::configure_remote_project(
+            let config = crate::hybrid::configure_remote_project(
                 &mut connection,
                 &project_id,
                 &server_url,
@@ -512,8 +859,18 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
                 &mode,
                 &cache_policy,
                 auto_sync,
-            )?)
-            .map_err(|err| err.to_string())
+            )?;
+            if let Some(session) = crate::credentials::current_session()? {
+                if session.server_url.trim_end_matches('/') == server_url.trim_end_matches('/') {
+                    connection
+                        .execute(
+                            "UPDATE remote_project_configs SET account_id = ?2 WHERE project_id = ?1",
+                            rusqlite::params![project_id, session.account_id],
+                        )
+                        .map_err(|err| err.to_string())?;
+                }
+            }
+            serde_json::to_value(config).map_err(|err| err.to_string())
         }
         "sync_project" => {
             let project_id = string_arg(&args, "projectId")?;
@@ -819,29 +1176,43 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
             Ok(Value::Null)
         }
         "open_annotation_window" => {
-            let app = runtime
-                .app
-                .as_ref()
-                .ok_or_else(desktop_capability_unavailable)?;
-            let project_id = string_arg(&args, "projectId")?;
-            let image_id = optional_string_arg(&args, "imageId").or_else(|| {
-                runtime.repository.lock().ok().and_then(|repository| {
-                    repository
-                        .project_images(&project_id, None)
-                        .first()
-                        .map(|image| image.id.clone())
-                })
-            });
-            crate::windows::open_annotation_window(app, &project_id, image_id.as_deref())?;
-            Ok(Value::Null)
+            #[cfg(mobile)]
+            {
+                return Err(desktop_capability_unavailable());
+            }
+            #[cfg(not(mobile))]
+            {
+                let app = runtime
+                    .app
+                    .as_ref()
+                    .ok_or_else(desktop_capability_unavailable)?;
+                let project_id = string_arg(&args, "projectId")?;
+                let image_id = optional_string_arg(&args, "imageId").or_else(|| {
+                    runtime.repository.lock().ok().and_then(|repository| {
+                        repository
+                            .project_images(&project_id, None)
+                            .first()
+                            .map(|image| image.id.clone())
+                    })
+                });
+                crate::windows::open_annotation_window(app, &project_id, image_id.as_deref())?;
+                Ok(Value::Null)
+            }
         }
         "open_backend_task_tray" => {
-            let app = runtime
-                .app
-                .as_ref()
-                .ok_or_else(desktop_capability_unavailable)?;
-            crate::windows::open_backend_tasks_window(app)?;
-            Ok(Value::Null)
+            #[cfg(mobile)]
+            {
+                return Err(desktop_capability_unavailable());
+            }
+            #[cfg(not(mobile))]
+            {
+                let app = runtime
+                    .app
+                    .as_ref()
+                    .ok_or_else(desktop_capability_unavailable)?;
+                crate::windows::open_backend_tasks_window(app)?;
+                Ok(Value::Null)
+            }
         }
         "get_file_asset_path" => {
             let project_id = string_arg(&args, "projectId")?;
@@ -857,6 +1228,7 @@ fn dispatch_command(runtime: &BackendRuntime, command: &str, args: Value) -> Res
 }
 
 fn asset_response(runtime: &BackendRuntime, path: &str) -> HttpResponse {
+    let path = path.split('?').next().unwrap_or(path);
     let parts: Vec<_> = path.trim_start_matches("/api/assets/").split('/').collect();
     if parts.len() != 2 {
         return HttpResponse::json(400, json!({ "ok": false, "error": "invalid asset path" }));
@@ -957,6 +1329,15 @@ fn string_vec_arg(args: &Value, key: &str) -> Result<Vec<String>, String> {
                 .collect::<Vec<_>>()
         })
         .ok_or_else(|| format!("missing string array argument: {key}"))
+}
+
+fn optional_string_vec_arg(args: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|err| format!("invalid string array argument: {key}: {err}")),
+    }
 }
 
 fn optional_u32_arg(args: &Value, key: &str) -> Option<u32> {

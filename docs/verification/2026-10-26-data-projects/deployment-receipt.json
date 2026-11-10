@@ -1,0 +1,16 @@
+{
+  "deployedAt": "2026-10-26T10:45:40.419490+00:00",
+  "service": "serverall-image-annotation.service",
+  "pid": 678350,
+  "releasePath": "/home/ubuntu/projects/.deployment/releases/image-annotation/20261026-data-projects-6010fdd11a1a",
+  "sourceSha256": "6010fdd11a1a8f7ff7294229e0053bdfeff242b32d345a8bf546f4c956aff5c1",
+  "binarySha256": "e818d0a52e7cb5b8c3b983a88020d5e80dc52129d40ac3fb4b8717ad7e93e632",
+  "previousBinary": "/home/ubuntu/projects/.deployment/releases/image-annotation/20261025-hosting-caafd1e56a19/image-annotation-server",
+  "backupPath": "/home/ubuntu/projects/.deployment/image-annotation-data-projects-20261026/production-backup",
+  "databaseMigration": "0005_data_projects.sql",
+  "activeDatasetJobsBeforeRestart": 0,
+  "health": "ok",
+  "stagingHttpChecks": 30,
+  "nativeSyncChecks": 15,
+  "note": "Additive schema and executable override; existing dataset routes, environment, object prefix contents and HTTPS reverse proxy retained"
+}

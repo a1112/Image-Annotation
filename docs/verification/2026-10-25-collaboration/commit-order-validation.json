@@ -1,0 +1,70 @@
+{
+  "time": "2026-10-25T07:14:04.231725+00:00",
+  "baseUrl": "http://127.0.0.1:16424",
+  "database": "sa_image_annotation_collaboration_staging",
+  "projectId": "0e5c73e3-88ec-40e3-b00f-600b8506aad8",
+  "seconds": 3.58,
+  "checks": [
+    {
+      "name": "health",
+      "passed": true
+    },
+    {
+      "name": "bootstrap cursor captured",
+      "passed": true
+    },
+    {
+      "name": "device A entered PgSleep in audit trigger",
+      "passed": true
+    },
+    {
+      "name": "device B request is pending while A sleeps",
+      "passed": true
+    },
+    {
+      "name": "mid-flight reads occurred while A slept",
+      "passed": true
+    },
+    {
+      "name": "mid-flight changes hide B",
+      "passed": true
+    },
+    {
+      "name": "mid-flight bootstrap hides B",
+      "passed": true
+    },
+    {
+      "name": "mid-flight bootstrap cursor is unchanged",
+      "passed": true
+    },
+    {
+      "name": "device B stayed pending until A committed",
+      "passed": true
+    },
+    {
+      "name": "device A annotation applied",
+      "passed": true
+    },
+    {
+      "name": "device B annotation applied",
+      "passed": true
+    },
+    {
+      "name": "intermediate cursor returns both annotation events",
+      "passed": true
+    },
+    {
+      "name": "intermediate cursor has no lost annotation event",
+      "passed": true
+    },
+    {
+      "name": "slow A sequence precedes B sequence",
+      "passed": true
+    },
+    {
+      "name": "temporary PgSleep trigger removed",
+      "passed": true
+    }
+  ],
+  "passed": true
+}

@@ -113,7 +113,14 @@ pub fn fetch(cache_root: &Path, request: &CacheFetchRequest) -> Result<CacheFetc
             .extension()
             .and_then(|value| value.to_str())
             .unwrap_or("cache"),
-        std::process::id()
+        format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        )
     ));
     let result = download_and_verify(&temporary, request, &expected_hash);
     match result {
@@ -200,8 +207,7 @@ pub fn register(
             ],
         )
         .map_err(|error| format!("failed to register asset cache entry: {error}"))?;
-    find_record(connection, asset_id)?
-        .ok_or_else(|| "cached asset was not registered".to_string())
+    find_record(connection, asset_id)?.ok_or_else(|| "cached asset was not registered".to_string())
 }
 
 pub fn touch(
@@ -273,9 +279,9 @@ pub fn cleanup_registered(
                           )
                     ) THEN 1
                     WHEN EXISTS (
-                        SELECT 1 FROM outbox
-                        WHERE outbox.entity_id = cache.asset_id
-                          AND outbox.status IN ('pending', 'retrying', 'failed')
+                        SELECT 1 FROM sync_outbox
+                        WHERE sync_outbox.entity_id = cache.asset_id
+                          AND sync_outbox.status NOT IN ('synced', 'superseded')
                     ) THEN 1
                     ELSE 0
                 END
@@ -309,7 +315,9 @@ pub fn cleanup_registered(
         .filter(|entry| removed_paths.contains(&entry.path))
         .map(|entry| entry.byte_size)
         .sum::<u64>();
-    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
     for path in &removed_paths {
         transaction
             .execute(
@@ -361,10 +369,7 @@ fn find_record(
         .map_err(|error| error.to_string())
 }
 
-pub fn cleanup(
-    entries: &mut [CacheEntry],
-    target_bytes: u64,
-) -> Result<Vec<PathBuf>, String> {
+pub fn cleanup(entries: &mut [CacheEntry], target_bytes: u64) -> Result<Vec<PathBuf>, String> {
     let mut current_bytes = entries
         .iter()
         .filter(|entry| entry.path.is_file())
@@ -375,12 +380,19 @@ pub fn cleanup(
     }
 
     entries.sort_by_key(|entry| entry.last_accessed_unix_ms);
+    // Several logical assets may share content-addressed bytes. One protected
+    // reference protects the file for every entry, independent of LRU order.
+    let protected_paths: std::collections::HashSet<_> = entries
+        .iter()
+        .filter(|entry| entry.protected)
+        .map(|entry| entry.path.clone())
+        .collect();
     let mut removed = Vec::new();
     for entry in entries.iter() {
         if current_bytes <= target_bytes {
             break;
         }
-        if entry.protected || !entry.path.is_file() {
+        if entry.protected || protected_paths.contains(&entry.path) || !entry.path.is_file() {
             continue;
         }
         fs::remove_file(&entry.path).map_err(|error| {
@@ -441,6 +453,12 @@ fn download_and_verify(
             .map_err(|error| format!("failed while writing cached asset: {error}"))?;
         hasher.update(&buffer[..read]);
         byte_size = byte_size.saturating_add(read as u64);
+        if request
+            .expected_size
+            .is_some_and(|expected| byte_size > expected)
+        {
+            return Err("asset response exceeds the declared size".to_string());
+        }
     }
     file.sync_all()
         .map_err(|error| format!("failed to flush cached asset: {error}"))?;
@@ -495,9 +513,7 @@ fn sanitize_extension(value: Option<&str>) -> Option<String> {
             .to_ascii_lowercase();
         if normalized.is_empty()
             || normalized.len() > 12
-            || !normalized
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric())
+            || !normalized.bytes().all(|byte| byte.is_ascii_alphanumeric())
         {
             None
         } else {

@@ -1,0 +1,187 @@
+{
+  "server": "https://175.178.16.90/image-annotation",
+  "datasetName": "高线检测数据",
+  "projectName": "北满特钢",
+  "publisherUserId": "6f3fdc3a-24fa-42f2-9b25-5864b51e06fe",
+  "updatedAt": "2026-10-26T08:54:29.809906+00:00",
+  "quotaBefore": {
+    "canManage": true,
+    "limitBytes": 10737418240,
+    "maxAssets": 100000,
+    "organizationId": "4896a429-ece1-4f11-9bd1-b28ec21699a4",
+    "reservedAssets": 0,
+    "reservedBytes": 0,
+    "revision": 69,
+    "updatedAt": "2026-10-25T17:30:05.898884Z",
+    "usedAssets": 36,
+    "usedBytes": 282178
+  },
+  "datasetId": "037d5f43-7b53-48ea-a3dc-b0f036fa2153",
+  "fullVersionId": "f9279917-5969-44dc-a65c-8e954a4624a5",
+  "fullVersion": {
+    "id": "f9279917-5969-44dc-a65c-8e954a4624a5",
+    "name": "v1-高线检测原始全量-20261026",
+    "itemCount": 6036,
+    "manifestHash": "38c5752ef76e6a3019224cba575987ffc318c321218b1045ea1c93e8736735f5",
+    "revision": null
+  },
+  "sourceAnnotationObjects": 13960,
+  "projectId": "d4885d04-1212-4c5c-8753-e5c015a43f32",
+  "reusedAssetCount": 6036,
+  "bootstrapCounts": {
+    "images": 6036,
+    "annotations": 6036,
+    "objects": 13960
+  },
+  "projectMembers": [
+    {
+      "joinedAt": "2026-10-26T08:54:02.504735Z",
+      "role": "owner",
+      "userId": "6f3fdc3a-24fa-42f2-9b25-5864b51e06fe"
+    },
+    {
+      "joinedAt": "2026-10-26T08:54:25.780128Z",
+      "role": "annotator",
+      "userId": "b4a4d115-3a11-4e7f-abd0-911c87cdc0e8"
+    },
+    {
+      "joinedAt": "2026-10-26T08:54:26.729605Z",
+      "role": "reviewer",
+      "userId": "2daed63e-2c6e-4bf2-93d1-c34a133826ea"
+    }
+  ],
+  "sampleImage": {
+    "id": "566dea1b-ab0b-45ab-9430-422cec25ab11",
+    "clientKey": "JPEGImages_120__2__00001",
+    "fileName": "JPEGImages/120 (2)_00001.jpg",
+    "width": 688,
+    "height": 1024,
+    "contentHash": "9c67b0ddf0b25ea243dc4a2f0d1c7098eea89f0470ea3eef7343d7cf184d2cdc",
+    "byteSize": 109620
+  },
+  "taskId": "6adf50e0-2a65-4976-a7c5-ae168789f6f6",
+  "quotaAfter": {
+    "canManage": true,
+    "limitBytes": 10737418240,
+    "maxAssets": 100000,
+    "organizationId": "4896a429-ece1-4f11-9bd1-b28ec21699a4",
+    "reservedAssets": 0,
+    "reservedBytes": 0,
+    "revision": 106,
+    "updatedAt": "2026-10-26T08:54:02.504735Z",
+    "usedAssets": 12108,
+    "usedBytes": 1046920962
+  },
+  "publicationComplete": true,
+  "batches": [
+    {
+      "file": "native-batch-001.zip",
+      "sha256": "ccd7c9f5e45fa6e267ac8c76912423e731bdcf6bc5d34acb2095bc47b199affc",
+      "byteSize": 49873242,
+      "operationId": "873c8cf6-7ed2-5605-a36f-0dfc44730959",
+      "jobId": "4cc7c31e-0681-4024-b5ff-d4ea5ad1b7b0",
+      "status": "completed",
+      "versionId": "4c8681a1-fbcc-4320-a333-9a1a94c6eab1"
+    },
+    {
+      "file": "native-batch-002.zip",
+      "sha256": "92df993f23d4f8015753319d0eee9bc5bf53673ab33f16c06356adb729eb1104",
+      "byteSize": 49888083,
+      "operationId": "94bf1927-5c2a-5167-86cd-e21e3782f690",
+      "jobId": "f115aedb-54d6-4d67-b7c7-e584da0aaa28",
+      "serverStatus": "succeeded",
+      "status": "completed",
+      "versionId": "c7294455-74b8-42f0-9de2-9acdbe7b34c1"
+    },
+    {
+      "file": "native-batch-003.zip",
+      "sha256": "fc94f9586653d40a041d4e8da7687364107e573dafa0520111a9a2099169ea28",
+      "byteSize": 49873512,
+      "operationId": "2c069c9f-1126-5367-876b-2b415b38d718",
+      "jobId": "28bcc458-5bcc-47fa-bf17-662185914890",
+      "serverStatus": "succeeded",
+      "status": "completed",
+      "versionId": "bed37ebe-c237-4a41-b3db-d8fd35cf8e06"
+    },
+    {
+      "file": "native-batch-004.zip",
+      "sha256": "87beea5e133d493986df6dbeaf12c310e84c1798c2cc5de5184b4f2170a01705",
+      "byteSize": 49822176,
+      "operationId": "5f8faa96-053f-5c91-b04c-54e31988a2db",
+      "jobId": "26e3bfda-303b-48ec-a60b-dd7c2fc76368",
+      "serverStatus": "succeeded",
+      "status": "completed",
+      "versionId": "26ca9b50-60bd-44bd-afe0-975e5b07905d"
+    },
+    {
+      "file": "native-batch-005.zip",
+      "sha256": "1163318382488cfa3685c2b2b26e7b43cf3bd6a3ef1a6c3c47dea8ea32919b49",
+      "byteSize": 49837276,
+      "operationId": "b166b96b-80e5-584a-aac3-fab5a462e913",
+      "jobId": "288c99c3-19a6-4322-b63f-eaef06e2e50c",
+      "serverStatus": "succeeded",
+      "status": "completed",
+      "versionId": "901798ca-50c9-4ad2-9c16-ae321ad94063"
+    },
+    {
+      "file": "native-batch-006.zip",
+      "sha256": "76a2ec98005ec5fef70ec8454435a9196c4441b9d57e8299bbbc449cf7028470",
+      "byteSize": 49843699,
+      "operationId": "d1ab9677-cb57-564b-b363-742f74d604fa",
+      "jobId": "fe985e7b-ac8c-47f0-9648-54b0ce59574b",
+      "serverStatus": "succeeded",
+      "status": "completed",
+      "versionId": "a32d3665-0cd1-493e-b05f-d701c74f258d"
+    },
+    {
+      "file": "native-batch-007.zip",
+      "sha256": "dbaad4c1996ea4587eacbef528ce739e0a1cf9a4897abc24928a33080ef78b8b",
+      "byteSize": 49870678,
+      "operationId": "a6b26e3c-ede8-5edf-8ce4-9ec04261f113",
+      "jobId": "1dc0802b-718e-4b7d-9ae7-160f62049d12",
+      "serverStatus": "succeeded",
+      "status": "completed",
+      "versionId": "8f7061c3-759e-4d3b-912c-dc1a7b9deef0"
+    },
+    {
+      "file": "native-batch-008.zip",
+      "sha256": "ed02e0ee4410f527ff91724c594906172ab3a3b50d79f9c41db694179737a247",
+      "byteSize": 49865130,
+      "operationId": "a710e53b-8047-550d-9024-14d20a6ea6b0",
+      "jobId": "58db1270-e47b-4194-917b-e572d0e34220",
+      "serverStatus": "succeeded",
+      "status": "completed",
+      "versionId": "c97227ef-fa31-4cd6-bbe7-8cd5fe0f0c4a"
+    },
+    {
+      "file": "native-batch-009.zip",
+      "sha256": "2c1a956327142819a085bc9efc6b15881c0b0bdf0adee469898205c357a9af5c",
+      "byteSize": 49876221,
+      "operationId": "1d2d1208-eacd-5e28-9f37-38abf5a4603c",
+      "jobId": "f758e511-f845-4573-b5e6-681ccddeddda",
+      "serverStatus": "succeeded",
+      "status": "completed",
+      "versionId": "9fd496ac-beba-4cca-9074-1ec68b4c80e5"
+    },
+    {
+      "file": "native-batch-010.zip",
+      "sha256": "7ee4fd4f262204621a30613a8d2de1b76526597403a791f187b27a4cf6360daa",
+      "byteSize": 49824703,
+      "operationId": "6b98ddf1-c76c-57ec-9711-76cd09174463",
+      "jobId": "e500677d-d4b8-4203-ad8c-67bca40819ca",
+      "serverStatus": "succeeded",
+      "status": "completed",
+      "versionId": "98627d5c-d4e1-4570-9353-52185972b71f"
+    },
+    {
+      "file": "native-batch-011.zip",
+      "sha256": "e1ad978a441243cb79e2a7996495088bcd7b5505d516cc5669b9f3e630c5b5c9",
+      "byteSize": 35960116,
+      "operationId": "5a2f2027-d1f9-5812-8816-a402db1aadd9",
+      "jobId": "24570341-e7cf-49a3-8eaf-4aaf8ebc81ce",
+      "serverStatus": "succeeded",
+      "status": "completed",
+      "versionId": "5a5b70ad-99a8-4787-a102-7f1edfa26c3c"
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "passed": true,
+  "checkedAt": "2026-10-26T16:50:21.408195+00:00",
+  "baseUrl": "http://127.0.0.1:26445",
+  "database": "remote PostgreSQL",
+  "storage": "remote S3",
+  "guiProjectId": "5e81045d-2985-40d2-8738-1755bcc509c9",
+  "guiHeadCommitId": "0e45e5dc",
+  "screenshots": [
+    "screenshots/staging-annotation.png",
+    "screenshots/staging-project-branches.png"
+  ],
+  "checks": [
+    {
+      "name": "browser login uses authenticated remote service",
+      "passed": true
+    },
+    {
+      "name": "GUI creates a project and uploads two real images",
+      "passed": true
+    },
+    {
+      "name": "draw and save a surface-defect bbox; reload restores it",
+      "passed": true
+    },
+    {
+      "name": "GUI commits a clean immutable version snapshot",
+      "passed": true
+    },
+    {
+      "name": "GUI creates and switches to review branch",
+      "passed": true
+    },
+    {
+      "name": "browser downloads server-generated image and label manifest",
+      "passed": true
+    },
+    {
+      "name": "browser WebP rotation and resize output is 320x210 with verified hash",
+      "passed": true
+    },
+    {
+      "name": "conversion history survives reload and service restart",
+      "passed": true
+    },
+    {
+      "name": "expired access cookie automatically refreshes without credential re-entry",
+      "passed": true
+    },
+    {
+      "name": "canvas and filmstrip remain visible with conversion panel collapsed",
+      "passed": true
+    }
+  ]
+}

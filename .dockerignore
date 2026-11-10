@@ -1,0 +1,14 @@
+.git
+node_modules
+artifacts
+data
+sample-data
+dist
+dist-web
+src-tauri/target
+server/target
+.worktrees
+**/.DS_Store
+**/__pycache__
+**/*.log
+server/.env

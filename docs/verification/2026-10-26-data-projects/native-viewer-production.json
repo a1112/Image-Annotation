@@ -1,0 +1,76 @@
+{
+  "passed": true,
+  "checkedAt": "2026-10-26T10:47:59.437865+00:00",
+  "ownerNativeBackend": "http://127.0.0.1:17321",
+  "viewerNativeBackend": "http://127.0.0.1:17323",
+  "remoteProjectId": "4a8e2989-2935-4c00-bb4b-03daddac960d",
+  "ownerProjectId": "data-project-65fbfa72-712d-4f0c-959d-2ce6dab513ee",
+  "viewerProjectId": "data-project-c482e656-ca40-4838-b7ba-de8156dca2f4",
+  "ownerDatasetId": "bbcb0a860-day",
+  "viewerDatasetId": "remote-bd153100a63e25ee5c98d1bf1d763c60dce0c837272f020dcad25468a9378ce3",
+  "ownerCommitId": "1f9db9be-dd53-4587-b6ee-6adfc44b9049",
+  "viewerLocalCommitId": "f39b3f7e-2f9e-439d-957f-37a73398852e",
+  "viewerUserId": "4e43a1f0-7637-4f02-86cc-8b79c00ae552",
+  "checks": [
+    {
+      "name": "owner still discovers the synchronized cloud project",
+      "passed": true
+    },
+    {
+      "name": "viewer discovers the cloud project with viewer ACL",
+      "passed": true
+    },
+    {
+      "name": "viewer clone contains every owner project dataset",
+      "passed": true
+    },
+    {
+      "name": "viewer clone materializes the owner's image dataset",
+      "passed": true
+    },
+    {
+      "name": "viewer clone imports the remote main ref",
+      "passed": true
+    },
+    {
+      "name": "viewer clone restores actual image labels",
+      "passed": true
+    },
+    {
+      "name": "viewer clone retains a merge commit with a second parent",
+      "passed": true
+    },
+    {
+      "name": "viewer clone starts with a clean worktree",
+      "passed": true
+    },
+    {
+      "name": "owner commits and publishes a real annotation update",
+      "passed": true
+    },
+    {
+      "name": "viewer performs a read-only pull of the owner update",
+      "passed": true
+    },
+    {
+      "name": "viewer local commit is read-only and never uploaded",
+      "passed": true
+    },
+    {
+      "name": "owner revokes the native viewer member",
+      "passed": true
+    },
+    {
+      "name": "revoked viewer disappears from remote discovery",
+      "passed": true
+    },
+    {
+      "name": "revoked viewer cannot synchronize its connected project",
+      "passed": true
+    },
+    {
+      "name": "owner data remains available after viewer revocation",
+      "passed": true
+    }
+  ]
+}

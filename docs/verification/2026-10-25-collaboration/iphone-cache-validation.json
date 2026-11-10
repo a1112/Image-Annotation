@@ -1,0 +1,28 @@
+{
+  "assets": [
+    {
+      "imageId": "images_train_demo_001",
+      "sha256": "a3f91ea913037423188c7befae76cd01f92e0e425f180fc3e08b0984c2b4ef9d",
+      "sizeBytes": 6942,
+      "pinned": true,
+      "contentVerified": true
+    },
+    {
+      "imageId": "images_train_demo_002",
+      "sha256": "fef92e4d26eae8fd961889e7b058b5ca793675e4d3787e837da98a4a1683d7dd",
+      "sizeBytes": 6942,
+      "pinned": false,
+      "contentVerified": true
+    },
+    {
+      "imageId": "images_train_demo_003",
+      "sha256": "d67f7eefc8bde8b6929528ad74bce7235914662528d585223bfe7f471b2f3ba4",
+      "sizeBytes": 6942,
+      "pinned": false,
+      "contentVerified": true
+    }
+  ],
+  "allContentVerified": true,
+  "note": "Read-only verification after final GUI offline-pin button click; single task original pinned, other originals retained as ordinary cache",
+  "screenshot": "iphone-offline-pin.png"
+}

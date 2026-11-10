@@ -1,0 +1,20 @@
+{
+  "passed": true,
+  "checkedAt": "2026-10-26T10:54:50.453531+00:00",
+  "projectId": "data-project-ec170fe6-657d-4a03-940c-b63efb9be880",
+  "mergeCommitId": "6c2aa64c-7e0c-4c14-bfca-41e470136da5",
+  "restoreCommitId": "86708073-0d80-4fd8-b707-08f570e12dff",
+  "historyCount": 13,
+  "checks": [
+    "native packaged UI creates and switches branch",
+    "native packaged UI commits annotation changes",
+    "native packaged UI previews and resolves actual annotation conflict",
+    "selected source annotation becomes effective",
+    "merge records two parents",
+    "native packaged UI confirms snapshot restore",
+    "restore creates a child commit and preserves history",
+    "restored annotation is effective",
+    "final conflict UI shows image filename, object labels and geometry summaries"
+  ],
+  "finalReadableConflictCommitId": "b8377d0c-869b-4c75-ab1a-1e55ea6e0c20"
+}

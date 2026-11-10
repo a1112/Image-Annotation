@@ -1,8 +1,11 @@
+import { isTauriRuntime } from "../platform/runtime";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { getWebHealth, getWebImageContentUrl, invokeWebCommand } from "./web";
 import type {
   AnnotationObject,
   AnnotationSaveResult,
   AnnotationState,
+  AnnotationTask,
   DatasetExport,
   BackendTask,
   BuiltinDataset,
@@ -29,6 +32,7 @@ import type {
   ProjectRole,
   RemoteProjectMember,
   PublishProjectResult,
+  TaskItem,
 } from "../types/domain";
 
 export class BackendUnavailableError extends Error {
@@ -43,7 +47,19 @@ export class BackendUnavailableError extends Error {
 
 const localBackendBaseUrl = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:17310";
 
-export type BackendRuntime = "tauri-desktop" | "standalone-backend";
+export type BackendTransportMode = "local" | "web";
+let backendTransportMode: BackendTransportMode = "local";
+
+/** Select the browser's cookie-authenticated server transport explicitly. */
+export function configureBackendTransport(mode: BackendTransportMode): void {
+  backendTransportMode = mode;
+}
+
+export function isWebBackendTransport(): boolean {
+  return backendTransportMode === "web";
+}
+
+export type BackendRuntime = "tauri-desktop" | "standalone-backend" | "web-remote-service";
 
 export type BackendHealth = {
   status: string;
@@ -65,6 +81,18 @@ export function isBackendUnavailableError(error: unknown): error is BackendUnava
 }
 
 export async function detectBackendConnection(): Promise<BackendConnection> {
+  if (backendTransportMode === "web") {
+    try {
+      const health = await getWebHealth();
+      return {
+        mode: "web-standalone-backend",
+        label: "已连接远端服务",
+        health,
+      };
+    } catch {
+      return { mode: "unavailable", label: "远端服务未连接", health: null };
+    }
+  }
   try {
     const health = await invoke<BackendHealth>("backend_health");
     return { mode: "tauri", label: "Tauri 内部", health };
@@ -132,13 +160,26 @@ export async function listClassSamples(
   });
 }
 
+export const IMAGE_ASSETS_CHANGED_EVENT = "image-annotation:image-assets-changed";
+let imageAssetGeneration = 0;
+
+export function invalidateImageAssets() {
+  imageAssetGeneration = Date.now();
+  window.dispatchEvent(new Event(IMAGE_ASSETS_CHANGED_EVENT));
+}
+
 export async function getFileAssetUrl(projectId: string, imageId: string): Promise<string> {
+  const generation = imageAssetGeneration;
+  const versioned = (url: string) => generation ? `${url}${url.includes("?") ? "&" : "?"}v=${generation}` : url;
+  if (backendTransportMode === "web") {
+    return versioned(getWebImageContentUrl(projectId, imageId));
+  }
   try {
     const path = await invoke<string>("get_file_asset_path", { projectId, imageId });
-    return convertFileSrc(path);
+    return versioned(convertFileSrc(path));
   } catch (error) {
     if (looksLikeMissingTauriBackend(error)) {
-      return `${localBackendBaseUrl}/api/assets/${encodeURIComponent(projectId)}/${encodeURIComponent(imageId)}`;
+      return versioned(`${localBackendBaseUrl}/api/assets/${encodeURIComponent(projectId)}/${encodeURIComponent(imageId)}`);
     }
     throw error;
   }
@@ -169,6 +210,48 @@ export async function saveImageAnnotations(
 
 export async function submitImageAnnotations(projectId: string, imageId: string): Promise<void> {
   await invokeRequired("submit_image_annotations", { projectId, imageId });
+}
+
+export async function listTasks(projectId: string): Promise<AnnotationTask[]> {
+  return invokeRequired("list_tasks", { projectId });
+}
+
+export async function createAnnotationTask(
+  projectId: string,
+  name: string,
+  imageIds?: string[],
+): Promise<AnnotationTask> {
+  const args: { projectId: string; name: string; imageIds?: string[] } = { projectId, name };
+  // An omitted/empty list means the whole project to the Rust command. Do not
+  // serialize [] as Some([]): older native backends reject that as an empty
+  // task instead of applying their existing all-images default.
+  if (imageIds && imageIds.length > 0) args.imageIds = imageIds;
+  return invokeRequired("create_annotation_task", args);
+}
+
+export async function listTaskItems(projectId: string, taskId: string): Promise<TaskItem[]> {
+  return invokeRequired("list_task_items", { projectId, taskId });
+}
+
+export async function claimTaskItem(projectId: string, taskId: string, imageId: string): Promise<void> {
+  await invokeRequired("claim_task_item", { projectId, taskId, imageId });
+}
+
+export async function releaseTaskItem(projectId: string, taskId: string, imageId: string): Promise<void> {
+  await invokeRequired("release_task_item", { projectId, taskId, imageId });
+}
+
+export async function reviewTaskItem(
+  projectId: string,
+  imageId: string,
+  decision: string,
+  note = "",
+): Promise<void> {
+  await invokeRequired("review_task_item", { projectId, imageId, decision, note });
+}
+
+export async function listReviewQueue(projectId: string): Promise<DatasetImage[]> {
+  return invokeRequired("list_review_queue", { projectId });
 }
 
 export async function setImageVerified(projectId: string, imageId: string, verified: boolean): Promise<void> {
@@ -524,19 +607,37 @@ export async function exportDataset(
   return invokeRequired("export_dataset", { projectId, snapshotId, format });
 }
 
-async function invokeRequired<T>(
+/**
+ * Low-level command bridge for feature modules.
+ *
+ * Keeping this as the only escape hatch means mobile features still use the
+ * Rust repository/session/cache implementation instead of growing a second
+ * browser-side storage or synchronisation layer.
+ */
+export async function invokeBackendCommand<T>(
   command: string,
   args?: Record<string, unknown>,
 ): Promise<T> {
+  if (backendTransportMode === "web") {
+    return invokeWebCommand<T>(command, args);
+  }
   try {
-    return args === undefined ? await invoke<T>(command) : await invoke<T>(command, args);
+    const result = args === undefined ? await invoke<T>(command) : await invoke<T>(command, args);
+    notifyLocalChange(command, args);
+    return result;
   } catch (error) {
     if (looksLikeMissingTauriBackend(error)) {
-      return invokeLocalBackend<T>(command, args, error);
+      const result = await invokeLocalBackend<T>(command, args, error);
+      notifyLocalChange(command, args);
+      return result;
     }
     throw error;
   }
 }
+
+// Existing desktop feature code uses the private name. Keep the alias while
+// exposing the bridge to the mobile feature modules above.
+const invokeRequired = invokeBackendCommand;
 
 async function invokeLocalBackend<T>(
   command: string,
@@ -564,7 +665,18 @@ async function invokeLocalBackend<T>(
   return payload.data as T;
 }
 
+const localMutations = new Set([
+  "save_image_annotations", "submit_image_annotations", "review_task_item", "create_annotation_task",
+  "create_issue", "transition_issue", "add_issue_comment", "restore_annotation_version",
+  "create_project_folder", "rename_project_folder", "delete_project_folder", "move_image_to_project_folder",
+]);
+function notifyLocalChange(command: string, args?: Record<string, unknown>) {
+  if (localMutations.has(command) && typeof args?.projectId === "string" && typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent("image-annotation:local-change", { detail: { projectId: args.projectId } }));
+  }
+}
+
 function looksLikeMissingTauriBackend(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
-  return /tauri|__TAURI__|ipc|invoke|not available|unavailable/i.test(message);
+  return !isTauriRuntime() && /tauri|__TAURI__|ipc|invoke|not available|unavailable/i.test(message);
 }

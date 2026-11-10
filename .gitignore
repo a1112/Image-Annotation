@@ -1,11 +1,19 @@
 node_modules/
 dist/
+dist-web/
 data/
 .worktrees/
 src-tauri/target/
-src-tauri/gen/
+# Tauri Android/iOS project files are generated from the checked-in config,
+# but the platform project itself is versioned so local signing and CI can
+# reproduce the mobile builds without depending on a developer's machine.
 server/target/
 server/.env
+artifacts/
+__pycache__/
 *.log
 .DS_Store
 Thumbs.db
+
+# Tauri generates capability schemas during builds.
+src-tauri/gen/schemas/

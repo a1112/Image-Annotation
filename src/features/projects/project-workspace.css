@@ -1,0 +1,398 @@
+/* Project workspace keeps the data-management surface compact and neutral. */
+.project-page .project-surface {
+  padding: 14px;
+  border-color: #d7dce4;
+  border-radius: 6px;
+}
+
+.project-page .project-surface h2 {
+  margin-bottom: 10px;
+  font-size: 16px;
+}
+
+.project-page .image-folder-toolbar {
+  gap: 8px;
+  margin-bottom: 10px;
+  padding: 7px 8px;
+  border-color: #d7dce4;
+  border-radius: 6px;
+  background: #f8f9fb;
+}
+
+.project-page .image-folder-list {
+  gap: 4px;
+}
+
+.project-page .image-folder-list button,
+.project-page .image-folder-actions button,
+.project-page .image-folder-actions select {
+  height: 28px;
+  border-color: #d1d7df;
+  border-radius: 4px;
+  color: #4b5563;
+  font-size: 11px;
+}
+
+.project-page .image-folder-list button.active {
+  border-color: #9aa4b2;
+  background: #e9edf1;
+  color: #1f2937;
+}
+
+.project-page .image-browser {
+  gap: 10px;
+}
+
+.project-page .image-browser-header {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.project-page .image-browser-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid #d7dce4;
+  border-radius: 6px;
+  background: #f8f9fb;
+}
+
+.project-page .image-browser-heading {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 10px;
+  min-width: max-content;
+}
+
+.project-page .image-browser-heading h2 {
+  margin: 0;
+  color: #1f2937;
+  font-size: 15px;
+  line-height: 1.2;
+}
+
+.project-page .image-browser-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.project-page .image-browser-stats > span,
+.project-page .image-browser-stats > span + span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+}
+
+.project-page .image-browser-stats strong {
+  color: #374151;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.project-page .image-browser-stats small {
+  color: #6b7280;
+  font-size: 11px;
+}
+
+.project-page .image-browser-controls {
+  display: flex;
+  align-items: center;
+  flex: 1 1 560px;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+}
+
+.project-page .image-status-filter {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 2px;
+  max-width: 100%;
+  padding: 0;
+  overflow-x: auto;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  scrollbar-width: thin;
+}
+
+.project-page .image-status-filter button,
+.project-page .image-filter-reset,
+.project-page .image-browser-controls .pager-actions button {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid #d1d7df;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #4b5563;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.project-page .image-status-filter button.active {
+  border-color: #9aa4b2;
+  background: #e9edf1;
+  box-shadow: none;
+  color: #1f2937;
+}
+
+.project-page .image-browser-controls .image-class-filter {
+  display: flex;
+  align-items: center;
+  align-content: flex-start;
+  flex: 1 1 220px;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 140px;
+  max-height: 56px;
+  padding: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  border: 0;
+}
+
+.project-page .image-browser-controls .image-class-filter button {
+  height: 28px;
+  padding: 0 7px;
+  border-color: #d1d7df;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #4b5563;
+  font-size: 11px;
+}
+
+.project-page .image-browser-controls .image-class-filter button.active {
+  border-color: #9aa4b2;
+  background: #e9edf1;
+  color: #1f2937;
+}
+
+.project-page .image-browser-controls .image-class-filter button.active strong {
+  background: #d7dce4;
+  color: #374151;
+}
+
+.project-page .image-browser-controls .image-class-filter strong {
+  border-radius: 3px;
+  background: #eef0f3;
+  color: #6b7280;
+}
+
+.project-page .image-filter-reset:disabled,
+.project-page .image-browser-controls .pager-actions button:disabled {
+  opacity: 0.5;
+}
+
+.project-page .image-browser-controls .pager-actions {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-left: auto;
+}
+
+.project-page .image-browser-controls .pager-actions span {
+  color: #6b7280;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.project-page .image-grid {
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 8px;
+}
+
+.project-page .image-tile {
+  gap: 7px;
+  padding: 8px;
+  border-color: #d7dce4;
+  border-radius: 5px;
+  box-shadow: none;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.project-page .image-tile:hover,
+.project-page .image-tile:focus-within,
+.project-page .selectable-image-grid .image-tile:hover {
+  border-color: #9aa4b2;
+  box-shadow: none;
+  transform: none;
+}
+
+.project-page .selectable-image-grid .image-tile.selected {
+  border-color: #6b7280;
+  background: #f1f3f5;
+  box-shadow: 0 0 0 1px #6b7280;
+}
+
+.project-page .selectable-image-grid .image-tile.selected::after {
+  top: 12px;
+  right: 12px;
+  width: 18px;
+  height: 18px;
+  border-width: 1px;
+  background: #4b5563;
+  box-shadow: none;
+}
+
+.project-page .selectable-image-grid .image-tile .sample-thumb {
+  height: 118px;
+  border-color: #d7dce4;
+  border-radius: 4px;
+}
+
+.project-page .image-tile-actions {
+  gap: 5px;
+}
+
+.project-page .image-tile-actions button {
+  height: 28px;
+  border-radius: 4px;
+  font-size: 11px;
+}
+
+.project-page .image-filter-empty {
+  min-height: 180px;
+  padding: 20px;
+  border-color: #d1d7df;
+  border-radius: 6px;
+  background: #f8f9fb;
+}
+
+.project-page .image-filter-empty strong {
+  margin-top: 7px;
+  font-size: 13px;
+}
+
+.project-page .image-filter-empty span {
+  margin-top: 3px;
+  font-size: 11px;
+}
+
+.project-page .tab-title-stack {
+  gap: 2px;
+  min-width: 0;
+}
+
+.project-page .tab-title-stack h2 {
+  font-size: 16px;
+}
+
+.project-page .class-sample-layout,
+.project-page .class-sample-panel,
+.project-page .task-workspace {
+  gap: 10px;
+}
+
+.project-page .task-creation-card {
+  gap: 10px;
+  padding: 12px;
+  border-color: #d7dce4;
+  border-radius: 6px;
+  background: #f8f9fb;
+}
+
+.project-page .task-creation-header h3 {
+  font-size: 15px;
+}
+
+.project-page .task-name-field input {
+  height: 32px;
+  border-color: #d1d7df;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.project-page .task-image-picker {
+  gap: 5px;
+  padding: 7px;
+  border-color: #d7dce4;
+  border-radius: 5px;
+}
+
+.project-page .task-image-option {
+  gap: 6px;
+  padding: 6px 7px;
+  border-color: #e0e4e9;
+  border-radius: 4px;
+}
+
+.project-page .data-table {
+  border-color: #d7dce4;
+  border-radius: 6px;
+}
+
+.project-page .table-row {
+  min-height: 38px;
+  padding-inline: 10px;
+  font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  .project-page .image-browser-heading,
+  .project-page .image-browser-controls {
+    flex-basis: 100%;
+  }
+
+  .project-page .image-browser-heading {
+    justify-content: space-between;
+  }
+
+  .project-page .image-browser-controls .pager-actions {
+    margin-left: 0;
+  }
+}
+
+@media (max-width: 560px) {
+  .project-page .project-surface {
+    padding: 10px;
+  }
+
+  .project-page .image-browser-toolbar {
+    align-items: stretch;
+    padding: 7px;
+  }
+
+  .project-page .image-browser-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .project-page .image-browser-controls {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+  }
+
+  .project-page .image-status-filter {
+    grid-column: 1 / -1;
+  }
+
+  .project-page .image-browser-controls .image-class-filter {
+    grid-column: 1 / -1;
+    min-width: 0;
+  }
+
+  .project-page .image-browser-controls .pager-actions {
+    justify-content: flex-start;
+  }
+
+  .project-page .image-browser-controls .pager-actions span {
+    flex-basis: 100%;
+  }
+}

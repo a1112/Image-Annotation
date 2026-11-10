@@ -1,0 +1,42 @@
+{
+  "projectId": "d2355506-c746-4bfe-b144-0ddd25f7e142",
+  "desktopLocalId": "2026-10-25",
+  "taskId": "5419a070-941d-4ddd-bf5a-4d7ad2e6dc0f",
+  "assetCount": 3,
+  "annotationCount": 3,
+  "taskItemCount": 1,
+  "checks": [
+    "desktop native app launch",
+    "demo dataset import",
+    "mouse pointer bbox creation",
+    "undo and redo",
+    "native save",
+    "LabelMe export has 3 shapes",
+    "LabelMe import roundtrip",
+    "switch image and restore 3 shapes",
+    "restart restores project",
+    "password login using native keyring",
+    "UI publishes project and 3 assets",
+    "UI creates selected-image task; independently confirmed through server API",
+    "GUI observes mobile annotation and iPad approval: 5 objects, 通过; image switched away/back to refresh loaded canvas"
+  ],
+  "desktopExecutableSha256": "e104fe6af54065a82eeaaef8efeb28dbcfe95f1eadb53c3d7c3942d5d02af263",
+  "repeatedPublishRegression": "fixed: publishing links the cache without enqueueing redundant project updates",
+  "historicalFixtureConflictRecovery": "resolved via the existing Rust resolve_sync_conflict API, choosing remote",
+  "initialPublishedAnnotationObjectCounts": [
+    2,
+    2,
+    3
+  ],
+  "crossDeviceFinal": {
+    "imageId": "images_train_demo_001",
+    "objectCount": 5,
+    "qaStatus": "通过",
+    "serverRevision": 6,
+    "syncStatus": "synced",
+    "openConflicts": 0,
+    "pendingOutbox": 0,
+    "screenshot": "desktop-approved-five-boxes.png",
+    "serverReport": "cross-device-server-validation.json"
+  }
+}

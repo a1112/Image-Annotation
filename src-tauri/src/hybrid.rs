@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -146,7 +146,11 @@ pub struct FolderWorkspace {
 }
 
 pub fn prepare_database(path: &Path) -> Result<(), String> {
-    if !path.exists() || fs::metadata(path).map(|meta| meta.len() == 0).unwrap_or(true) {
+    if !path.exists()
+        || fs::metadata(path)
+            .map(|meta| meta.len() == 0)
+            .unwrap_or(true)
+    {
         return Ok(());
     }
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
@@ -155,10 +159,7 @@ pub fn prepare_database(path: &Path) -> Result<(), String> {
     if version >= CURRENT_SCHEMA_VERSION {
         return Ok(());
     }
-    let backup = path.with_extension(format!(
-        "sqlite.backup-v{version}-{}",
-        now_unix_string()
-    ));
+    let backup = path.with_extension(format!("sqlite.backup-v{version}-{}", now_unix_string()));
     fs::copy(path, backup).map_err(|err| format!("failed to back up project database: {err}"))?;
     Ok(())
 }
@@ -188,6 +189,8 @@ pub fn migrate_database(connection: &mut Connection) -> Result<(), String> {
             4 => migrate_remote_configuration(&transaction)?,
             5 => migrate_remote_entity_ids(&transaction)?,
             6 => migrate_issue_attachments(&transaction)?,
+            7 => migrate_collaboration_state(&transaction)?,
+            8 => ensure_column(&transaction, "remote_project_configs", "account_id", "TEXT")?,
             _ => return Err(format!("unknown schema migration: {target}")),
         }
         transaction
@@ -231,24 +234,48 @@ fn migrate_hybrid_schema(connection: &Connection) -> Result<(), String> {
         ("projects", "revision", "INTEGER NOT NULL DEFAULT 0"),
         ("projects", "server_revision", "INTEGER"),
         ("projects", "local_revision", "INTEGER NOT NULL DEFAULT 0"),
-        ("projects", "sync_status", "TEXT NOT NULL DEFAULT 'local_only'"),
+        (
+            "projects",
+            "sync_status",
+            "TEXT NOT NULL DEFAULT 'local_only'",
+        ),
         ("projects", "last_synced_at", "TEXT"),
         ("projects", "sync_error", "TEXT"),
         ("projects", "dirty", "INTEGER NOT NULL DEFAULT 0"),
-        ("projects", "created_by", "TEXT NOT NULL DEFAULT 'local-user'"),
-        ("projects", "updated_by", "TEXT NOT NULL DEFAULT 'local-user'"),
+        (
+            "projects",
+            "created_by",
+            "TEXT NOT NULL DEFAULT 'local-user'",
+        ),
+        (
+            "projects",
+            "updated_by",
+            "TEXT NOT NULL DEFAULT 'local-user'",
+        ),
         ("projects", "deleted_at", "TEXT"),
         ("images", "revision", "INTEGER NOT NULL DEFAULT 0"),
         ("images", "server_revision", "INTEGER"),
         ("images", "local_revision", "INTEGER NOT NULL DEFAULT 0"),
-        ("images", "sync_status", "TEXT NOT NULL DEFAULT 'local_only'"),
+        (
+            "images",
+            "sync_status",
+            "TEXT NOT NULL DEFAULT 'local_only'",
+        ),
         ("images", "last_synced_at", "TEXT"),
         ("images", "sync_error", "TEXT"),
         ("images", "dirty", "INTEGER NOT NULL DEFAULT 0"),
         ("images", "deleted_at", "TEXT"),
         ("annotations", "server_revision", "INTEGER"),
-        ("annotations", "local_revision", "INTEGER NOT NULL DEFAULT 0"),
-        ("annotations", "sync_status", "TEXT NOT NULL DEFAULT 'local_only'"),
+        (
+            "annotations",
+            "local_revision",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "annotations",
+            "sync_status",
+            "TEXT NOT NULL DEFAULT 'local_only'",
+        ),
         ("annotations", "last_synced_at", "TEXT"),
         ("annotations", "sync_error", "TEXT"),
         ("annotations", "dirty", "INTEGER NOT NULL DEFAULT 0"),
@@ -540,7 +567,7 @@ pub fn record_review_operation(
             params![image_id],
         )
         .map_err(|err| err.to_string())?;
-    enqueue_operation(
+    let review_operation_id = enqueue_operation(
         transaction,
         &project_id,
         "qa_review",
@@ -554,6 +581,7 @@ pub fn record_review_operation(
     }
 
     let issue_id = unique_id("issue");
+    transaction.execute("UPDATE sync_outbox SET payload_json=json_set(payload_json,'$.issueClientKey',?2) WHERE id=?1",params![review_operation_id,issue_id]).map_err(|error|error.to_string())?;
     let now = now_unix_string();
     let description = if note.trim().is_empty() {
         "质检驳回，等待修复".to_string()
@@ -613,14 +641,52 @@ pub fn enqueue_operation(
     base_revision: Option<i64>,
     payload: Value,
 ) -> Result<String, String> {
+    // An operation becomes immutable once attempted: retries must carry the same body.
+    // Only the newest, never-sent draft may be coalesced, never across a submission.
+    if entity_type == "annotation" && operation == "update" {
+        let latest: Option<(String, String, String, Option<String>)> = transaction.query_row(
+            "SELECT id, operation, status, attempted_at FROM sync_outbox WHERE project_id = ?1 AND entity_type = ?2 AND entity_id = ?3 ORDER BY rowid DESC LIMIT 1",
+            params![project_id, entity_type, entity_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        if let Some((id, previous, status, attempted)) = latest {
+            if previous == "update" && status == "pending" && attempted.is_none() {
+                transaction
+                    .execute(
+                        "UPDATE sync_outbox SET payload_json = ?2, updated_at = ?3 WHERE id = ?1",
+                        params![id, payload.to_string(), now_unix_string()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                return Ok(id);
+            }
+        }
+    }
+    let base = transaction.query_row(
+        "SELECT revision, payload_json FROM sync_entity_bases WHERE project_id = ?1 AND entity_type = ?2 AND entity_id = ?3",
+        params![project_id, if entity_type == "qa_review" { "annotation" } else { entity_type }, entity_id],
+        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?)),
+    ).optional().map_err(|error| error.to_string())?;
+    let accepted_revision = base.as_ref().and_then(|value| value.0);
+    let known_revision = if matches!(entity_type, "annotation" | "qa_review") {
+        transaction
+            .query_row(
+                "SELECT server_revision FROM annotations WHERE id = ?1",
+                [entity_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .flatten()
+    } else {
+        None
+    };
     let id = unique_id("op");
     let now = now_unix_string();
-    transaction
-        .execute(
-            "INSERT INTO sync_outbox (id, project_id, entity_type, entity_id, operation, base_revision, payload_json, status, retry_count, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0, ?8, ?8)",
-            params![id, project_id, entity_type, entity_id, operation, base_revision, payload.to_string(), now],
-        )
-        .map_err(|err| err.to_string())?;
+    transaction.execute(
+        "INSERT INTO sync_outbox (id, project_id, entity_type, entity_id, operation, base_revision, payload_json, base_json, status, retry_count, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', 0, ?9, ?9)",
+        params![id, project_id, entity_type, entity_id, operation,
+            base_revision.or(accepted_revision).or(known_revision), payload.to_string(), base.map(|value| value.1), now],
+    ).map_err(|error| error.to_string())?;
     Ok(id)
 }
 
@@ -872,7 +938,7 @@ pub fn list_ready_outbox(
 ) -> Result<Vec<OutboxOperation>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT id, project_id, entity_type, entity_id, operation, base_revision, payload_json, status, retry_count, next_retry_at, error_message, created_at, updated_at FROM sync_outbox WHERE project_id = ?1 AND (status = 'pending' OR (status = 'failed' AND next_retry_at IS NOT NULL AND next_retry_at <= ?2)) ORDER BY created_at LIMIT ?3",
+            "SELECT o.id, o.project_id, o.entity_type, o.entity_id, o.operation, o.base_revision, o.payload_json, o.status, o.retry_count, o.next_retry_at, o.error_message, o.created_at, o.updated_at FROM sync_outbox o WHERE o.project_id = ?1 AND (o.status = 'pending' OR (o.status = 'failed' AND o.next_retry_at IS NOT NULL AND CAST(o.next_retry_at AS INTEGER) <= CAST(?2 AS INTEGER))) AND NOT EXISTS (SELECT 1 FROM sync_outbox prior WHERE prior.project_id = o.project_id AND prior.entity_id = o.entity_id AND prior.rowid < o.rowid AND prior.status NOT IN ('synced', 'superseded')) ORDER BY o.rowid LIMIT ?3",
         )
         .map_err(|err| err.to_string())?;
     let records = statement
@@ -913,6 +979,55 @@ pub fn configure_remote_project(
     cache_policy: &str,
     auto_sync: bool,
 ) -> Result<RemoteProjectConfig, String> {
+    configure_remote_project_impl(
+        connection,
+        project_id,
+        server_url,
+        remote_project_id,
+        device_id,
+        mode,
+        cache_policy,
+        auto_sync,
+        true,
+    )
+}
+
+/// Opening a shared project only links this installation's cache. It must not
+/// attempt a project-admin write on behalf of an annotator or viewer.
+pub fn cache_remote_project(
+    connection: &mut Connection,
+    project_id: &str,
+    server_url: &str,
+    remote_project_id: &str,
+    device_id: &str,
+    mode: &str,
+    cache_policy: &str,
+    auto_sync: bool,
+) -> Result<RemoteProjectConfig, String> {
+    configure_remote_project_impl(
+        connection,
+        project_id,
+        server_url,
+        remote_project_id,
+        device_id,
+        mode,
+        cache_policy,
+        auto_sync,
+        false,
+    )
+}
+
+fn configure_remote_project_impl(
+    connection: &mut Connection,
+    project_id: &str,
+    server_url: &str,
+    remote_project_id: &str,
+    device_id: &str,
+    mode: &str,
+    cache_policy: &str,
+    auto_sync: bool,
+    publish_settings: bool,
+) -> Result<RemoteProjectConfig, String> {
     validate_project_mode(mode)?;
     validate_cache_policy(cache_policy)?;
     if !server_url.starts_with("http://") && !server_url.starts_with("https://") {
@@ -922,8 +1037,8 @@ pub fn configure_remote_project(
     let transaction = connection.transaction().map_err(|err| err.to_string())?;
     transaction
         .execute(
-            "UPDATE projects SET mode = ?2, sync_status = 'pending', dirty = 1, local_revision = local_revision + 1, updated_at = ?3 WHERE id = ?1",
-            params![project_id, mode, now],
+            "UPDATE projects SET mode = ?2, sync_status = CASE WHEN ?4 THEN 'pending' ELSE sync_status END, dirty = CASE WHEN ?4 THEN 1 ELSE dirty END, local_revision = local_revision + ?4, updated_at = ?3 WHERE id = ?1",
+            params![project_id, mode, now, publish_settings as i64],
         )
         .map_err(|err| err.to_string())?;
     transaction
@@ -952,15 +1067,17 @@ pub fn configure_remote_project(
             ],
         )
         .map_err(|err| err.to_string())?;
-    enqueue_operation(
-        &transaction,
-        project_id,
-        "project",
-        project_id,
-        "update",
-        None,
-        json!({ "mode": mode, "cachePolicy": cache_policy }),
-    )?;
+    if publish_settings {
+        enqueue_operation(
+            &transaction,
+            project_id,
+            "project",
+            project_id,
+            "update",
+            None,
+            json!({ "mode": mode, "cachePolicy": cache_policy }),
+        )?;
+    }
     transaction.commit().map_err(|err| err.to_string())?;
     remote_project_config(connection, project_id)?
         .ok_or_else(|| "remote project configuration was not saved".to_string())
@@ -1001,13 +1118,7 @@ pub fn migrate_legacy_folders(
             folder_ids.insert(folder_name.clone(), id.clone());
             id
         };
-        move_image_to_folder_in_transaction(
-            &transaction,
-            project_id,
-            image_id,
-            &folder_id,
-            true,
-        )?;
+        move_image_to_folder_in_transaction(&transaction, project_id, image_id, &folder_id, true)?;
     }
     transaction.commit().map_err(|err| err.to_string())?;
     read_folder_workspace(connection, project_id)
@@ -1169,13 +1280,7 @@ pub fn move_image_to_folder(
         return Err(format!("folder not found: {folder_id}"));
     }
     let transaction = connection.transaction().map_err(|err| err.to_string())?;
-    move_image_to_folder_in_transaction(
-        &transaction,
-        project_id,
-        image_id,
-        folder_id,
-        true,
-    )?;
+    move_image_to_folder_in_transaction(&transaction, project_id, image_id, folder_id, true)?;
     transaction.commit().map_err(|err| err.to_string())?;
     read_folder_workspace(connection, project_id)
 }
@@ -1271,11 +1376,13 @@ pub fn mark_outbox_applied(
                 )
                 .map_err(|err| err.to_string())?;
         }
+        "task" => {
+            transaction.execute("UPDATE tasks SET remote_id=COALESCE(?2,remote_id),server_revision=?3 WHERE id=?1",params![operation.entity_id,remote_payload.and_then(|value|value.get("id")).and_then(Value::as_str),server_revision]).map_err(|error|error.to_string())?;
+        }
         "issue_attachment" => {
             let remote_id = remote_payload
                 .and_then(|payload| payload.get("id"))
-                .and_then(Value::as_str)
-                ;
+                .and_then(Value::as_str);
             transaction
                 .execute(
                     "UPDATE issue_attachments SET remote_id = COALESCE(?2, remote_id), upload_state = 'ready', revision = COALESCE(?3, revision), sync_state = 'clean', updated_at = ?4 WHERE id = ?1",
@@ -1284,6 +1391,51 @@ pub fn mark_outbox_applied(
                 .map_err(|err| err.to_string())?;
         }
         _ => {}
+    }
+    if let Some(payload) = remote_payload {
+        let kind = if operation.entity_type == "qa_review" {
+            "annotation"
+        } else {
+            operation.entity_type.as_str()
+        };
+        remember_base(
+            &transaction,
+            &operation.project_id,
+            kind,
+            &operation.entity_id,
+            server_revision,
+            payload,
+        )?;
+        // Only operations which have never left this device can be rebased safely.
+        transaction.execute("UPDATE sync_outbox SET base_revision=?3,base_json=?4 WHERE project_id=?1 AND entity_id=?2 AND status='pending' AND attempted_at IS NULL",params![operation.project_id,operation.entity_id,server_revision,payload.to_string()]).map_err(|error|error.to_string())?;
+    }
+    let more:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM sync_outbox WHERE project_id=?1 AND entity_id=?2 AND status NOT IN ('synced','superseded'))",params![operation.project_id,operation.entity_id],|row|row.get(0)).map_err(|error|error.to_string())?;
+    if more {
+        for table in match operation.entity_type.as_str() {
+            "annotation" | "qa_review" => vec!["annotations", "images"],
+            "asset" => vec!["images"],
+            "issue" => vec!["issues"],
+            "folder" => vec!["folders"],
+            _ => Vec::new(),
+        } {
+            transaction
+                .execute(
+                    &format!("UPDATE {table} SET dirty=1,sync_status='pending' WHERE id=?1"),
+                    [&operation.entity_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    } else if matches!(operation.entity_type.as_str(), "annotation" | "qa_review") {
+        if let Some(payload) = remote_payload.filter(|p| p.get("objects").is_some()) {
+            apply_remote_payload(
+                &transaction,
+                &operation.project_id,
+                "annotation",
+                &operation.entity_id,
+                server_revision,
+                payload,
+            )?;
+        }
     }
     transaction
         .execute(
@@ -1302,13 +1454,15 @@ pub fn mark_outbox_failed(
 ) -> Result<(), String> {
     let retry_count = operation.retry_count + 1;
     let next_retry_at = retryable.then(|| {
-        let delay = match retry_count {
-            1 => 0,
-            2 => 2,
-            3 => 5,
-            4 => 15,
-            value => (2_u64.pow(value.min(12) - 4) * 15).min(300),
-        };
+        let base = 5_u64
+            .saturating_mul(1_u64 << retry_count.saturating_sub(1).min(8))
+            .min(900);
+        let jitter = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64)
+            % (base / 5 + 1);
+        let delay = base + jitter;
         (now_unix() + delay).to_string()
     });
     connection
@@ -1330,41 +1484,46 @@ pub fn mark_outbox_failed(
 pub fn record_operation_conflict(
     connection: &mut Connection,
     operation: &OutboxOperation,
-    remote: Value,
+    mut remote: Value,
 ) -> Result<SyncConflict, String> {
+    if let Some(objects) = remote.get("remoteAnnotation").cloned() {
+        remote = json!({"objects":objects,"imageId":operation.entity_id,"revision":remote.get("currentRevision")});
+    }
     let id = format!("conflict-{}", operation.id);
     let now = now_unix_string();
-    let transaction = connection.transaction().map_err(|err| err.to_string())?;
-    transaction
-        .execute(
-            "INSERT OR REPLACE INTO sync_conflicts (id, project_id, entity_type, entity_id, base_json, local_json, remote_json, status, created_at, resolved_at) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, 'open', ?7, NULL)",
-            params![
-                id,
-                operation.project_id,
-                operation.entity_type,
-                operation.entity_id,
-                operation.payload.to_string(),
-                remote.to_string(),
-                now
-            ],
+    let base = connection
+        .query_row(
+            "SELECT base_json FROM sync_outbox WHERE id=?1",
+            [&operation.id],
+            |row| row.get::<_, Option<String>>(0),
         )
-        .map_err(|err| err.to_string())?;
-    transaction
-        .execute(
-            "UPDATE sync_outbox SET status = 'conflict', error_message = 'remote revision conflict', updated_at = ?2 WHERE id = ?1",
-            params![operation.id, now],
-        )
-        .map_err(|err| err.to_string())?;
-    transaction.commit().map_err(|err| err.to_string())?;
+        .optional()
+        .map_err(|error| error.to_string())?
+        .flatten()
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+        .or(read_base(
+            connection,
+            &operation.project_id,
+            &operation.entity_type,
+            &operation.entity_id,
+        )?);
+    let local = local_entity_payload(connection, &operation.entity_type, &operation.entity_id)?;
+    let tx = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    tx.execute("INSERT OR REPLACE INTO sync_conflicts(id,project_id,entity_type,entity_id,base_json,local_json,remote_json,status,created_at,resolved_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'open',?8,NULL)",params![id,operation.project_id,operation.entity_type,operation.entity_id,base.as_ref().map(Value::to_string),local.to_string(),remote.to_string(),now]).map_err(|error|error.to_string())?;
+    tx.execute("UPDATE sync_outbox SET status='conflict',error_message='remote revision conflict',updated_at=?2 WHERE id=?1",params![operation.id,now]).map_err(|error|error.to_string())?;
+    mark_local_conflicted(&tx, &operation.entity_type, &operation.entity_id)?;
+    tx.commit().map_err(|error| error.to_string())?;
     Ok(SyncConflict {
         id,
         project_id: operation.project_id.clone(),
         entity_type: operation.entity_type.clone(),
         entity_id: operation.entity_id.clone(),
-        base: None,
-        local: operation.payload.clone(),
+        base,
+        local,
         remote,
-        status: "open".to_string(),
+        status: "open".into(),
         created_at: now,
         resolved_at: None,
     })
@@ -1420,24 +1579,91 @@ pub fn resolve_conflict(
         return Err("conflict has already been resolved".to_string());
     }
     let now = now_unix_string();
+    let revision = conflict
+        .remote
+        .get("revision")
+        .or_else(|| conflict.remote.get("currentRevision"))
+        .and_then(Value::as_i64);
+    if resolution == "local"
+        && conflict.entity_type != "project"
+        && conflict.remote.get("deleted").and_then(Value::as_bool) == Some(true)
+    {
+        return Err("远端已删除此实体，请先保存本地副本，再选择采用远端删除".into());
+    }
     let transaction = connection.transaction().map_err(|err| err.to_string())?;
+    transaction.execute("UPDATE sync_outbox SET status='superseded',updated_at=?3 WHERE project_id=?1 AND entity_id=?2 AND status NOT IN ('synced','superseded')",params![project_id,conflict.entity_id,now]).map_err(|error|error.to_string())?;
+    remember_base(
+        &transaction,
+        project_id,
+        &conflict.entity_type,
+        &conflict.entity_id,
+        revision,
+        &conflict.remote,
+    )?;
+    if conflict.entity_type == "project"
+        && conflict.remote.get("deleted").and_then(Value::as_bool) == Some(true)
+    {
+        transaction.execute("UPDATE sync_outbox SET status='superseded',updated_at=?2 WHERE project_id=?1 AND status NOT IN ('synced','superseded')",params![project_id,now]).map_err(|error|error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE remote_project_configs SET auto_sync=0 WHERE project_id=?1",
+                [project_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if resolution == "local" {
+            transaction.execute("UPDATE projects SET mode='local_only',status='active',deleted_at=NULL,sync_status='local_only',dirty=0 WHERE id=?1",[project_id]).map_err(|error|error.to_string())?;
+            transaction
+                .execute("UPDATE asset_cache SET pinned=1", [])
+                .map_err(|error| error.to_string())?;
+        } else {
+            mark_entity_deleted(&transaction, "project", project_id)?;
+        }
+        transaction
+            .execute(
+                "UPDATE sync_conflicts SET status='resolved',resolved_at=?2 WHERE id=?1",
+                params![conflict_id, now],
+            )
+            .map_err(|error| error.to_string())?;
+        return transaction.commit().map_err(|error| error.to_string());
+    }
     if resolution == "local" {
         enqueue_operation(
             &transaction,
             project_id,
             &conflict.entity_type,
             &conflict.entity_id,
-            "update",
-            None,
+            if conflict.entity_type == "qa_review" {
+                "transition"
+            } else {
+                "update"
+            },
+            revision,
             conflict.local.clone(),
         )?;
+        let table = match conflict.entity_type.as_str() {
+            "annotation" => Some("annotations"),
+            "asset" => Some("images"),
+            "issue" => Some("issues"),
+            "folder" => Some("folders"),
+            _ => None,
+        };
+        if let Some(table) = table {
+            transaction
+                .execute(
+                    &format!("UPDATE {table} SET sync_status='pending',dirty=1 WHERE id=?1"),
+                    [&conflict.entity_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    } else if conflict.remote.get("deleted").and_then(Value::as_bool) == Some(true) {
+        mark_entity_deleted(&transaction, &conflict.entity_type, &conflict.entity_id)?;
     } else {
         apply_remote_payload(
             &transaction,
             project_id,
             &conflict.entity_type,
             &conflict.entity_id,
-            None,
+            revision,
             &conflict.remote,
         )?;
     }
@@ -1450,6 +1676,27 @@ pub fn resolve_conflict(
     transaction.commit().map_err(|err| err.to_string())
 }
 
+/// A change page is committed with its cursor, or not at all.
+pub type RemoteEntityChange = (String, String, String, Option<i64>, Value);
+
+pub fn apply_remote_page(
+    connection: &mut Connection,
+    project_id: &str,
+    changes: Vec<RemoteEntityChange>,
+    cursor: &str,
+) -> Result<(), String> {
+    let tx = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    for (kind, remote_id, operation, revision, payload) in changes {
+        apply_change_in_transaction(
+            &tx, project_id, &kind, &remote_id, &operation, revision, &payload,
+        )?;
+    }
+    update_pull_cursor(&tx, project_id, cursor)?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
 pub fn apply_remote_change(
     connection: &mut Connection,
     project_id: &str,
@@ -1459,31 +1706,19 @@ pub fn apply_remote_change(
     revision: Option<i64>,
     payload: &Value,
 ) -> Result<(), String> {
-    let dirty = entity_dirty(connection, entity_type, entity_id)?;
-    if dirty {
-        let id = unique_id("conflict");
-        connection
-            .execute(
-                "INSERT INTO sync_conflicts (id, project_id, entity_type, entity_id, base_json, local_json, remote_json, status, created_at) VALUES (?1, ?2, ?3, ?4, NULL, '{}', ?5, 'open', ?6)",
-                params![id, project_id, entity_type, entity_id, payload.to_string(), now_unix_string()],
-            )
-            .map_err(|err| err.to_string())?;
-        return Ok(());
-    }
-    let transaction = connection.transaction().map_err(|err| err.to_string())?;
-    if operation == "delete" {
-        mark_entity_deleted(&transaction, entity_type, entity_id)?;
-    } else {
-        apply_remote_payload(
-            &transaction,
-            project_id,
-            entity_type,
-            entity_id,
-            revision,
-            payload,
-        )?;
-    }
-    transaction.commit().map_err(|err| err.to_string())
+    let tx = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    apply_change_in_transaction(
+        &tx,
+        project_id,
+        entity_type,
+        entity_id,
+        operation,
+        revision,
+        payload,
+    )?;
+    tx.commit().map_err(|error| error.to_string())
 }
 
 pub fn apply_remote_snapshot(
@@ -1492,40 +1727,227 @@ pub fn apply_remote_snapshot(
     entities: Vec<(String, String, Option<i64>, Value)>,
     cursor: &str,
 ) -> Result<(), String> {
-    let transaction = connection.transaction().map_err(|err| err.to_string())?;
-    for (entity_type, entity_id, revision, payload) in entities {
-        if entity_dirty(&transaction, &entity_type, &entity_id)? {
-            transaction
-                .execute(
-                    "INSERT INTO sync_conflicts (id, project_id, entity_type, entity_id, base_json, local_json, remote_json, status, created_at) VALUES (?1, ?2, ?3, ?4, NULL, '{}', ?5, 'open', ?6)",
-                    params![
-                        unique_id("conflict"),
-                        project_id,
-                        entity_type,
-                        entity_id,
-                        payload.to_string(),
-                        now_unix_string()
-                    ],
-                )
-                .map_err(|err| err.to_string())?;
-            continue;
+    apply_remote_page(
+        connection,
+        project_id,
+        entities
+            .into_iter()
+            .map(|(kind, id, revision, payload)| (kind, id, "update".into(), revision, payload))
+            .collect(),
+        cursor,
+    )
+}
+
+fn apply_change_in_transaction(
+    connection: &Connection,
+    project_id: &str,
+    entity_type: &str,
+    remote_id: &str,
+    operation: &str,
+    revision: Option<i64>,
+    payload: &Value,
+) -> Result<(), String> {
+    let local_id = if entity_type == "project" {
+        project_id.to_owned()
+    } else {
+        resolve_local_entity_id(connection, entity_type, remote_id, payload)?
+    };
+    let accepted: Option<i64> = connection.query_row(
+        "SELECT revision FROM sync_entity_bases WHERE project_id=?1 AND entity_type=?2 AND entity_id=?3",
+        params![project_id, entity_type, local_id], |row| row.get::<_,Option<i64>>(0),
+    ).optional().map_err(|error| error.to_string())?.flatten();
+    // Acknowledged events may arrive after a newer local edit. They are not conflicts.
+    if revision
+        .zip(accepted)
+        .is_some_and(|(incoming, known)| incoming <= known)
+    {
+        return Ok(());
+    }
+    let pending: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sync_outbox WHERE project_id=?1 AND entity_id=?2 AND (entity_type=?3 OR (?3='annotation' AND entity_type='qa_review')) AND status NOT IN ('synced','superseded'))",
+        params![project_id,local_id,entity_type], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    let deletion_overlaps = operation=="delete" && match entity_type {
+        "project"=>connection.query_row("SELECT EXISTS(SELECT 1 FROM sync_outbox WHERE project_id=?1 AND status NOT IN ('synced','superseded'))",[project_id],|row|row.get::<_,bool>(0)).map_err(|error|error.to_string())?,
+        "asset"=>connection.query_row("SELECT EXISTS(SELECT 1 FROM sync_outbox WHERE project_id=?1 AND entity_id=?2 AND status NOT IN ('synced','superseded'))",params![project_id,local_id],|row|row.get::<_,bool>(0)).map_err(|error|error.to_string())?,
+        _=>false,
+    };
+    if deletion_overlaps
+        || pending
+        || (entity_type != "asset" && entity_dirty(connection, entity_type, &local_id)?)
+    {
+        // Independent comments are append-only; only mutable entities conflict.
+        if entity_type != "issue_comment" {
+            let mut remote = payload.clone();
+            if let Some(object) = remote.as_object_mut() {
+                if let Some(value) = revision {
+                    object.insert("revision".into(), json!(value));
+                }
+                if operation == "delete" {
+                    object.insert("deleted".into(), json!(true));
+                }
+            }
+            let base = read_base(connection, project_id, entity_type, &local_id)?;
+            let local = local_entity_payload(connection, entity_type, &local_id)?;
+            connection.execute(
+                "INSERT OR IGNORE INTO sync_conflicts(id,project_id,entity_type,entity_id,base_json,local_json,remote_json,status,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'open',?8)",
+                params![format!("pull-{entity_type}-{local_id}-{}-{operation}",revision.unwrap_or(0)),project_id,entity_type,local_id,base.map(|v|v.to_string()),local.to_string(),remote.to_string(),now_unix_string()],
+            ).map_err(|error|error.to_string())?;
+            mark_local_conflicted(connection, entity_type, &local_id)?;
+            return Ok(());
         }
+    }
+    if operation == "delete" {
+        mark_entity_deleted(connection, entity_type, &local_id)?;
+    } else {
         apply_remote_payload(
-            &transaction,
+            connection,
             project_id,
-            &entity_type,
-            &entity_id,
+            entity_type,
+            &local_id,
             revision,
-            &payload,
+            payload,
         )?;
     }
-    transaction
-        .execute(
-            "INSERT INTO sync_cursors (project_id, server_cursor, last_pulled_at) VALUES (?1, ?2, ?3) ON CONFLICT(project_id) DO UPDATE SET server_cursor = excluded.server_cursor, last_pulled_at = excluded.last_pulled_at",
-            params![project_id, cursor, now_unix_string()],
+    remember_base(
+        connection,
+        project_id,
+        entity_type,
+        &local_id,
+        revision,
+        payload,
+    )
+}
+
+fn read_base(
+    connection: &Connection,
+    project_id: &str,
+    kind: &str,
+    id: &str,
+) -> Result<Option<Value>, String> {
+    connection.query_row("SELECT payload_json FROM sync_entity_bases WHERE project_id=?1 AND entity_type=?2 AND entity_id=?3",params![project_id,kind,id],|row|row.get::<_,String>(0))
+        .optional().map_err(|error|error.to_string())?.map(|value|serde_json::from_str(&value).map_err(|error|error.to_string())).transpose()
+}
+
+fn remember_base(
+    connection: &Connection,
+    project_id: &str,
+    kind: &str,
+    id: &str,
+    revision: Option<i64>,
+    payload: &Value,
+) -> Result<(), String> {
+    connection.execute("INSERT INTO sync_entity_bases(project_id,entity_type,entity_id,revision,payload_json) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(project_id,entity_type,entity_id) DO UPDATE SET revision=excluded.revision,payload_json=excluded.payload_json",params![project_id,kind,id,revision,payload.to_string()]).map_err(|error|error.to_string())?;
+    Ok(())
+}
+
+fn resolve_local_entity_id(
+    connection: &Connection,
+    kind: &str,
+    remote_id: &str,
+    payload: &Value,
+) -> Result<String, String> {
+    if kind == "folder_member" {
+        let (folder, image) = payload
+            .get("folderId")
+            .and_then(Value::as_str)
+            .zip(payload.get("imageId").and_then(Value::as_str))
+            .or_else(|| remote_id.split_once(':'))
+            .ok_or("folder member has no identifiers")?;
+        return Ok(format!(
+            "{}:{}",
+            resolve_local_entity_id(connection, "folder", folder, &json!({}))?,
+            resolve_local_entity_id(connection, "asset", image, &json!({}))?
+        ));
+    }
+    let table = match kind {
+        "asset" => "images",
+        "annotation" => "annotations",
+        "issue" => "issues",
+        "folder" => "folders",
+        "issue_attachment" => "issue_attachments",
+        "task" => "tasks",
+        "task_item" => "task_items",
+        "qa_review" => "qa_reviews",
+        _ => {
+            return Ok(payload
+                .get("clientKey")
+                .and_then(Value::as_str)
+                .unwrap_or(remote_id)
+                .to_owned())
+        }
+    };
+    let mapped = connection
+        .query_row(
+            &format!("SELECT id FROM {table} WHERE remote_id=?1 OR id=?1 LIMIT 1"),
+            [remote_id],
+            |row| row.get::<_, String>(0),
         )
-        .map_err(|err| err.to_string())?;
-    transaction.commit().map_err(|err| err.to_string())
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some(id) = mapped {
+        return Ok(id);
+    }
+    if kind == "annotation" {
+        if let Some(image) = payload.get("imageId").and_then(Value::as_str) {
+            return Ok(connection
+                .query_row(
+                    "SELECT id FROM images WHERE remote_id=?1 OR id=?1 LIMIT 1",
+                    [image],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or_else(|| image.to_owned()));
+        }
+    }
+    Ok(payload
+        .get("clientKey")
+        .and_then(Value::as_str)
+        .unwrap_or(remote_id)
+        .to_owned())
+}
+
+fn local_entity_payload(connection: &Connection, kind: &str, id: &str) -> Result<Value, String> {
+    if kind == "project" {
+        return connection.query_row("SELECT name,description,mode,status,revision FROM projects WHERE id=?1",[id],|row|Ok(json!({"id":id,"name":row.get::<_,String>(0)?,"description":row.get::<_,String>(1)?,"mode":row.get::<_,String>(2)?,"status":row.get::<_,String>(3)?,"revision":row.get::<_,i64>(4)?}))).map_err(|error|error.to_string());
+    }
+    if kind == "annotation" {
+        let state = connection
+            .query_row(
+                "SELECT object_json,server_revision FROM annotations WHERE id=?1",
+                [id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        return Ok(state.map(|(objects,revision)|json!({"imageId":id,"objects":serde_json::from_str::<Value>(&objects).unwrap_or(json!([])),"revision":revision})).unwrap_or(json!({"imageId":id,"objects":[]})));
+    }
+    if kind == "issue" {
+        return serde_json::to_value(get_issue(connection, id)?).map_err(|error| error.to_string());
+    }
+    let payload=connection.query_row("SELECT payload_json FROM sync_outbox WHERE entity_type=?1 AND entity_id=?2 AND status NOT IN ('synced','superseded') ORDER BY rowid DESC LIMIT 1",params![kind,id],|row|row.get::<_,String>(0)).optional().map_err(|error|error.to_string())?;
+    Ok(payload
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(json!({"id":id})))
+}
+
+fn mark_local_conflicted(connection: &Connection, kind: &str, id: &str) -> Result<(), String> {
+    let table = match kind {
+        "project" => "projects",
+        "annotation" => "annotations",
+        "asset" => "images",
+        "issue" => "issues",
+        "folder" => "folders",
+        _ => return Ok(()),
+    };
+    connection
+        .execute(
+            &format!("UPDATE {table} SET sync_status='conflict',dirty=1 WHERE id=?1"),
+            [id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 pub fn update_pull_cursor(
@@ -1542,10 +1964,7 @@ pub fn update_pull_cursor(
     Ok(())
 }
 
-pub fn current_pull_cursor(
-    connection: &Connection,
-    project_id: &str,
-) -> Result<String, String> {
+pub fn current_pull_cursor(connection: &Connection, project_id: &str) -> Result<String, String> {
     connection
         .query_row(
             "SELECT server_cursor FROM sync_cursors WHERE project_id = ?1",
@@ -1592,7 +2011,7 @@ pub fn sync_summary(connection: &Connection, project_id: &str) -> Result<SyncSum
         failed_operations: count_rows(
             connection,
             "sync_outbox",
-            "project_id = ?1 AND status = 'failed'",
+            "project_id = ?1 AND status IN ('failed', 'rejected')",
             project_id,
         )?,
         conflict_count: count_rows(
@@ -1659,7 +2078,9 @@ fn seed_split_folders(connection: &mut Connection, project_id: &str) -> Result<(
             .prepare("SELECT id, split FROM images WHERE deleted_at IS NULL ORDER BY id")
             .map_err(|err| err.to_string())?;
         let rows = statement
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|err| err.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|err| err.to_string())?;
@@ -1671,7 +2092,11 @@ fn seed_split_folders(connection: &mut Connection, project_id: &str) -> Result<(
     let transaction = connection.transaction().map_err(|err| err.to_string())?;
     let mut folders: HashMap<String, String> = HashMap::new();
     for (image_id, split) in rows {
-        let name = if split.trim().is_empty() { "未分组" } else { split.trim() };
+        let name = if split.trim().is_empty() {
+            "未分组"
+        } else {
+            split.trim()
+        };
         let folder_id = if let Some(id) = folders.get(name) {
             id.clone()
         } else {
@@ -1914,6 +2339,10 @@ fn apply_remote_payload(
     payload: &Value,
 ) -> Result<(), String> {
     match entity_type {
+        "project" => {
+            connection.execute("UPDATE projects SET name=COALESCE(?2,name),description=COALESCE(?3,description),status=COALESCE(?4,status),server_revision=?5,revision=COALESCE(?5,revision) WHERE id=?1",params![project_id,payload.get("name").and_then(Value::as_str),payload.get("description").and_then(Value::as_str),payload.get("status").and_then(Value::as_str),revision]).map_err(|error|error.to_string())?;
+        }
+
         "asset" => {
             let remote_id = payload
                 .get("id")
@@ -1982,10 +2411,7 @@ fn apply_remote_payload(
                             .get("mimeType")
                             .and_then(Value::as_str)
                             .unwrap_or("application/octet-stream"),
-                        payload
-                            .get("byteSize")
-                            .and_then(Value::as_i64)
-                            .unwrap_or(0),
+                        payload.get("byteSize").and_then(Value::as_i64).unwrap_or(0),
                         payload
                             .get("objectKey")
                             .and_then(Value::as_str)
@@ -2015,7 +2441,7 @@ fn apply_remote_payload(
                         .ok()
                         .flatten()
                 })
-                .unwrap_or_else(|| entity_id.to_string());
+                .unwrap_or_else(|| remote_image_id.unwrap_or(entity_id).to_string());
             connection
                 .execute(
                     "INSERT INTO annotations (id, image_id, remote_id, revision, object_json, updated_at, server_revision, sync_status, dirty) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, 'synced', 0) ON CONFLICT(id) DO UPDATE SET remote_id = COALESCE(excluded.remote_id, annotations.remote_id), revision = excluded.revision, object_json = excluded.object_json, updated_at = excluded.updated_at, server_revision = excluded.server_revision, sync_status = 'synced', dirty = 0",
@@ -2029,6 +2455,20 @@ fn apply_remote_payload(
                     ],
                 )
                 .map_err(|err| err.to_string())?;
+            let status = payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("draft");
+            connection
+                .execute(
+                    "UPDATE images SET status=?2,qa_status=?3 WHERE id=?1",
+                    params![
+                        local_image_id,
+                        localized_annotation_status(status),
+                        localized_qa_status(status)
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
         }
         "issue" => {
             let remote_id = payload.get("id").and_then(Value::as_str);
@@ -2109,10 +2549,7 @@ fn apply_remote_payload(
                 .get("folderId")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let remote_image_id = payload
-                .get("imageId")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let remote_image_id = payload.get("imageId").and_then(Value::as_str).unwrap_or("");
             let local_folder_id = connection
                 .query_row(
                     "SELECT id FROM folders WHERE remote_id = ?1 OR id = ?1 LIMIT 1",
@@ -2145,13 +2582,12 @@ fn apply_remote_payload(
         }
         "issue_comment" => {
             let remote_id = payload
-                .get("id")
+                .get("clientKey")
+                .filter(|v| !v.is_null())
+                .or_else(|| payload.get("id"))
                 .and_then(Value::as_str)
                 .unwrap_or(entity_id);
-            let remote_issue_id = payload
-                .get("issueId")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let remote_issue_id = payload.get("issueId").and_then(Value::as_str).unwrap_or("");
             let local_issue_id = connection
                 .query_row(
                     "SELECT id FROM issues WHERE remote_id = ?1 OR id = ?1 LIMIT 1",
@@ -2183,10 +2619,7 @@ fn apply_remote_payload(
                 .get("clientKey")
                 .and_then(Value::as_str)
                 .unwrap_or(entity_id);
-            let remote_issue_id = payload
-                .get("issueId")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let remote_issue_id = payload.get("issueId").and_then(Value::as_str).unwrap_or("");
             let local_issue_id = connection
                 .query_row(
                     "SELECT id FROM issues WHERE remote_id = ?1 OR id = ?1 LIMIT 1",
@@ -2240,15 +2673,83 @@ fn apply_remote_payload(
                             .get("mimeType")
                             .and_then(Value::as_str)
                             .unwrap_or("application/octet-stream"),
-                        payload
-                            .get("byteSize")
-                            .and_then(Value::as_i64)
-                            .unwrap_or(0),
+                        payload.get("byteSize").and_then(Value::as_i64).unwrap_or(0),
                         revision.unwrap_or(1),
                         now_unix_string()
                     ],
                 )
                 .map_err(|error| error.to_string())?;
+        }
+        "task" => {
+            connection.execute("INSERT INTO tasks(id,name,status,created_at,updated_at,project_id,remote_id,server_revision,assignee_id) VALUES(?1,?2,?3,?4,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,updated_at=excluded.updated_at,server_revision=excluded.server_revision,assignee_id=excluded.assignee_id,deleted_at=NULL",
+                params![entity_id,payload.get("name").and_then(Value::as_str).unwrap_or("协作任务"),localized_task_status(payload.get("status").and_then(Value::as_str).unwrap_or("active")),now_unix_string(),project_id,payload.get("id").and_then(Value::as_str).unwrap_or(entity_id),revision,payload.get("assigneeId").and_then(Value::as_str)]).map_err(|error|error.to_string())?;
+        }
+        "task_item" => {
+            let task = payload
+                .get("taskId")
+                .and_then(Value::as_str)
+                .ok_or("remote task item has no taskId")?;
+            let image = payload
+                .get("imageId")
+                .and_then(Value::as_str)
+                .ok_or("remote task item has no imageId")?;
+            let task_id = resolve_local_entity_id(connection, "task", task, &json!({}))?;
+            let image_id = resolve_local_entity_id(connection, "asset", image, &json!({}))?;
+            let item_id = connection
+                .query_row(
+                    "SELECT id FROM task_items WHERE task_id=?1 AND image_id=?2 LIMIT 1",
+                    params![task_id, image_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or_else(|| entity_id.to_owned());
+            let status = payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("assigned");
+            connection.execute("INSERT INTO task_items(id,task_id,image_id,status,qa_status,project_id,remote_id,server_revision,assignee_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO UPDATE SET remote_id=excluded.remote_id,status=excluded.status,qa_status=excluded.qa_status,server_revision=excluded.server_revision,assignee_id=excluded.assignee_id,deleted_at=NULL",params![item_id,task_id,image_id,localized_task_status(status),localized_qa_status(status),project_id,payload.get("id").and_then(Value::as_str).unwrap_or(entity_id),revision,payload.get("assigneeId").and_then(Value::as_str)]).map_err(|error|error.to_string())?;
+        }
+        "qa_review" => {
+            let image = payload
+                .get("imageId")
+                .and_then(Value::as_str)
+                .ok_or("remote review has no imageId")?;
+            let image_id = resolve_local_entity_id(connection, "asset", image, &json!({}))?;
+            let decision = payload
+                .get("decision")
+                .and_then(Value::as_str)
+                .unwrap_or("rejected");
+            connection.execute("INSERT INTO qa_reviews(id,image_id,decision,note,created_at,project_id,remote_id,server_revision,annotation_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO NOTHING",params![entity_id,image_id,localized_qa_status(decision),payload.get("note").and_then(Value::as_str).unwrap_or(""),now_unix_string(),project_id,payload.get("id").and_then(Value::as_str).unwrap_or(entity_id),revision,payload.get("annotationRevision").and_then(Value::as_i64)]).map_err(|error|error.to_string())?;
+            connection
+                .execute(
+                    "UPDATE images SET status=?2,qa_status=?2,review_note=?3 WHERE id=?1 AND dirty=0",
+                    params![
+                        image_id,
+                        localized_qa_status(decision),
+                        payload.get("note").and_then(Value::as_str).unwrap_or("")
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        "label_schema" => {
+            connection.execute("INSERT INTO remote_label_schemas(id,project_id,payload_json) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json",params![entity_id,project_id,payload.to_string()]).map_err(|error|error.to_string())?;
+            let classes = payload
+                .pointer("/schema/classes")
+                .or_else(|| payload.pointer("/schemaJson/classes"))
+                .or_else(|| payload.get("classes"))
+                .and_then(Value::as_array);
+            if let Some(classes) = classes {
+                for (index, class) in classes.iter().enumerate() {
+                    connection.execute("INSERT INTO classes(id,label,color) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET label=excluded.label,color=excluded.color",params![class.get("id").and_then(Value::as_i64).unwrap_or(index as i64),class.get("label").or_else(||class.get("name")).and_then(Value::as_str).or_else(||class.as_str()).unwrap_or("类别"),class.get("color").and_then(Value::as_str).unwrap_or("#4d78ef")]).map_err(|error|error.to_string())?;
+                }
+                connection
+                    .execute(
+                        "UPDATE projects SET class_count=?2 WHERE id=?1",
+                        params![project_id, classes.len() as i64],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
         }
         _ => {}
     }
@@ -2260,6 +2761,36 @@ fn mark_entity_deleted(
     entity_type: &str,
     entity_id: &str,
 ) -> Result<(), String> {
+    if entity_type == "project" {
+        connection.execute("UPDATE projects SET deleted_at=?2,status='deleted',dirty=0,sync_status='synced' WHERE id=?1",params![entity_id,now_unix_string()]).map_err(|error|error.to_string())?;
+        connection
+            .execute(
+                "UPDATE remote_project_configs SET auto_sync=0 WHERE project_id=?1",
+                [entity_id],
+            )
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    if entity_type == "folder_member" {
+        if let Some((folder, image)) = entity_id.split_once(':') {
+            connection.execute("UPDATE folder_members SET deleted_at=?3,sync_status='synced',dirty=0 WHERE folder_id=?1 AND image_id=?2",params![folder,image,now_unix_string()]).map_err(|error|error.to_string())?;
+        }
+        return Ok(());
+    }
+    if matches!(entity_type, "task" | "task_item" | "qa_review") {
+        let table = match entity_type {
+            "task" => "tasks",
+            "task_item" => "task_items",
+            _ => "qa_reviews",
+        };
+        connection
+            .execute(
+                &format!("UPDATE {table} SET deleted_at=?2 WHERE id=?1"),
+                params![entity_id, now_unix_string()],
+            )
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
     if entity_type == "issue_attachment" {
         connection
             .execute(
@@ -2285,6 +2816,38 @@ fn mark_entity_deleted(
         )
         .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+fn localized_annotation_status(status: &str) -> &str {
+    match status {
+        "unannotated" => "未标注",
+        "draft" => "草稿",
+        "submitted" => "待质检",
+        "approved" => "通过",
+        "rejected" => "驳回",
+        _ => status,
+    }
+}
+fn localized_qa_status(status: &str) -> &str {
+    match status {
+        "submitted" => "待质检",
+        "approved" => "通过",
+        "rejected" => "驳回",
+        "draft" | "unannotated" | "assigned" | "in_progress" => "",
+        _ => status,
+    }
+}
+fn localized_task_status(status: &str) -> &str {
+    match status {
+        "draft" => "草稿",
+        "active" | "assigned" | "in_progress" => "进行中",
+        "paused" => "已暂停",
+        "done" | "archived" | "approved" => "已完成",
+        "submitted" => "待质检",
+        "rejected" => "驳回",
+        "unassigned" => "未分配",
+        _ => status,
+    }
 }
 
 fn validate_project_mode(mode: &str) -> Result<(), String> {
@@ -2381,6 +2944,8 @@ fn migration_name(version: i64) -> &'static str {
         4 => "remote-project-configuration",
         5 => "remote-entity-identifiers",
         6 => "issue-attachments",
+        7 => "mobile-collaboration-state",
+        8 => "remote-account-binding",
         _ => "unknown",
     }
 }
@@ -2440,6 +3005,48 @@ fn migrate_issue_attachments(connection: &Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+fn migrate_collaboration_state(connection: &Connection) -> Result<(), String> {
+    ensure_column(connection, "sync_outbox", "base_json", "TEXT")?;
+    ensure_column(connection, "sync_outbox", "attempted_at", "TEXT")?;
+    for table in ["tasks", "task_items", "qa_reviews"] {
+        for (column, definition) in [
+            ("remote_id", "TEXT"),
+            ("project_id", "TEXT NOT NULL DEFAULT ''"),
+            ("server_revision", "INTEGER"),
+            ("deleted_at", "TEXT"),
+        ] {
+            ensure_column(connection, table, column, definition)?;
+        }
+        connection.execute_batch(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_remote_id ON {table}(remote_id) WHERE remote_id IS NOT NULL;"
+        )).map_err(|error| error.to_string())?;
+    }
+    for (table, column, definition) in [
+        ("tasks", "assignee_id", "TEXT"),
+        ("task_items", "assignee_id", "TEXT"),
+        ("qa_reviews", "annotation_revision", "INTEGER"),
+    ] {
+        ensure_column(connection, table, column, definition)?;
+    }
+    connection
+        .execute_batch(
+            r#"
+        CREATE TABLE IF NOT EXISTS sync_entity_bases (
+            project_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
+            revision INTEGER, payload_json TEXT NOT NULL,
+            PRIMARY KEY(project_id, entity_type, entity_id)
+        );
+        CREATE TABLE IF NOT EXISTS sync_run_locks (
+            project_id TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS remote_label_schemas (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL, payload_json TEXT NOT NULL
+        );
+    "#,
+        )
+        .map_err(|error| error.to_string())
+}
+
 fn now_unix_string() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2456,9 +3063,5 @@ fn now_unix() -> u64 {
 }
 
 fn unique_id(prefix: &str) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{prefix}-{nanos}")
+    format!("{prefix}-{}", uuid::Uuid::new_v4())
 }

@@ -1,0 +1,220 @@
+{
+  "checkedAt": "2026-10-26T00:49:43+08:00",
+  "scope": "read-only final production audit",
+  "localBaseline": {
+    "head": "8731402b0c5cd76e911cbdd55d88197376b614c3",
+    "branch": "main",
+    "workingTreeHasPreexistingChanges": true
+  },
+  "production": {
+    "service": {
+      "unit": "serverall-image-annotation.service",
+      "active": true,
+      "subState": "running",
+      "mainPid": 4122935,
+      "execMainStatus": 0,
+      "publicHealth": {
+        "status": "ok",
+        "service": "image-annotation-server",
+        "version": "0.1.0"
+      }
+    },
+    "release": {
+      "sourceManifestSha256": "caafd1e56a19290bf2a3ff075945a1868215135535489cd564c6c758c73c1e17",
+      "binarySha256": "d6be8a4f6a9dc6e43fc03bbfb85844312f1ea7cd98d33fff14661d1efb1a94a6",
+      "processExecutableSha256": "d6be8a4f6a9dc6e43fc03bbfb85844312f1ea7cd98d33fff14661d1efb1a94a6",
+      "sourceManifestFileCount": 22,
+      "dropIn": "/etc/systemd/system/serverall-image-annotation.service.d/91-codex-hosting-20261025.conf",
+      "releasePath": "/home/ubuntu/projects/.deployment/releases/image-annotation/20261025-hosting-caafd1e56a19",
+      "processMatchesRelease": true
+    },
+    "database": {
+      "name": "sa_image_annotation",
+      "migrationRows": [
+        {
+          "version": 1,
+          "description": "hybrid v1",
+          "success": true,
+          "sha384": "462383bb0e41ee59f0318150510bb3e773fa9866de9f04cd0f57172aee7395f8cf894f2c805dfecf6b1f2db815263549"
+        },
+        {
+          "version": 2,
+          "description": "issue attachments",
+          "success": true,
+          "sha384": "bc29e103775d362b7cb9fe534696715bf5fe573d25894f2aba64902557e566421e942b370a187d61a2bd6700af00b49d"
+        },
+        {
+          "version": 3,
+          "description": "mobile collaboration",
+          "success": true,
+          "sha384": "94e13bb454db3fc478f5f1ca0adf63067a59e56869b90e00a9a7b63c7f3a3c4b39d8937d05cee4be88c41e50f3ee2caf"
+        },
+        {
+          "version": 4,
+          "description": "dataset hosting",
+          "success": true,
+          "sha384": "be2e4f78f400482e08ea088b44535071ec8ad58e34b45e7acf5497b330d950e648a2e15be99f0fb84cd95ec683c65e6f"
+        }
+      ],
+      "allSucceeded": true,
+      "localFileChecksumsMatch": true
+    }
+  },
+  "guiServerState": {
+    "localPath": "docs/verification/2026-10-25-dataset-hosting/gui-server-state.json",
+    "checkedAt": "2026-10-25T16:39:43.358198+00:00",
+    "datasetId": "2a63c59a-90e9-4d61-af84-1aceb1f85177",
+    "datasetRevision": 5,
+    "itemCount": 3,
+    "totalBytes": 57490,
+    "versionId": "73ae80e6-844c-4d2d-bdbe-0627a823a091",
+    "manifestHash": "1066b847b5e9109966433740edf2c5f058235d79ed576022569b54efbdcf8e1b",
+    "objectCounts": [
+      { "fileName": "images/train/demo_003.png", "count": 2 },
+      { "fileName": "images/train/demo_001.png", "count": 5 },
+      { "fileName": "images/train/demo_002.png", "count": 2 }
+    ],
+    "jobs": []
+  },
+  "mobileHostingProject": {
+    "name": "MobileHostingReuse2026-10-26",
+    "projectId": "15441235-ddaa-459c-9212-979333ef0560",
+    "status": "active",
+    "revision": 1,
+    "databaseReadOnlyEvidence": true,
+    "adminLoginStatus": 200,
+    "adminProjectGetStatus": 403,
+    "accessNote": "The GUI project is owned by a separate active account in the same organization; API admin credentials were not used to bypass project ACL. Asset/version evidence below is read-only production database evidence.",
+    "assets": [
+      {
+        "id": "229ae818-a6ea-4e1e-8096-0b729cde0bfa",
+        "fileName": "images/train/demo_001.png",
+        "assetStatus": "ready",
+        "assetRevision": 1,
+        "objectCount": 5,
+        "annotationRevision": 1,
+        "annotationStatus": "draft",
+        "datasetId": "2a63c59a-90e9-4d61-af84-1aceb1f85177",
+        "datasetVersionId": "73ae80e6-844c-4d2d-bdbe-0627a823a091"
+      },
+      {
+        "id": "29cfec99-d372-4b12-a7fc-41126e1d375c",
+        "fileName": "images/train/demo_002.png",
+        "assetStatus": "ready",
+        "assetRevision": 1,
+        "objectCount": 2,
+        "annotationRevision": 1,
+        "annotationStatus": "draft",
+        "datasetId": "2a63c59a-90e9-4d61-af84-1aceb1f85177",
+        "datasetVersionId": "73ae80e6-844c-4d2d-bdbe-0627a823a091"
+      },
+      {
+        "id": "87d9d00c-389a-4a8f-94ea-235746a38e6d",
+        "fileName": "images/train/demo_003.png",
+        "assetStatus": "ready",
+        "assetRevision": 1,
+        "objectCount": 2,
+        "annotationRevision": 1,
+        "annotationStatus": "draft",
+        "datasetId": "2a63c59a-90e9-4d61-af84-1aceb1f85177",
+        "datasetVersionId": "73ae80e6-844c-4d2d-bdbe-0627a823a091"
+      }
+    ],
+    "immutableVersion": {
+      "datasetId": "2a63c59a-90e9-4d61-af84-1aceb1f85177",
+      "versionId": "73ae80e6-844c-4d2d-bdbe-0627a823a091",
+      "versionNumber": 1,
+      "manifestHash": "1066b847b5e9109966433740edf2c5f058235d79ed576022569b54efbdcf8e1b",
+      "itemCount": 3,
+      "manifestObjectCounts": [
+        { "fileName": "images/train/demo_001.png", "count": 5 },
+        { "fileName": "images/train/demo_002.png", "count": 2 },
+        { "fileName": "images/train/demo_003.png", "count": 2 }
+      ],
+      "matchesGuiSnapshot": true
+    }
+  },
+  "desktopNativeImport": {
+    "checkedAt": "2026-10-26T01:03:16+08:00",
+    "datasetId": "94ff8d19-40d4-44df-9c65-6aaa799c5653",
+    "name": "桌面原生回导验收 2026-10-26",
+    "status": "active",
+    "revision": 2,
+    "itemCount": 3,
+    "annotationObjectCount": 9,
+    "items": [
+      { "fileName": "train/demo_001.png", "objectCount": 5, "revision": 1 },
+      { "fileName": "train/demo_002.png", "objectCount": 2, "revision": 1 },
+      { "fileName": "train/demo_003.png", "objectCount": 2, "revision": 1 }
+    ],
+    "version": {
+      "id": "5b2eb248-65c4-4c7f-a379-891c076ece67",
+      "versionNumber": 1,
+      "itemCount": 3,
+      "manifestHash": "3ae79ffff430afb12665a28cf5775cf9eb3f42b2a698758d8927a87478319a78"
+    },
+    "job": {
+      "id": "f3c906da-a80e-4ece-b0d5-f5a1443bd9fe",
+      "kind": "import",
+      "format": "native",
+      "status": "succeeded",
+      "inputByteSize": 3075,
+      "outputByteSize": null,
+      "quotaReservationConsumedBytes": 6581,
+      "quotaReservationConsumedAssets": 3
+    },
+    "quotaAfterJob": {
+      "usedAssets": 36,
+      "reservedAssets": 0,
+      "reservedBytes": 0,
+      "reservationReleasedAt": null,
+      "reservationConsumed": true
+    },
+    "readOnlyDatabaseEvidence": true
+  },
+  "stagingAfterAudit": {
+    "checkedAt": "2026-10-26T01:28:27+08:00",
+    "productionService": "active",
+    "stagingUnit": "not-found",
+    "stagingPort16425Health": "connection-refused",
+    "stagingStopped": true
+  },
+  "finalMobileSaveRoundTrip": {
+    "checkedAt": "2026-10-26T01:28:27+08:00",
+    "projectId": "15441235-ddaa-459c-9212-979333ef0560",
+    "assetId": "229ae818-a6ea-4e1e-8096-0b729cde0bfa",
+    "annotationId": "a79913a8-15d9-4985-9d61-2ac16e90c780",
+    "annotationRevision": 2,
+    "previousAnnotationRevision": 1,
+    "objectCount": 5,
+    "assetStatus": "ready",
+    "annotationStatus": "draft",
+    "changedObject": {
+      "id": "ann-0",
+      "versionBBox": { "x": 172.8, "y": 130.2, "width": 294.4, "height": 176.40000000000003 },
+      "currentProjectBBox": { "x": 190.6, "y": 142.5, "width": 294.4, "height": 176.40000000000003 },
+      "delta": { "x": 17.8, "y": 12.3, "width": 0, "height": 0 }
+    },
+    "sourceDatasetId": "2a63c59a-90e9-4d61-af84-1aceb1f85177",
+    "sourceVersionId": "73ae80e6-844c-4d2d-bdbe-0627a823a091",
+    "sourceVersionManifestHash": "1066b847b5e9109966433740edf2c5f058235d79ed576022569b54efbdcf8e1b",
+    "sourceVersionManifestUnchanged": true,
+    "readOnlyDatabaseEvidence": true
+  },
+  "openapi": {
+    "yamlParsed": true,
+    "duplicateKeys": 0,
+    "pathCount": 54,
+    "mainRouteLiteralCount": 54,
+    "mainRoutesMissingFromOpenapi": 0,
+    "openapiOnlyNormalizedRoutes": 0
+  },
+  "gitDiffCheck": {
+    "passed": true
+  },
+  "limitations": [
+    "No production data or service state was modified.",
+    "The GUI project was not queried through the admin API because its owner account is a separate project member; direct production PostgreSQL evidence was read-only.",
+    "Staging was left running during the original audit and was later stopped by root; the current stopped state is recorded above."
+  ]
+}

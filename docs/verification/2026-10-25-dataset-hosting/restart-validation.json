@@ -1,0 +1,18 @@
+{
+  "checkedAt": "2026-10-25T15:49:26.018688+00:00",
+  "passed": true,
+  "checks": [
+    "failed object deletion retains quota reservation",
+    "quota failure never partially imports dataset",
+    "cleanup retries and releases quota after object deletion recovers",
+    "job committed running before process kill",
+    "same persisted job completes after SIGKILL and restart",
+    "retry after restart reuses original job ID",
+    "recovered export SHA-256 matches",
+    "recovered ZIP CRC valid",
+    "quota charged exactly once and reservation drained"
+  ],
+  "jobId": "38a6f403-4f8d-4fcb-93b3-596e6ae6f38f",
+  "error": null,
+  "scope": "isolated PostgreSQL and bucket; original S3 read paused by loopback proxy; actual service main process SIGKILL; production untouched"
+}

@@ -1,0 +1,288 @@
+{
+  "schema": "web-workspace-verification/v1",
+  "baseUrl": "http://127.0.0.1:26445",
+  "passed": true,
+  "checks": [
+    {
+      "name": "downloaded image b0756bca-200d-4b87-9c5e-39ad8a722b92 has its original bytes",
+      "passed": true
+    },
+    {
+      "name": "downloaded image b0756bca-200d-4b87-9c5e-39ad8a722b92 has a verified sha256",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label initial-0-0",
+      "passed": true
+    },
+    {
+      "name": "stale browser annotation write is rejected",
+      "passed": true,
+      "status": 409,
+      "code": "IMAGE_REVISION_MISMATCH"
+    },
+    {
+      "name": "rejected stale write preserves the saved label and revision",
+      "passed": true
+    },
+    {
+      "name": "downloaded image 3bd26a2f-0172-4fd5-bb9e-714aaecb46ba has its original bytes",
+      "passed": true
+    },
+    {
+      "name": "downloaded image 3bd26a2f-0172-4fd5-bb9e-714aaecb46ba has a verified sha256",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label initial-0-1",
+      "passed": true
+    },
+    {
+      "name": "downloaded image 124ea67d-f12c-4842-abba-12313362d49f has its original bytes",
+      "passed": true
+    },
+    {
+      "name": "downloaded image 124ea67d-f12c-4842-abba-12313362d49f has a verified sha256",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label initial-1-0",
+      "passed": true
+    },
+    {
+      "name": "downloaded image 331da228-2f9a-4781-9477-85d5312f5d32 has its original bytes",
+      "passed": true
+    },
+    {
+      "name": "downloaded image 331da228-2f9a-4781-9477-85d5312f5d32 has a verified sha256",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label initial-1-1",
+      "passed": true
+    },
+    {
+      "name": "main working tree reports uploaded/annotated changes",
+      "passed": true
+    },
+    {
+      "name": "initial commit has immutable image/annotation hash references",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label feature-label",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label main-label",
+      "passed": true
+    },
+    {
+      "name": "independent branch changes have no merge conflict",
+      "passed": true
+    },
+    {
+      "name": "clean merge records a second parent",
+      "passed": true
+    },
+    {
+      "name": "clean merge retains both real annotation labels",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label conflict-theirs",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label conflict-ours",
+      "passed": true
+    },
+    {
+      "name": "three-way merge exposes a real conflicting entry",
+      "passed": true
+    },
+    {
+      "name": "resolved conflict commit records both parents",
+      "passed": true
+    },
+    {
+      "name": "conflict resolution keeps the explicit ours label",
+      "passed": true
+    },
+    {
+      "name": "restore creates a new commit and returns to the initial label",
+      "passed": true
+    },
+    {
+      "name": "history retains the initial and resolved commits after restore",
+      "passed": true
+    },
+    {
+      "name": "history entries expose valid immutable hash references",
+      "passed": true
+    },
+    {
+      "name": "restored main working tree is clean",
+      "passed": true
+    },
+    {
+      "name": "non-member cannot discover owner data project",
+      "passed": true
+    },
+    {
+      "name": "cross-origin web command is rejected by CSRF/origin policy",
+      "passed": true,
+      "status": 403
+    },
+    {
+      "name": "same-origin command remains available after CSRF probe",
+      "passed": true,
+      "status": 200
+    },
+    {
+      "name": "expired/logged-out web cookie receives 401",
+      "passed": true,
+      "status": 401
+    }
+  ],
+  "projectId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c",
+  "datasetIds": [
+    "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c::52e7a9e0-9275-4601-a66d-b9d51c351e7c",
+    "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c::1983bb86-35a7-4984-8232-61f6a500dcbb"
+  ],
+  "images": [
+    {
+      "datasetId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c::52e7a9e0-9275-4601-a66d-b9d51c351e7c",
+      "imageId": "b0756bca-200d-4b87-9c5e-39ad8a722b92",
+      "fileName": "web-0-0-600a4b4aa0.png",
+      "sourceHash": "203046ca8967fd27df2423eb712d456ff71c085250d0730ebe6b4d3197f1d0d5",
+      "sourceByteSize": 378,
+      "dimensions": [
+        12,
+        9
+      ],
+      "initialLabel": "initial-0-0",
+      "download": {
+        "route": "web-content",
+        "byteSize": 378,
+        "sha256": "203046ca8967fd27df2423eb712d456ff71c085250d0730ebe6b4d3197f1d0d5",
+        "dimensions": [
+          12,
+          9
+        ]
+      }
+    },
+    {
+      "datasetId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c::52e7a9e0-9275-4601-a66d-b9d51c351e7c",
+      "imageId": "3bd26a2f-0172-4fd5-bb9e-714aaecb46ba",
+      "fileName": "web-0-1-600a4b4aa0.png",
+      "sourceHash": "e4aafee7890e50adad54b513675eda93bc771f56eb111c9baf047541dffc5048",
+      "sourceByteSize": 410,
+      "dimensions": [
+        12,
+        10
+      ],
+      "initialLabel": "initial-0-1",
+      "download": {
+        "route": "web-content",
+        "byteSize": 410,
+        "sha256": "e4aafee7890e50adad54b513675eda93bc771f56eb111c9baf047541dffc5048",
+        "dimensions": [
+          12,
+          10
+        ]
+      }
+    },
+    {
+      "datasetId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c::1983bb86-35a7-4984-8232-61f6a500dcbb",
+      "imageId": "124ea67d-f12c-4842-abba-12313362d49f",
+      "fileName": "web-1-0-600a4b4aa0.png",
+      "sourceHash": "4c4b980bea58bdb7cc0f99d559a889db96f56592d9092580ab8b358fadf9c2c1",
+      "sourceByteSize": 399,
+      "dimensions": [
+        13,
+        9
+      ],
+      "initialLabel": "initial-1-0",
+      "download": {
+        "route": "web-content",
+        "byteSize": 399,
+        "sha256": "4c4b980bea58bdb7cc0f99d559a889db96f56592d9092580ab8b358fadf9c2c1",
+        "dimensions": [
+          13,
+          9
+        ]
+      }
+    },
+    {
+      "datasetId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c::1983bb86-35a7-4984-8232-61f6a500dcbb",
+      "imageId": "331da228-2f9a-4781-9477-85d5312f5d32",
+      "fileName": "web-1-1-600a4b4aa0.png",
+      "sourceHash": "f8b09c442b6a7a09efe1ed48e0b5d427e62053516587b4dbb826b30c6af01485",
+      "sourceByteSize": 432,
+      "dimensions": [
+        13,
+        10
+      ],
+      "initialLabel": "initial-1-1",
+      "download": {
+        "route": "web-content",
+        "byteSize": 432,
+        "sha256": "f8b09c442b6a7a09efe1ed48e0b5d427e62053516587b4dbb826b30c6af01485",
+        "dimensions": [
+          13,
+          10
+        ]
+      }
+    }
+  ],
+  "initialCommitId": "fe78644a-1a8d-4f0f-9dfc-4760ec62ad7a",
+  "featureCommitId": "5fc7a637-85a3-4881-8ab8-d1fedbf9c4ef",
+  "mainChangeCommitId": "6b3e2919-b110-40c9-a395-99e5d270c2c2",
+  "mergeCommitId": "b176d4e8-74ea-4856-89d0-dc9949aca360",
+  "conflictTheirsCommitId": "c93d998b-95c6-44c4-8939-73296a9bfac0",
+  "conflictOursCommitId": "1366f2f3-d617-4ce8-bba3-849d0e3a6ba0",
+  "conflictResolvedCommitId": "2fbc28f5-9877-46d3-a8be-029a25c3ab53",
+  "restoreCommitId": "7501bc78-70e5-4f41-9ac5-05b6c181c574",
+  "graph": {
+    "commitCount": 8,
+    "hashRefsChecked": 32,
+    "mergeSecondParent": "5fc7a637-85a3-4881-8ab8-d1fedbf9c4ef",
+    "resolvedSecondParent": "c93d998b-95c6-44c4-8939-73296a9bfac0"
+  },
+  "resume": {
+    "projectId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c",
+    "mainHeadCommitId": "7501bc78-70e5-4f41-9ac5-05b6c181c574",
+    "restoreCommitId": "7501bc78-70e5-4f41-9ac5-05b6c181c574",
+    "images": [
+      {
+        "datasetId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c::52e7a9e0-9275-4601-a66d-b9d51c351e7c",
+        "imageId": "b0756bca-200d-4b87-9c5e-39ad8a722b92",
+        "sourceHash": "203046ca8967fd27df2423eb712d456ff71c085250d0730ebe6b4d3197f1d0d5",
+        "sourceByteSize": 378,
+        "expectedLabel": "initial-0-0"
+      },
+      {
+        "datasetId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c::52e7a9e0-9275-4601-a66d-b9d51c351e7c",
+        "imageId": "3bd26a2f-0172-4fd5-bb9e-714aaecb46ba",
+        "sourceHash": "e4aafee7890e50adad54b513675eda93bc771f56eb111c9baf047541dffc5048",
+        "sourceByteSize": 410,
+        "expectedLabel": "initial-0-1"
+      },
+      {
+        "datasetId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c::1983bb86-35a7-4984-8232-61f6a500dcbb",
+        "imageId": "124ea67d-f12c-4842-abba-12313362d49f",
+        "sourceHash": "4c4b980bea58bdb7cc0f99d559a889db96f56592d9092580ab8b358fadf9c2c1",
+        "sourceByteSize": 399,
+        "expectedLabel": "initial-1-0"
+      },
+      {
+        "datasetId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c::1983bb86-35a7-4984-8232-61f6a500dcbb",
+        "imageId": "331da228-2f9a-4781-9477-85d5312f5d32",
+        "sourceHash": "f8b09c442b6a7a09efe1ed48e0b5d427e62053516587b4dbb826b30c6af01485",
+        "sourceByteSize": 432,
+        "expectedLabel": "initial-1-1"
+      }
+    ]
+  }
+}

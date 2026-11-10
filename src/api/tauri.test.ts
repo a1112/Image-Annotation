@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
   BackendUnavailableError,
+  createAnnotationTask,
   detectBackendConnection,
   getFileAssetUrl,
   listClassSamples,
@@ -42,6 +43,41 @@ describe("backend fallback", () => {
       label: "person",
       offset: 0,
       limit: 48,
+    });
+  });
+
+  it("创建任务时把图片选择传给 Rust 队列", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      id: "task-1",
+      name: "第一轮标注",
+      status: "进行中",
+      createdAt: "",
+      updatedAt: "",
+    });
+
+    await createAnnotationTask("project-1", "第一轮标注", ["image-1"]);
+
+    expect(invoke).toHaveBeenCalledWith("create_annotation_task", {
+      projectId: "project-1",
+      name: "第一轮标注",
+      imageIds: ["image-1"],
+    });
+  });
+
+  it("省略图片选择时保留 Rust 的全项目默认语义", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      id: "task-all",
+      name: "全项目任务",
+      status: "进行中",
+      createdAt: "",
+      updatedAt: "",
+    });
+
+    await createAnnotationTask("project-1", "全项目任务");
+
+    expect(invoke).toHaveBeenCalledWith("create_annotation_task", {
+      projectId: "project-1",
+      name: "全项目任务",
     });
   });
 

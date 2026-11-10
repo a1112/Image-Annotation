@@ -1,0 +1,146 @@
+{
+  "schemaVersion": 1,
+  "checkedAt": "2026-10-26T08:55:04.970672+00:00",
+  "scope": "read-only production audit after publication and mobile collaboration",
+  "server": "https://175.178.16.90/image-annotation",
+  "dataset": {
+    "id": "037d5f43-7b53-48ea-a3dc-b0f036fa2153",
+    "name": "高线检测数据",
+    "sourceImageCount": 6036,
+    "remoteAssetCount": 6036,
+    "sourceObjectCount": 13960,
+    "remoteObjectCount": 13960,
+    "dimensionMismatches": 0,
+    "contentMismatches": 0,
+    "classes": {
+      "source": [
+        {
+          "id": 0,
+          "label": "erzi",
+          "color": "#1fa7ff"
+        },
+        {
+          "id": 1,
+          "label": "ezi",
+          "color": "#cc54d8"
+        },
+        {
+          "id": 2,
+          "label": "jieba",
+          "color": "#f59e0b"
+        },
+        {
+          "id": 3,
+          "label": "zhedie",
+          "color": "#22c55e"
+        }
+      ],
+      "remote": [
+        {
+          "id": 0,
+          "label": "erzi",
+          "color": null
+        },
+        {
+          "id": 1,
+          "label": "ezi",
+          "color": null
+        },
+        {
+          "id": 2,
+          "label": "jieba",
+          "color": null
+        },
+        {
+          "id": 3,
+          "label": "zhedie",
+          "color": null
+        }
+      ]
+    }
+  },
+  "project": {
+    "id": "d4885d04-1212-4c5c-8753-e5c015a43f32",
+    "name": "北满特钢",
+    "remoteAssetCount": 6036,
+    "remoteAnnotationCount": 6036,
+    "changedAnnotationClientKeys": [],
+    "unexpectedChangedAnnotationClientKeys": []
+  },
+  "immutableVersion": {
+    "datasetId": "037d5f43-7b53-48ea-a3dc-b0f036fa2153",
+    "versionId": "f9279917-5969-44dc-a65c-8e954a4624a5",
+    "expectedManifestHash": "38c5752ef76e6a3019224cba575987ffc318c321218b1045ea1c93e8736735f5",
+    "actualManifestHash": "38c5752ef76e6a3019224cba575987ffc318c321218b1045ea1c93e8736735f5",
+    "manifestHashMatches": true,
+    "itemCount": 6036,
+    "sampleClientKey": "JPEGImages_120__2__00001",
+    "sampleAnnotation": {
+      "immutableVersion": {
+        "objectCount": 2,
+        "objectsHash": "3baddf9012abeabc0ac116b5a5bbc2dfc522bc4e2a3e331a4c5d81847e664fbf"
+      },
+      "projectCurrent": {
+        "revision": 1,
+        "status": "draft",
+        "objectCount": 2,
+        "objectsHash": "3baddf9012abeabc0ac116b5a5bbc2dfc522bc4e2a3e331a4c5d81847e664fbf"
+      },
+      "unchanged": true
+    }
+  },
+  "sampleOriginalDownloads": [
+    {
+      "clientKey": "JPEGImages_120__2__00001",
+      "assetId": "566dea1b-ab0b-45ab-9430-422cec25ab11",
+      "remoteContentHash": "9c67b0ddf0b25ea243dc4a2f0d1c7098eea89f0470ea3eef7343d7cf184d2cdc",
+      "downloadedSha256": "9c67b0ddf0b25ea243dc4a2f0d1c7098eea89f0470ea3eef7343d7cf184d2cdc",
+      "sourceSha256": "9c67b0ddf0b25ea243dc4a2f0d1c7098eea89f0470ea3eef7343d7cf184d2cdc",
+      "byteSize": 109620,
+      "matchesSource": true
+    },
+    {
+      "clientKey": "JPEGImages_beiman_03995ec5154e465a967c6e1967fbb2f1",
+      "assetId": "e77bb204-a29a-418d-9a54-796408cc5d50",
+      "remoteContentHash": "6807c2ce3afc596549acabd96a68755f55512078a818978be4f102103d64473e",
+      "downloadedSha256": "6807c2ce3afc596549acabd96a68755f55512078a818978be4f102103d64473e",
+      "sourceSha256": "6807c2ce3afc596549acabd96a68755f55512078a818978be4f102103d64473e",
+      "byteSize": 82329,
+      "matchesSource": true
+    },
+    {
+      "clientKey": "JPEGImages_beiman_fff9c5f02d02479c84b1c5f35a531ebc",
+      "assetId": "7d6a31bc-05f5-4f71-b8c2-ab19ed04841e",
+      "remoteContentHash": "046ba978d0220124304016fcb53fdaa451422d79b59f3328d09a613b48256bb4",
+      "downloadedSha256": "046ba978d0220124304016fcb53fdaa451422d79b59f3328d09a613b48256bb4",
+      "sourceSha256": "046ba978d0220124304016fcb53fdaa451422d79b59f3328d09a613b48256bb4",
+      "byteSize": 49244,
+      "matchesSource": true
+    }
+  ],
+  "collaboration": {
+    "taskId": "6adf50e0-2a65-4976-a7c5-ae168789f6f6",
+    "taskStatus": "unassigned",
+    "sampleTaskItem": {
+      "id": "75034801-648b-4b30-aec3-f4e87aaec0d4",
+      "status": "unassigned",
+      "assigneeId": null,
+      "revision": 1
+    },
+    "latestSampleReview": null
+  },
+  "source": {
+    "snapshot": "/Users/a1-6/project/Image-Annotation/data/workspaces/default/projects/local-dataset-f84178fa0c2ea9eb/snapshots/snapshot-7660b220-75bf-48be-9c10-d01a647cb419/manifest.json",
+    "sourceRoot": "/Users/a1-6/project/Image-Annotation/data/workspaces/default/imports/北满特钢/高线检测数据",
+    "sourceManifestSha256": "323c272a0c450a594bbf459574826828bdd9e69063daeaa8b8665980c2cd2b98"
+  },
+  "readOnly": true,
+  "credentialsRead": true,
+  "credentialsWritten": false,
+  "ticketsWritten": false,
+  "cloudWrites": [
+    "authentication device session only"
+  ],
+  "passed": true,
+  "failures": []
+}

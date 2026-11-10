@@ -1,0 +1,125 @@
+{
+  "sha256": "45845a20ac81c63afae252d0274adb1c1dbf5566ad50df8a27c314e28a839b15",
+  "files": [
+    {
+      "path": "Cargo.lock",
+      "sha256": "06386f5269981c93425d073a44e5e7831680d04227ecc76aa41c4c741b9a5b67"
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "2e48c702d713bff14fa87d1f107b0bb4a2372ee933a0abd7401678b8d26bbb30"
+    },
+    {
+      "path": "migrations/0001_hybrid_v1.sql",
+      "sha256": "f434981784a0e4ed10a1f09818b26d1731864bdaf6a6de5bca5ab6df3bf5f974"
+    },
+    {
+      "path": "migrations/0002_issue_attachments.sql",
+      "sha256": "82c45273a1a39835a3ed236eb2be6594c2416c9acbdd5fcd8a7a992291f9f22b"
+    },
+    {
+      "path": "migrations/0003_mobile_collaboration.sql",
+      "sha256": "eb0b2b0e0dd57ce79a14b95a68bdf94c5a53dc0fd2c849eeb832f15f6dd880ef"
+    },
+    {
+      "path": "migrations/0004_dataset_hosting.sql",
+      "sha256": "cd478cdc0d6a636169fe84098a769c0766c7eff66bb6d4f98666f400bcf0391a"
+    },
+    {
+      "path": "migrations/0005_data_projects.sql",
+      "sha256": "135c870c749e52ee494fe9a2059127177cddc6689fb66edb0f15431d28e12e20"
+    },
+    {
+      "path": "migrations/0006_image_transforms.sql",
+      "sha256": "0b2568462b50fa46c6eaa8519bb635a9753c57497dcf751cd0e6795109496936"
+    },
+    {
+      "path": "migrations/0007_web_workspace.sql",
+      "sha256": "7c716011d7415b1c500c35537c8f6d6a88d1a32fd83f5ed62ca6b7ec29a61f58"
+    },
+    {
+      "path": "migrations/0008_project_blob_references.sql",
+      "sha256": "377de174fe8601c071b1d4750de1cf75cc6d9df229603312546b41d061b2c600"
+    },
+    {
+      "path": "src/auth.rs",
+      "sha256": "056d6383b9ff7a39207cc39d1d0488a8f1946df696f3b7b3734480738ba4175a"
+    },
+    {
+      "path": "src/config.rs",
+      "sha256": "4ebbf239f537f296c87438c6772343d1060ed180d092c9e2e93958a1f88a13c8"
+    },
+    {
+      "path": "src/main.rs",
+      "sha256": "40a56c1be11c4e74e20548b0a2a0a47a71f29489bcbf467c64467d6e8a6a0523"
+    },
+    {
+      "path": "src/routes/account.rs",
+      "sha256": "7fd405f78ff75379b0097a7524dcea672a241fb9d6032487a8b081c4ce982887"
+    },
+    {
+      "path": "src/routes/annotations.rs",
+      "sha256": "964a8a0eb7d6b852e18be2628e9953ea7834f4f9d56f2312cba2eb8376cb0a4e"
+    },
+    {
+      "path": "src/routes/assets.rs",
+      "sha256": "41b821482f279f52094a17507e13dcdd30081fc6bede8d7a3f9e283c8ded6ac2"
+    },
+    {
+      "path": "src/routes/attachments.rs",
+      "sha256": "dece6554c52c406398942d640ae102d90ab2f3aedbb6e10697a1844fc9548970"
+    },
+    {
+      "path": "src/routes/collaboration.rs",
+      "sha256": "10aee28eccfe249bfcf07af4fe9b1c029c27fd7b25e9a95435b52e074415db68"
+    },
+    {
+      "path": "src/routes/data_projects.rs",
+      "sha256": "ad631c426cba5fb8334dc22c7d2d1e272a0e2ee1c98c8206e3f900b5d24b6357"
+    },
+    {
+      "path": "src/routes/dataset_jobs.rs",
+      "sha256": "48daddfed21f00c2f6c3f8bb127722aea526f6ea67869bcee3d750683116d3db"
+    },
+    {
+      "path": "src/routes/datasets.rs",
+      "sha256": "33b5676523b2ca43e5144f562dd1086a2421d26c63c2af2390504eb8924c24a2"
+    },
+    {
+      "path": "src/routes/image_transforms.rs",
+      "sha256": "304b1475c11928fca11265eebd0b51f451c1065a67bdbce875029c5153701706"
+    },
+    {
+      "path": "src/routes/issues.rs",
+      "sha256": "a9f5cd74ade2d75d3172b7f885ddbe0fa5d5e312025caa5cc548208dda1802ec"
+    },
+    {
+      "path": "src/routes/mod.rs",
+      "sha256": "e7e8a47dff60e4d9945dd96bbe068e2141f7a1879462c9edde03a64989d00a1e"
+    },
+    {
+      "path": "src/routes/objects.rs",
+      "sha256": "f68a88247fd455334277a3a6f9ff5314e845f7f6ae62f10f9109ba8d7e1f02b3"
+    },
+    {
+      "path": "src/routes/projects.rs",
+      "sha256": "027f3f0f65b07b0a6f4855f07598dfaa44ebc60755b7335163675eb4cd044a1f"
+    },
+    {
+      "path": "src/routes/sync.rs",
+      "sha256": "22b185a98cdf38c5e2141c4e72ffb74c69b1b1bcb384145268219d38ae6552f1"
+    },
+    {
+      "path": "src/routes/web_auth.rs",
+      "sha256": "e7b01281e96864cd7e4b8b6fd25d8aaaad97c0a805af376f5033a94009fc2239"
+    },
+    {
+      "path": "src/routes/web_workspace.rs",
+      "sha256": "e0d9712df5918a3b0f430b4763b4676292e7377fa049cebd0ab5ff97487d4007"
+    },
+    {
+      "path": "src/state.rs",
+      "sha256": "5ab268bdafba460a17912c9294dea31382b66e195db91e233b6f82c041792c25"
+    }
+  ]
+}

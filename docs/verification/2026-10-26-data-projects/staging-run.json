@@ -1,0 +1,39 @@
+{
+  "schema": "data-project-staging-verification/v1",
+  "environment": "isolated-staging",
+  "service": {
+    "unit": "codex-image-annotation-data-projects-staging",
+    "manager": "systemd --user (transient unit)",
+    "active": true,
+    "mainPidObserved": 628217,
+    "cgroupObserved": "/user.slice/user-1000.slice/user@1000.service/app.slice/codex-image-annotation-data-projects-staging.service",
+    "bind": "127.0.0.1:16425",
+    "productionTouched": false
+  },
+  "build": {
+    "command": "cargo build --locked --ignore-rust-version",
+    "passed": true,
+    "rustVersionNote": "staging host rustc 1.93.1 requires ignore-rust-version for dependencies declaring 1.94.1"
+  },
+  "tests": {
+    "command": "cargo test --locked --ignore-rust-version",
+    "unitPassed": 11,
+    "collaborationPassed": 2,
+    "dataProjectPassed": 2,
+    "datasetHostingPassed": 3,
+    "pgDataProjectExplicitPassed": 2
+  },
+  "httpReport": "http-release-staging.json",
+  "historicalHttpReport": {
+    "report": "http-staging.json",
+    "checks": 29,
+    "note": "保留的早期 staging 验收记录，不代表最终 release 验收"
+  },
+  "releaseHttpReport": {
+    "report": "http-release-staging.json",
+    "checks": 30,
+    "unit": "codex-image-annotation-data-projects-staging-release.service",
+    "manager": "systemd --user",
+    "note": "Final release binary checked in http-release-staging.json; earlier service section is retained historical evidence"
+  }
+}

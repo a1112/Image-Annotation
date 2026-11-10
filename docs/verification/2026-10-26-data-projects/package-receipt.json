@@ -1,0 +1,19 @@
+{
+  "builtAt": "2026-10-26T11:03:02.013252+00:00",
+  "platform": "macOS arm64",
+  "appPath": "/Users/a1-6/project/Image-Annotation/artifacts/data-projects-20261026/Image Annotation.app",
+  "dmgPath": "/Users/a1-6/project/Image-Annotation/artifacts/data-projects-20261026/Image Annotation_0.1.0_aarch64.dmg",
+  "binarySha256": "52af6f47b5cba8c9f837ef044e32da757067749167f7c9251703d5544bca58e4",
+  "dmgSha256": "f491911bc25f274e4af934f819f49dd977d2ecc12095ebb236df5a9d895e939d",
+  "sourceSha256": "76cbe8bf99079e9587f882a0f8a1a1a4c4867f92ff8bf1eae76952a94ef6f533",
+  "nativeTextSectionSha256": "4e700983a8d3cbcbcf86a0513b7273157bef50421a34b2168c7d3d2974afa01d",
+  "acceptanceCodeMatchesDeliveredApp": true,
+  "signature": "ad-hoc, codesign strict verification passed",
+  "dmgVerification": "hdiutil verify passed",
+  "acceptanceConfiguration": "Same compiled native code and embedded frontend; final app launched with isolated data root and verified retained cloud login, HEAD, two datasets and opaque account panel",
+  "sourceSnapshot": "desktop-source-snapshot.tar.gz",
+  "note": "Desktop build frozen before web workspace changes; final collaboration modal opacity/success feedback included",
+  "finalizedAt": "2026-10-26T12:30:39.152365+00:00",
+  "nativeLoadedSectionsSha256": "cf901cb6d58f814c80ca7d674fb4bb2351a43227bb82cb9bc94a466b2099ba40",
+  "acceptanceEmbeddedFrontendMatchesDeliveredApp": true
+}

@@ -3,8 +3,8 @@ use crate::{
     importers::{createml, labelme, voc, yolo},
     project_fs, storage,
 };
-use serde::{Deserialize, Serialize};
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -112,18 +112,33 @@ mod annotation_shape_tests {
         let mut line: AnnotationObject = serde_json::from_value(serde_json::json!({
             "id": "line-1", "classId": 0, "label": "edge", "type": "line",
             "points": [{"x": 1.0, "y": 1.0}], "attributes": {}
-        })).unwrap();
-        assert!(validate_annotation_objects(&[line.clone()]).unwrap_err().contains("line-1"));
+        }))
+        .unwrap();
+        assert!(validate_annotation_objects(&[line.clone()])
+            .unwrap_err()
+            .contains("line-1"));
 
-        line.points = Some(vec![Point { x: 1.0, y: 1.0 }, Point { x: f64::NAN, y: 2.0 }]);
-        assert!(validate_annotation_objects(&[line]).unwrap_err().contains("line-1"));
+        line.points = Some(vec![
+            Point { x: 1.0, y: 1.0 },
+            Point {
+                x: f64::NAN,
+                y: 2.0,
+            },
+        ]);
+        assert!(validate_annotation_objects(&[line])
+            .unwrap_err()
+            .contains("line-1"));
     }
 
     #[test]
     fn accepts_all_reference_shape_geometry_and_rejects_duplicate_ids() {
         let cases = [
-            ("oriented_rectangle", 4), ("circle", 2), ("line", 2),
-            ("linestrip", 3), ("point", 1), ("points", 2),
+            ("oriented_rectangle", 4),
+            ("circle", 2),
+            ("line", 2),
+            ("linestrip", 3),
+            ("point", 1),
+            ("points", 2),
         ];
         for (kind, count) in cases {
             let points = if kind == "oriented_rectangle" {
@@ -136,8 +151,13 @@ mod annotation_shape_tests {
                 "points": points.iter().map(|(x, y)| serde_json::json!({"x": x, "y": y})).collect::<Vec<_>>(),
                 "attributes": {}
             })).unwrap();
-            assert!(validate_annotation_objects(&[object.clone()]).is_ok(), "{kind}");
-            assert!(validate_annotation_objects(&[object.clone(), object]).unwrap_err().contains("duplicate"));
+            assert!(
+                validate_annotation_objects(&[object.clone()]).is_ok(),
+                "{kind}"
+            );
+            assert!(validate_annotation_objects(&[object.clone(), object])
+                .unwrap_err()
+                .contains("duplicate"));
         }
     }
 
@@ -146,26 +166,45 @@ mod annotation_shape_tests {
         let rotated: AnnotationObject = serde_json::from_value(serde_json::json!({
             "id":"rotated", "classId":0, "label":"shape", "type":"oriented_rectangle",
             "points":[{"x":1,"y":1},{"x":5,"y":1},{"x":6,"y":5},{"x":1,"y":5}], "attributes":{}
-        })).unwrap();
-        assert!(validate_annotation_objects(&[rotated]).unwrap_err().contains("not rectangular"));
+        }))
+        .unwrap();
+        assert!(validate_annotation_objects(&[rotated])
+            .unwrap_err()
+            .contains("not rectangular"));
         let mask: AnnotationObject = serde_json::from_value(serde_json::json!({
             "id":"mask", "classId":0, "label":"shape", "type":"mask",
             "points":[{"x":1,"y":1},{"x":3,"y":3}], "maskData":"aGVsbG8=", "attributes":{}
-        })).unwrap();
-        assert!(validate_annotation_objects(&[mask]).unwrap_err().contains("not PNG"));
+        }))
+        .unwrap();
+        assert!(validate_annotation_objects(&[mask])
+            .unwrap_err()
+            .contains("not PNG"));
     }
 
     #[test]
     fn rejects_shape_extents_outside_image() {
-        let bbox = AnnotationObject::bbox("outside".into(), 0, "shape".into(), BBox {
-            x: 95.0, y: 10.0, width: 10.0, height: 10.0,
-        });
-        assert!(validate_annotation_bounds(&[bbox], 100, 80).unwrap_err().contains("outside"));
+        let bbox = AnnotationObject::bbox(
+            "outside".into(),
+            0,
+            "shape".into(),
+            BBox {
+                x: 95.0,
+                y: 10.0,
+                width: 10.0,
+                height: 10.0,
+            },
+        );
+        assert!(validate_annotation_bounds(&[bbox], 100, 80)
+            .unwrap_err()
+            .contains("outside"));
         let circle: AnnotationObject = serde_json::from_value(serde_json::json!({
             "id":"circle", "classId":0, "label":"shape", "type":"circle",
             "points":[{"x":5.0,"y":5.0},{"x":15.0,"y":5.0}], "attributes":{}
-        })).unwrap();
-        assert!(validate_annotation_bounds(&[circle], 100, 80).unwrap_err().contains("circle"));
+        }))
+        .unwrap();
+        assert!(validate_annotation_bounds(&[circle], 100, 80)
+            .unwrap_err()
+            .contains("circle"));
     }
 }
 
@@ -224,24 +263,36 @@ pub(crate) fn validate_annotation_objects(objects: &[AnnotationObject]) -> Resul
         };
         match object.object_type.as_str() {
             "bbox" => {
-                let box_geometry = object.bbox.as_ref().ok_or_else(|| format!(
-                    "bbox annotation '{}' has no bbox", object.id
-                ))?;
-                if !box_geometry.x.is_finite() || !box_geometry.y.is_finite()
-                    || !box_geometry.width.is_finite() || !box_geometry.height.is_finite()
-                    || box_geometry.x < 0.0 || box_geometry.y < 0.0
-                    || box_geometry.width <= 0.0 || box_geometry.height <= 0.0
+                let box_geometry = object
+                    .bbox
+                    .as_ref()
+                    .ok_or_else(|| format!("bbox annotation '{}' has no bbox", object.id))?;
+                if !box_geometry.x.is_finite()
+                    || !box_geometry.y.is_finite()
+                    || !box_geometry.width.is_finite()
+                    || !box_geometry.height.is_finite()
+                    || box_geometry.x < 0.0
+                    || box_geometry.y < 0.0
+                    || box_geometry.width <= 0.0
+                    || box_geometry.height <= 0.0
                 {
-                    return Err(format!("bbox annotation '{}' has invalid geometry", object.id));
+                    return Err(format!(
+                        "bbox annotation '{}' has invalid geometry",
+                        object.id
+                    ));
                 }
             }
             "polygon" => {
                 let points = object.polygon.as_deref().unwrap_or_default();
                 if points.len() < 3 || !points.iter().all(valid_point) {
-                    return Err(format!("polygon annotation '{}' has invalid points", object.id));
+                    return Err(format!(
+                        "polygon annotation '{}' has invalid points",
+                        object.id
+                    ));
                 }
             }
-            "oriented_rectangle" | "circle" | "line" | "linestrip" | "point" | "points" | "mask" => {
+            "oriented_rectangle" | "circle" | "line" | "linestrip" | "point" | "points"
+            | "mask" => {
                 let points = object.points.as_deref().unwrap_or_default();
                 let valid_count = match object.object_type.as_str() {
                     "oriented_rectangle" => points.len() == 4,
@@ -250,96 +301,177 @@ pub(crate) fn validate_annotation_objects(objects: &[AnnotationObject]) -> Resul
                     _ => points.len() == 1,
                 };
                 if !valid_count || !points.iter().all(valid_point) {
-                    return Err(format!("{} annotation '{}' has invalid points", object.object_type, object.id));
+                    return Err(format!(
+                        "{} annotation '{}' has invalid points",
+                        object.object_type, object.id
+                    ));
                 }
                 if object.object_type == "oriented_rectangle" && !is_oriented_rectangle(points) {
-                    return Err(format!("oriented rectangle annotation '{}' is not rectangular", object.id));
+                    return Err(format!(
+                        "oriented rectangle annotation '{}' is not rectangular",
+                        object.id
+                    ));
                 }
                 if object.object_type == "mask" {
                     validate_mask_png(object)?;
                 }
             }
             "classification" => {}
-            kind => return Err(format!("unsupported annotation type '{}' for '{}'", kind, object.id)),
+            kind => {
+                return Err(format!(
+                    "unsupported annotation type '{}' for '{}'",
+                    kind, object.id
+                ))
+            }
         }
     }
     Ok(())
 }
 
 fn is_oriented_rectangle(points: &[Point]) -> bool {
-    if points.len() != 4 { return false; }
+    if points.len() != 4 {
+        return false;
+    }
     let first = (points[1].x - points[0].x, points[1].y - points[0].y);
     let second = (points[2].x - points[1].x, points[2].y - points[1].y);
     let first_length = first.0.hypot(first.1);
     let second_length = second.0.hypot(second.1);
-    first_length >= 1.0 && second_length >= 1.0
+    first_length >= 1.0
+        && second_length >= 1.0
         && (first.0 * second.0 + first.1 * second.1).abs() <= first_length * second_length * 0.02
         && (points[0].x + points[2].x - points[1].x - points[3].x).abs() <= 0.5
         && (points[0].y + points[2].y - points[1].y - points[3].y).abs() <= 0.5
 }
 
 fn validate_mask_png(object: &AnnotationObject) -> Result<(), String> {
-    let data = object.mask_data.as_deref().filter(|value| !value.is_empty())
+    let data = object
+        .mask_data
+        .as_deref()
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("mask annotation '{}' has no mask data", object.id))?;
     if data.len() > 32 * 1024 * 1024 {
         return Err(format!("mask annotation '{}' exceeds 32 MiB", object.id));
     }
-    let bytes = base64::engine::general_purpose::STANDARD.decode(data)
-        .map_err(|error| format!("mask annotation '{}' has invalid base64: {error}", object.id))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|error| {
+            format!(
+                "mask annotation '{}' has invalid base64: {error}",
+                object.id
+            )
+        })?;
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Err(format!("mask annotation '{}' is not PNG", object.id));
     }
     if bytes.len() < 24 {
-        return Err(format!("mask annotation '{}' has incomplete PNG", object.id));
+        return Err(format!(
+            "mask annotation '{}' has incomplete PNG",
+            object.id
+        ));
     }
     let png_width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
     let png_height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
-    if png_width == 0 || png_height == 0 || u64::from(png_width) * u64::from(png_height) > 20_000_000 {
-        return Err(format!("mask annotation '{}' has unsupported dimensions", object.id));
+    if png_width == 0
+        || png_height == 0
+        || u64::from(png_width) * u64::from(png_height) > 20_000_000
+    {
+        return Err(format!(
+            "mask annotation '{}' has unsupported dimensions",
+            object.id
+        ));
     }
     let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
         .map_err(|error| format!("mask annotation '{}' has invalid PNG: {error}", object.id))?;
     let points = object.points.as_deref().unwrap_or_default();
-    if points.len() == 2 && ((points[1].x - points[0].x - image.width() as f64).abs() > 2.0
-        || (points[1].y - points[0].y - image.height() as f64).abs() > 2.0) {
-        return Err(format!("mask annotation '{}' PNG dimensions do not match its bounds", object.id));
+    if points.len() == 2
+        && ((points[1].x - points[0].x - image.width() as f64).abs() > 2.0
+            || (points[1].y - points[0].y - image.height() as f64).abs() > 2.0)
+    {
+        return Err(format!(
+            "mask annotation '{}' PNG dimensions do not match its bounds",
+            object.id
+        ));
     }
     Ok(())
 }
 
-pub(crate) fn validate_annotation_bounds(objects: &[AnnotationObject], width: u32, height: u32) -> Result<(), String> {
+pub(crate) fn validate_annotation_bounds(
+    objects: &[AnnotationObject],
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
     for object in objects {
         if let Some(bbox) = &object.bbox {
             if bbox.x + bbox.width > width as f64 || bbox.y + bbox.height > height as f64 {
-                return Err(format!("annotation '{}' extends outside the image", object.id));
+                return Err(format!(
+                    "annotation '{}' extends outside the image",
+                    object.id
+                ));
             }
         }
-        if object.polygon.iter().flatten().chain(object.points.iter().flatten())
-            .any(|point| point.x > width as f64 || point.y > height as f64) {
-            return Err(format!("annotation '{}' extends outside the image", object.id));
+        if object
+            .polygon
+            .iter()
+            .flatten()
+            .chain(object.points.iter().flatten())
+            .any(|point| point.x > width as f64 || point.y > height as f64)
+        {
+            return Err(format!(
+                "annotation '{}' extends outside the image",
+                object.id
+            ));
         }
         if object.object_type == "circle" {
             if let Some(points) = &object.points {
-                let radius = ((points[0].x - points[1].x).powi(2) + (points[0].y - points[1].y).powi(2)).sqrt();
-                if points[0].x < radius || points[0].y < radius
-                    || points[0].x + radius > width as f64 || points[0].y + radius > height as f64 {
-                    return Err(format!("circle annotation '{}' extends outside the image", object.id));
+                let radius = ((points[0].x - points[1].x).powi(2)
+                    + (points[0].y - points[1].y).powi(2))
+                .sqrt();
+                if points[0].x < radius
+                    || points[0].y < radius
+                    || points[0].x + radius > width as f64
+                    || points[0].y + radius > height as f64
+                {
+                    return Err(format!(
+                        "circle annotation '{}' extends outside the image",
+                        object.id
+                    ));
                 }
             }
         }
-        if object.object_type == "mask" && object.points.as_ref().is_some_and(|points|
-            points[0].x >= points[1].x || points[0].y >= points[1].y) {
-            return Err(format!("mask annotation '{}' has invalid bounds", object.id));
+        if object.object_type == "mask"
+            && object
+                .points
+                .as_ref()
+                .is_some_and(|points| points[0].x >= points[1].x || points[0].y >= points[1].y)
+        {
+            return Err(format!(
+                "mask annotation '{}' has invalid bounds",
+                object.id
+            ));
         }
     }
     Ok(())
 }
 
-fn unsupported_source_annotation(format: &str, objects: &[AnnotationObject], classes: &[storage::StoredClass]) -> Option<String> {
-    let expected_type = if format == "yolo-seg" { "polygon" } else { "bbox" };
+fn unsupported_source_annotation(
+    format: &str,
+    objects: &[AnnotationObject],
+    classes: &[storage::StoredClass],
+) -> Option<String> {
+    let expected_type = if format == "yolo-seg" {
+        "polygon"
+    } else {
+        "bbox"
+    };
     for object in objects {
-        if !classes.iter().any(|class| class.id == object.class_id && class.label == object.label) {
-            return Some(format!("annotation '{}' classId/label does not match project classes", object.id));
+        if !classes
+            .iter()
+            .any(|class| class.id == object.class_id && class.label == object.label)
+        {
+            return Some(format!(
+                "annotation '{}' classId/label does not match project classes",
+                object.id
+            ));
         }
         if object.object_type != expected_type {
             return Some(format!(
@@ -348,12 +480,24 @@ fn unsupported_source_annotation(format: &str, objects: &[AnnotationObject], cla
             ));
         }
         for (key, value) in &object.attributes {
-            if value.is_null() || value == "" || value == false
-                || value.as_object().is_some_and(serde_json::Map::is_empty) { continue; }
+            if value.is_null()
+                || value == ""
+                || value == false
+                || value.as_object().is_some_and(serde_json::Map::is_empty)
+            {
+                continue;
+            }
             let supported = matches!(key.as_str(), "source" | "format" | "split")
-                || (format == "voc-detect" && (matches!(key.as_str(), "difficult" | "truncated" | "confidence" | "pose")
-                    || (key == "flags" && value.as_object().is_some_and(|flags|
-                        flags.keys().all(|name| matches!(name.as_str(), "difficult" | "truncated"))))));
+                || (format == "voc-detect"
+                    && (matches!(
+                        key.as_str(),
+                        "difficult" | "truncated" | "confidence" | "pose"
+                    ) || (key == "flags"
+                        && value.as_object().is_some_and(|flags| {
+                            flags
+                                .keys()
+                                .all(|name| matches!(name.as_str(), "difficult" | "truncated"))
+                        }))));
             if !supported {
                 return Some(format!(
                     "{format} cannot represent annotation '{}' attribute '{}'",
@@ -423,6 +567,100 @@ pub struct AnnotationState {
     #[serde(default)]
     pub verified: bool,
     pub updated_at: Option<String>,
+}
+
+fn annotation_state_from_data_project_value(
+    image_id: &str,
+    value: Value,
+) -> Result<AnnotationState, String> {
+    if let Some(objects) = value.as_array() {
+        let objects =
+            serde_json::from_value::<Vec<AnnotationObject>>(Value::Array(objects.clone()))
+                .map_err(|error| {
+                    format!("invalid data-project annotation for '{image_id}': {error}")
+                })?;
+        return Ok(AnnotationState {
+            image_id: image_id.to_string(),
+            revision: None,
+            objects,
+            status: "草稿".to_string(),
+            verified: false,
+            updated_at: None,
+        });
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("data-project annotation for '{image_id}' is not an object"))?;
+    let objects = serde_json::from_value::<Vec<AnnotationObject>>(
+        object.get("objects").cloned().unwrap_or_else(|| json!([])),
+    )
+    .map_err(|error| format!("invalid data-project annotation for '{image_id}': {error}"))?;
+    let revision = match object.get("revision") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| {
+                    format!("invalid data-project annotation revision for '{image_id}'")
+                })?
+                .to_string(),
+        ),
+    };
+    let updated_at = match object.get("updatedAt") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| {
+                    format!("invalid data-project annotation timestamp for '{image_id}'")
+                })?
+                .to_string(),
+        ),
+    };
+    Ok(AnnotationState {
+        image_id: image_id.to_string(),
+        revision,
+        objects,
+        status: object
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("草稿")
+            .to_string(),
+        verified: object
+            .get("verified")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        updated_at,
+    })
+}
+
+fn classes_from_data_project_metadata(value: &Value) -> Result<Vec<storage::StoredClass>, String> {
+    let classes = value
+        .get("classes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "data-project metadata has no classes array".to_string())?;
+    classes
+        .iter()
+        .map(|class| {
+            let id = class
+                .get("id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "data-project class has invalid id".to_string())?;
+            let id =
+                u32::try_from(id).map_err(|_| "data-project class id is too large".to_string())?;
+            let label = class
+                .get("label")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "data-project class has invalid label".to_string())?
+                .to_string();
+            let color = class
+                .get("color")
+                .and_then(Value::as_str)
+                .unwrap_or("#64748b")
+                .to_string();
+            Ok(storage::StoredClass { id, label, color })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -636,23 +874,62 @@ impl SampleRepository {
                     .unwrap_or_else(|| manifest.clone());
                 let indexed_images = storage::read_images(&paths.sqlite, None).unwrap_or_default();
                 let indexed_classes = storage::read_classes(&paths.sqlite).unwrap_or_default();
-                let image_count = if indexed_images.is_empty() {
+                let active_class_count =
+                    match crate::data_project_versioning::active_data_project_checkout_metadata(
+                        &manifest.id,
+                    ) {
+                        Ok(Some(metadata)) => classes_from_data_project_metadata(&metadata)
+                            .map(|classes| classes.len() as u16)
+                            .unwrap_or(0),
+                        Ok(None) | Err(_) => 0,
+                    };
+                let active_entries =
+                    match crate::data_project_versioning::active_data_project_checkout_entries(
+                        &manifest.id,
+                    ) {
+                        Ok(entries) => entries,
+                        Err(_) => Some(Vec::new()),
+                    };
+                let image_count = if let Some(entries) = active_entries.as_ref() {
+                    entries.len() as u32
+                } else if indexed_images.is_empty() {
                     indexed_manifest.image_count
                 } else {
                     indexed_images.len() as u32
                 };
-                let annotated_count = indexed_images
-                    .iter()
-                    .filter(|image| image.status != "未标注" && image.status != "草稿")
-                    .count() as u32;
-                let review_count = indexed_images
-                    .iter()
-                    .filter(|image| image.qa_status == "待质检")
-                    .count() as u32;
-                let issue_count = indexed_images
-                    .iter()
-                    .filter(|image| image.qa_status == "驳回")
-                    .count() as u32;
+                let annotated_count = if let Some(entries) = active_entries.as_ref() {
+                    entries
+                        .iter()
+                        .filter(|image| image.status != "未标注" && image.status != "草稿")
+                        .count() as u32
+                } else {
+                    indexed_images
+                        .iter()
+                        .filter(|image| image.status != "未标注" && image.status != "草稿")
+                        .count() as u32
+                };
+                let review_count = if let Some(entries) = active_entries.as_ref() {
+                    entries
+                        .iter()
+                        .filter(|image| image.qa_status == "待质检")
+                        .count() as u32
+                } else {
+                    indexed_images
+                        .iter()
+                        .filter(|image| image.qa_status == "待质检")
+                        .count() as u32
+                };
+                let issue_count = if let Some(entries) = active_entries.as_ref() {
+                    entries
+                        .iter()
+                        .filter(|image| image.qa_status == "驳回")
+                        .count() as u32
+                } else {
+                    indexed_images
+                        .iter()
+                        .filter(|image| image.qa_status == "驳回")
+                        .count() as u32
+                };
                 let annotation_types = match indexed_manifest.format.as_str() {
                     "yolo-seg" => vec!["Polygon".to_string(), "BBox".to_string()],
                     "image-classification" => vec!["Classification".to_string()],
@@ -676,7 +953,9 @@ impl SampleRepository {
                     },
                     review_count,
                     issue_count,
-                    class_count: if indexed_classes.is_empty() {
+                    class_count: if active_class_count > 0 {
+                        active_class_count
+                    } else if indexed_classes.is_empty() {
                         indexed_manifest.class_count as u16
                     } else {
                         indexed_classes.len() as u16
@@ -709,8 +988,16 @@ impl SampleRepository {
         let train_count = images.iter().filter(|image| image.split == "train").count() as u32;
         let val_count = images.iter().filter(|image| image.split == "val").count() as u32;
         let labels = coco_labels();
-        let stored_classes = storage::read_classes(&project_fs::project_paths(project_id).sqlite)
-            .unwrap_or_default();
+        let stored_classes =
+            match crate::data_project_versioning::active_data_project_checkout_metadata(project_id)
+            {
+                Ok(Some(metadata)) => {
+                    classes_from_data_project_metadata(&metadata).unwrap_or_default()
+                }
+                Ok(None) => storage::read_classes(&project_fs::project_paths(project_id).sqlite)
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
         let paths = project_fs::project_paths(project_id);
         let task_summaries = storage::list_task_records(&paths.sqlite)
             .unwrap_or_default()
@@ -863,6 +1150,40 @@ impl SampleRepository {
         offset: Option<u32>,
         limit: Option<u32>,
     ) -> Vec<DatasetImage> {
+        // A materialized branch is the workbench's source of truth.  Keep the
+        // source-backed index as a fallback only when no branch checkout is
+        // active; a damaged checkout must not silently reveal the external
+        // dataset instead.
+        match crate::data_project_versioning::active_data_project_checkout_entries(project_id) {
+            Ok(Some(entries)) => {
+                let mut images = entries
+                    .into_iter()
+                    .filter(|entry| {
+                        group_id
+                            .as_deref()
+                            .map(|group| group == entry.split.as_str())
+                            .unwrap_or(true)
+                    })
+                    .map(|entry| DatasetImage {
+                        id: entry.image_id,
+                        file_name: entry.file_name,
+                        width: entry.width,
+                        height: entry.height,
+                        split: entry.split.clone(),
+                        status: entry.status,
+                        qa_status: entry.qa_status,
+                        review_note: None,
+                        tags: vec![format!("split={}", entry.split)],
+                    })
+                    .collect::<Vec<_>>();
+                images.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+                let offset = offset.unwrap_or(0) as usize;
+                let limit = limit.unwrap_or(u32::MAX) as usize;
+                return images.into_iter().skip(offset).take(limit).collect();
+            }
+            Ok(None) => {}
+            Err(_) => return Vec::new(),
+        }
         let paths = project_fs::project_paths(project_id);
         let indexed_images = if let Some(limit) = limit {
             storage::read_images_page(
@@ -875,7 +1196,12 @@ impl SampleRepository {
         } else {
             storage::read_images(&paths.sqlite, group_id.as_deref()).unwrap_or_default()
         };
-        if !indexed_images.is_empty() || storage::read_project_manifest(&paths.sqlite).ok().flatten().is_some() {
+        if !indexed_images.is_empty()
+            || storage::read_project_manifest(&paths.sqlite)
+                .ok()
+                .flatten()
+                .is_some()
+        {
             return indexed_images
                 .into_iter()
                 .map(|image| DatasetImage {
@@ -919,7 +1245,8 @@ impl SampleRepository {
                 break;
             }
 
-            let (width, height) = crate::datasets::oriented_image_dimensions(&path).unwrap_or((0, 0));
+            let (width, height) =
+                crate::datasets::oriented_image_dimensions(&path).unwrap_or((0, 0));
             let file_name = path
                 .file_name()
                 .map(|value| value.to_string_lossy().to_string())
@@ -947,14 +1274,19 @@ impl SampleRepository {
     }
 
     pub fn image_path(&self, project_id: &str, image_id: &str) -> Option<PathBuf> {
+        match crate::data_project_versioning::active_data_project_checkout_image_path_for_dataset(
+            project_id, image_id,
+        ) {
+            Ok(Some(path)) => return Some(path),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
         let paths = project_fs::project_paths(project_id);
         let asset_root = project_asset_root(project_id, &paths);
-        if let Ok(images) = storage::read_images(&paths.sqlite, None) {
-            if let Some(image) = images.into_iter().find(|image| image.id == image_id) {
-                let path = asset_root.join(image.file_name);
-                if path.exists() {
-                    return Some(path);
-                }
+        if let Ok(Some(image)) = storage::read_image(&paths.sqlite, image_id) {
+            let path = asset_root.join(image.file_name);
+            if path.exists() {
+                return Some(path);
             }
         }
 
@@ -974,6 +1306,33 @@ impl SampleRepository {
     }
 
     pub fn image_annotation_state(&self, project_id: &str, image_id: &str) -> AnnotationState {
+        match crate::data_project_versioning::read_active_data_project_checkout_annotation_for_dataset(
+            project_id, image_id,
+        ) {
+            Ok(Some(value)) => {
+                return annotation_state_from_data_project_value(image_id, value).unwrap_or_else(
+                    |error| AnnotationState {
+                        image_id: image_id.to_string(),
+                        revision: None,
+                        objects: Vec::new(),
+                        status: format!("项目工作区解析失败: {error}"),
+                        verified: false,
+                        updated_at: None,
+                    },
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return AnnotationState {
+                    image_id: image_id.to_string(),
+                    revision: None,
+                    objects: Vec::new(),
+                    status: format!("项目工作区不可用: {error}"),
+                    verified: false,
+                    updated_at: None,
+                };
+            }
+        }
         let paths = project_fs::project_paths(project_id);
         let verified = storage::read_image_verified(&paths.sqlite, image_id).unwrap_or(false);
         if let Ok(Some(payload)) = storage::read_annotation_payload(&paths.sqlite, image_id) {
@@ -982,7 +1341,9 @@ impl SampleRepository {
                 image_id: image_id.to_string(),
                 revision: Some(payload.revision),
                 objects: parsed.as_ref().cloned().unwrap_or_default(),
-                status: if parsed.is_err() { "项目标注解析失败".to_string() } else {
+                status: if parsed.is_err() {
+                    "项目标注解析失败".to_string()
+                } else {
                     image_status(project_id, image_id).unwrap_or_else(|| "草稿".to_string())
                 },
                 verified,
@@ -1058,7 +1419,9 @@ impl SampleRepository {
                     image_id: image_id.to_string(),
                     revision: None,
                     objects: parsed.as_ref().cloned().unwrap_or_default(),
-                    status: if parsed.is_err() { "源标签解析失败".to_string() } else {
+                    status: if parsed.is_err() {
+                        "源标签解析失败".to_string()
+                    } else {
                         image_status(project_id, image_id).unwrap_or_else(|| "已标注".to_string())
                     },
                     verified,
@@ -1095,7 +1458,8 @@ impl SampleRepository {
             };
         };
 
-        let (width, height) = crate::datasets::oriented_image_dimensions(&image_path).unwrap_or((0, 0));
+        let (width, height) =
+            crate::datasets::oriented_image_dimensions(&image_path).unwrap_or((0, 0));
         let labels = storage::read_classes(&paths.sqlite)
             .unwrap_or_default()
             .into_iter()
@@ -1122,7 +1486,9 @@ impl SampleRepository {
             image_id: image_id.to_string(),
             revision: None,
             objects: parsed.as_ref().cloned().unwrap_or_default(),
-            status: if parsed.is_err() { "源标签解析失败".to_string() } else {
+            status: if parsed.is_err() {
+                "源标签解析失败".to_string()
+            } else {
                 image_status(project_id, image_id).unwrap_or_else(|| "已标注".to_string())
             },
             verified,
@@ -1130,7 +1496,7 @@ impl SampleRepository {
         }
     }
 
-    fn snapshot_annotation_state_strict(
+    pub(crate) fn snapshot_annotation_state_strict(
         &self,
         paths: &project_fs::ProjectPaths,
         project: &project_fs::ProjectManifest,
@@ -1138,6 +1504,41 @@ impl SampleRepository {
         source_asset_root: &Path,
         image: &DatasetImage,
     ) -> Result<AnnotationState, String> {
+        // Snapshot/commit capture must parse the same controlled checkout
+        // that the workbench reads.  Do this before touching the source root;
+        // falling through would turn a branch edit into a false zero-label
+        // source snapshot.
+        match crate::data_project_versioning::active_data_project_checkout_image_path_for_dataset(
+            &project.id,
+            &image.id,
+        ) {
+            Ok(Some(image_path)) => {
+                let dimensions =
+                    crate::datasets::oriented_image_dimensions(&image_path).map_err(|error| {
+                        format!(
+                            "read active checkout dimensions for '{}' at {}: {error}",
+                            image.id,
+                            image_path.display()
+                        )
+                    })?;
+                if dimensions != (image.width, image.height) {
+                    return Err(format!(
+                        "active checkout image '{}' dimensions changed from {}x{} to {}x{}",
+                        image.id, image.width, image.height, dimensions.0, dimensions.1
+                    ));
+                }
+                let value = crate::data_project_versioning::read_active_data_project_checkout_annotation_for_dataset(
+                    &project.id,
+                    &image.id,
+                )?
+                .ok_or_else(|| {
+                    format!("active checkout annotation is missing for image '{}'", image.id)
+                })?;
+                return annotation_state_from_data_project_value(&image.id, value);
+            }
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
         let verified = storage::read_image_verified(&paths.sqlite, &image.id)?;
         let image_path = resolve_snapshot_image_path(
             source_asset_root,
@@ -1332,22 +1733,38 @@ impl SampleRepository {
     }
 
     pub fn load_external_annotations(
-        &self, project_id: &str, image_id: &str, source_path: &str,
+        &self,
+        project_id: &str,
+        image_id: &str,
+        source_path: &str,
     ) -> Result<labelme::ExternalAnnotations, String> {
-        let image_path = self.image_path(project_id, image_id)
+        let image_path = self
+            .image_path(project_id, image_id)
             .ok_or_else(|| format!("image not found: {image_id}"))?;
-        let (width, height) = crate::datasets::oriented_image_dimensions(&image_path).map_err(|err| err.to_string())?;
+        let (width, height) = crate::datasets::oriented_image_dimensions(&image_path)
+            .map_err(|err| err.to_string())?;
         let classes = storage::read_classes(&project_fs::project_paths(project_id).sqlite)?
-            .into_iter().map(|class| class.label).collect::<Vec<_>>();
-        let data = fs::read_to_string(source_path).map_err(|err| format!("read annotation file: {err}"))?;
-        if data.len() > 32 * 1024 * 1024 { return Err("annotation file exceeds 32 MiB".into()); }
-        let extension = Path::new(source_path).extension().and_then(|item| item.to_str())
-            .unwrap_or("").to_ascii_lowercase();
+            .into_iter()
+            .map(|class| class.label)
+            .collect::<Vec<_>>();
+        let data = fs::read_to_string(source_path)
+            .map_err(|err| format!("read annotation file: {err}"))?;
+        if data.len() > 32 * 1024 * 1024 {
+            return Err("annotation file exceeds 32 MiB".into());
+        }
+        let extension = Path::new(source_path)
+            .extension()
+            .and_then(|item| item.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
         let imported = match extension.as_str() {
             "json" => {
                 let root: Value = serde_json::from_str(&data).map_err(|err| err.to_string())?;
                 if root.is_array() {
-                    let image_name = image_path.file_name().ok_or("image has no filename")?.to_string_lossy();
+                    let image_name = image_path
+                        .file_name()
+                        .ok_or("image has no filename")?
+                        .to_string_lossy();
                     createml::parse_createml(&data, &image_name, &classes)?
                 } else {
                     if let (Some(label_width), Some(label_height)) = (
@@ -1359,80 +1776,144 @@ impl SampleRepository {
                         }
                     }
                     if let Some(labelme_name) = root.get("imagePath").and_then(Value::as_str) {
-                        let named = Path::new(labelme_name).file_name().and_then(|name| name.to_str());
+                        let named = Path::new(labelme_name)
+                            .file_name()
+                            .and_then(|name| name.to_str());
                         if named != image_path.file_name().and_then(|name| name.to_str()) {
-                            return Err(format!("LabelMe imagePath '{labelme_name}' does not match current image"));
+                            return Err(format!(
+                                "LabelMe imagePath '{labelme_name}' does not match current image"
+                            ));
                         }
                     }
                     labelme::parse_labelme(&data, &classes)?
                 }
             }
             "xml" => labelme::ExternalAnnotations {
-                objects: voc::parse_voc_annotations(&data, &classes)?, verified: false,
+                objects: voc::parse_voc_annotations(&data, &classes)?,
+                verified: false,
             },
             "txt" => labelme::ExternalAnnotations {
-                objects: data.lines().map(str::trim).filter(|line| !line.is_empty())
-                    .enumerate().map(|(index, line)| {
+                objects: data
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .enumerate()
+                    .map(|(index, line)| {
                         let prefer_polygon = line.split_whitespace().count() > 5;
-                        yolo::line_to_annotation(line, width, height, &classes, index, prefer_polygon)
-                    }).collect::<Result<Vec<_>, _>>()?, verified: false,
+                        yolo::line_to_annotation(
+                            line,
+                            width,
+                            height,
+                            &classes,
+                            index,
+                            prefer_polygon,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                verified: false,
             },
             _ => return Err(format!("unsupported annotation file: {source_path}")),
         };
         validate_annotation_objects(&imported.objects)?;
         validate_annotation_bounds(&imported.objects, width, height)?;
         for object in &imported.objects {
-            if object.class_id as usize >= classes.len() || classes[object.class_id as usize] != object.label {
-                return Err(format!("annotation '{}' uses unknown project class '{}'", object.id, object.label));
+            if object.class_id as usize >= classes.len()
+                || classes[object.class_id as usize] != object.label
+            {
+                return Err(format!(
+                    "annotation '{}' uses unknown project class '{}'",
+                    object.id, object.label
+                ));
             }
         }
         Ok(imported)
     }
 
     pub fn export_annotation_file(
-        &self, project_id: &str, image_id: &str, format: &str, output_path: Option<String>,
+        &self,
+        project_id: &str,
+        image_id: &str,
+        format: &str,
+        output_path: Option<String>,
     ) -> Result<Option<String>, String> {
-        let image_path = self.image_path(project_id, image_id)
+        let image_path = self
+            .image_path(project_id, image_id)
             .ok_or_else(|| format!("image not found: {image_id}"))?;
-        let (width, height) = crate::datasets::oriented_image_dimensions(&image_path).map_err(|err| err.to_string())?;
+        let (width, height) = crate::datasets::oriented_image_dimensions(&image_path)
+            .map_err(|err| err.to_string())?;
         let state = self.image_annotation_state(project_id, image_id);
         if state.status.ends_with("解析失败") {
-            return Err(format!("image '{image_id}' has malformed annotations; export was blocked"));
+            return Err(format!(
+                "image '{image_id}' has malformed annotations; export was blocked"
+            ));
         }
         validate_annotation_objects(&state.objects)?;
         validate_annotation_bounds(&state.objects, width, height)?;
         let source_format = match format {
-            "voc" => Some("voc-detect"), "yolo" => Some("yolo-detect"), "yolo-seg" => Some("yolo-seg"),
+            "voc" => Some("voc-detect"),
+            "yolo" => Some("yolo-detect"),
+            "yolo-seg" => Some("yolo-seg"),
             _ => None,
         };
         if let Some(source_format) = source_format {
             let classes = storage::read_classes(&project_fs::project_paths(project_id).sqlite)?;
-            if let Some(reason) = unsupported_source_annotation(source_format, &state.objects, &classes) {
+            if let Some(reason) =
+                unsupported_source_annotation(source_format, &state.objects, &classes)
+            {
                 return Err(reason);
             }
         }
-        let filename = image_path.file_name().ok_or("image has no filename")?.to_string_lossy();
+        let filename = image_path
+            .file_name()
+            .ok_or("image has no filename")?
+            .to_string_lossy();
         let mut body = match format {
-            "labelme" => labelme::write_labelme(&image_path, width, height, &state.objects, state.verified)?,
+            "labelme" => {
+                labelme::write_labelme(&image_path, width, height, &state.objects, state.verified)?
+            }
             "createml" => createml::write_createml(&filename, &state.objects, state.verified)?,
             "voc" => voc::annotations_to_voc_xml(&image_path, width, height, &state.objects)?,
             "yolo" => yolo::annotations_to_yolo_lines(&state.objects, width, height)?,
             "yolo-seg" => yolo::annotations_to_yolo_polygon_lines(&state.objects, width, height)?,
             _ => return Err(format!("unsupported annotation export format: {format}")),
         };
-        let extension = if format == "voc" { "xml" } else if format.starts_with("yolo") { "txt" } else { "json" };
+        let extension = if format == "voc" {
+            "xml"
+        } else if format.starts_with("yolo") {
+            "txt"
+        } else {
+            "json"
+        };
         let output = match output_path {
             Some(path) => PathBuf::from(path),
-            None => match rfd::FileDialog::new().set_file_name(format!("{}.{}", image_path.file_stem().unwrap_or_default().to_string_lossy(), extension)).save_file() {
-                Some(path) => path,
-                None => return Ok(None),
-            },
+            None => {
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                {
+                    return Err("文件导出仅在桌面端可用".to_string());
+                }
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                {
+                    match rfd::FileDialog::new()
+                        .set_file_name(format!(
+                            "{}.{}",
+                            image_path.file_stem().unwrap_or_default().to_string_lossy(),
+                            extension
+                        ))
+                        .save_file()
+                    {
+                        Some(path) => path,
+                        None => return Ok(None),
+                    }
+                }
+            }
         };
         if format == "createml" && output.is_file() {
-            let existing = fs::read_to_string(&output).map_err(|err| format!("read existing CreateML {}: {err}", output.display()))?;
+            let existing = fs::read_to_string(&output)
+                .map_err(|err| format!("read existing CreateML {}: {err}", output.display()))?;
             body = createml::merge_createml(&existing, &filename, &state.objects, state.verified)?;
         }
-        fs::write(&output, body).map_err(|err| format!("write annotation {}: {err}", output.display()))?;
+        fs::write(&output, body)
+            .map_err(|err| format!("write annotation {}: {err}", output.display()))?;
         Ok(Some(output.to_string_lossy().to_string()))
     }
 
@@ -1449,6 +1930,46 @@ impl SampleRepository {
                 .map_err(|err| format!("read source image dimensions: {err}"))?;
             validate_annotation_bounds(&objects, width, height)?;
         }
+        match crate::data_project_versioning::active_data_project_checkout_annotation_path_for_dataset(
+            project_id, image_id,
+        ) {
+            Ok(Some(_)) => {
+                let current = self.image_annotation_state(project_id, image_id);
+                if current.status.starts_with("项目工作区") {
+                    return Err(current.status);
+                }
+                let value = json!({
+                    "imageId": image_id,
+                    "objects": objects,
+                    "status": "草稿",
+                    "qaStatus": "",
+                    "verified": current.verified,
+                    "revision": current.revision,
+                });
+                let result = crate::data_project_versioning::write_active_data_project_checkout_annotation(
+                    project_id,
+                    image_id,
+                    revision.as_deref(),
+                    value,
+                    "草稿",
+                    "",
+                    None,
+                    Some(current.verified),
+                )?
+                .ok_or_else(|| "active checkout disappeared while saving annotation".to_string())?;
+                return Ok(AnnotationSaveResult {
+                    revision: result.revision,
+                    saved_at: result.saved_at,
+                    audit_event_id: result.audit_event_id,
+                    source_sync: "branch-only".to_string(),
+                    source_sync_message: Some(
+                        "annotation saved in the active data-project checkout".to_string(),
+                    ),
+                });
+            }
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
         let paths = project_fs::ensure_project_dirs(project_id)?;
         if let Some(existing) = storage::read_annotation_payload(&paths.sqlite, image_id)? {
             serde_json::from_str::<Vec<AnnotationObject>>(&existing.object_json)
@@ -1458,8 +1979,12 @@ impl SampleRepository {
             if native_path.exists() {
                 let data = fs::read_to_string(&native_path).map_err(|error| error.to_string())?;
                 if serde_json::from_str::<AnnotationState>(&data).is_err()
-                    && serde_json::from_str::<Vec<AnnotationObject>>(&data).is_err() {
-                    return Err(format!("existing native annotation {} is malformed; save was blocked", native_path.display()));
+                    && serde_json::from_str::<Vec<AnnotationObject>>(&data).is_err()
+                {
+                    return Err(format!(
+                        "existing native annotation {} is malformed; save was blocked",
+                        native_path.display()
+                    ));
                 }
             }
         }
@@ -1472,7 +1997,9 @@ impl SampleRepository {
         } else {
             yolo_project_format(project_id)
         };
-        if let (Some(format), Some(image_path)) = (&source_format, self.image_path(project_id, image_id)) {
+        if let (Some(format), Some(image_path)) =
+            (&source_format, self.image_path(project_id, image_id))
+        {
             let (width, height) = crate::datasets::oriented_image_dimensions(&image_path)
                 .map_err(|error| format!("read source image dimensions: {error}"))?;
             let label_path = if format == "voc-detect" {
@@ -1480,8 +2007,9 @@ impl SampleRepository {
             } else {
                 yolo_label_write_path_for_image(project_id, &image_path)
             };
-            validate_existing_source_label(&label_path, format, width, height, &classes)
-                .map_err(|error| format!("{error}; save was blocked to preserve the source label"))?;
+            validate_existing_source_label(&label_path, format, width, height, &classes).map_err(
+                |error| format!("{error}; save was blocked to preserve the source label"),
+            )?;
         }
         let mut source_write: Option<(PathBuf, String)> = None;
         let mut source_sync = "not-applicable".to_string();
@@ -1497,27 +2025,51 @@ impl SampleRepository {
                     "voc-detect" => {
                         let path = image_path.with_extension("xml");
                         let original = if path.is_file() {
-                            fs::read_to_string(&path).map(Some).map_err(|error| error.to_string())
-                        } else { Ok(None) };
-                        original.and_then(|xml| voc::annotations_to_voc_xml_preserving(
-                            &image_path, width, height, &objects, xml.as_deref(),
-                        )).map(|body| (path, body))
+                            fs::read_to_string(&path)
+                                .map(Some)
+                                .map_err(|error| error.to_string())
+                        } else {
+                            Ok(None)
+                        };
+                        original
+                            .and_then(|xml| {
+                                voc::annotations_to_voc_xml_preserving(
+                                    &image_path,
+                                    width,
+                                    height,
+                                    &objects,
+                                    xml.as_deref(),
+                                )
+                            })
+                            .map(|body| (path, body))
                     }
                     "yolo-seg" => yolo::annotations_to_yolo_polygon_lines(&objects, width, height)
-                        .map(|body| (yolo_label_write_path_for_image(project_id, &image_path), body)),
-                    _ => yolo::annotations_to_yolo_lines(&objects, width, height)
-                        .map(|body| (yolo_label_write_path_for_image(project_id, &image_path), body)),
+                        .map(|body| {
+                            (
+                                yolo_label_write_path_for_image(project_id, &image_path),
+                                body,
+                            )
+                        }),
+                    _ => yolo::annotations_to_yolo_lines(&objects, width, height).map(|body| {
+                        (
+                            yolo_label_write_path_for_image(project_id, &image_path),
+                            body,
+                        )
+                    }),
                 };
                 match planned {
                     Ok(write) => source_write = Some(write),
                     Err(reason) => {
                         source_sync = "native-only".to_string();
-                        source_sync_message = Some(format!("{reason}; source labels were left unchanged"));
+                        source_sync_message =
+                            Some(format!("{reason}; source labels were left unchanged"));
                     }
                 }
             } else {
                 source_sync = "native-only".to_string();
-                source_sync_message = Some("source image was not found; source labels were left unchanged".to_string());
+                source_sync_message = Some(
+                    "source image was not found; source labels were left unchanged".to_string(),
+                );
             }
         }
         let object_json = serde_json::to_string(&objects).map_err(|err| err.to_string())?;
@@ -1537,14 +2089,16 @@ impl SampleRepository {
         };
         let data = serde_json::to_string_pretty(&state).map_err(|err| err.to_string())?;
         if let Err(error) = fs::write(paths.annotations.join(format!("{image_id}.json")), data) {
-            let warning = format!("native sidecar could not be written: {error}; SQLite revision was saved");
+            let warning =
+                format!("native sidecar could not be written: {error}; SQLite revision was saved");
             source_sync_message = Some(match source_sync_message {
                 Some(existing) => format!("{existing}; {warning}"),
                 None => warning,
             });
         }
         if let Some((label_path, label_data)) = source_write {
-            let write_result = label_path.parent()
+            let write_result = label_path
+                .parent()
                 .map(fs::create_dir_all)
                 .transpose()
                 .and_then(|_| fs::write(&label_path, label_data));
@@ -1569,11 +2123,40 @@ impl SampleRepository {
     }
 
     pub fn submit_image_annotations(&self, project_id: &str, image_id: &str) -> Result<(), String> {
+        match crate::data_project_versioning::update_active_data_project_checkout_image_state(
+            project_id,
+            image_id,
+            Some("待质检"),
+            Some("待质检"),
+            Some(None),
+            None,
+        ) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => return Err(error),
+        }
         let paths = project_fs::project_paths(project_id);
         storage::submit_image_for_review(&paths.sqlite, image_id)
     }
 
-    pub fn set_image_verified(&self, project_id: &str, image_id: &str, verified: bool) -> Result<(), String> {
+    pub fn set_image_verified(
+        &self,
+        project_id: &str,
+        image_id: &str,
+        verified: bool,
+    ) -> Result<(), String> {
+        match crate::data_project_versioning::update_active_data_project_checkout_image_state(
+            project_id,
+            image_id,
+            None,
+            None,
+            None,
+            Some(verified),
+        ) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => return Err(error),
+        }
         let paths = project_fs::project_paths(project_id);
         storage::set_image_verified(&paths.sqlite, image_id, verified)
     }
@@ -1693,10 +2276,52 @@ impl SampleRepository {
         project_id: &str,
         name: &str,
     ) -> Result<AnnotationTask, String> {
+        self.create_annotation_task_for_images(project_id, name, None)
+    }
+
+    /// Create a task for either the complete project image set or an explicit
+    /// non-empty selection.  The selection is validated against the indexed
+    /// project before the storage transaction starts so a task can never
+    /// reference an image from another project (or a duplicate image).
+    pub fn create_annotation_task_for_images(
+        &self,
+        project_id: &str,
+        name: &str,
+        selected_image_ids: Option<&[String]>,
+    ) -> Result<AnnotationTask, String> {
         let paths = project_fs::project_paths(project_id);
         let images = self.project_images(project_id, None);
-        let image_ids: Vec<_> = images.iter().map(|image| image.id.as_str()).collect();
-        let record = storage::create_annotation_task_record(&paths.sqlite, name, &image_ids)?;
+        let image_ids = match selected_image_ids {
+            None => images.into_iter().map(|image| image.id).collect::<Vec<_>>(),
+            Some(selected) => {
+                if selected.is_empty() {
+                    return Err("at least one image must be selected".to_string());
+                }
+                let available = images
+                    .iter()
+                    .map(|image| image.id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let mut seen = BTreeSet::new();
+                let mut image_ids = Vec::with_capacity(selected.len());
+                for image_id in selected {
+                    if image_id.trim().is_empty() {
+                        return Err("selected image ID must not be empty".to_string());
+                    }
+                    if !available.contains(image_id.as_str()) {
+                        return Err(format!(
+                            "selected image does not belong to project: {image_id}"
+                        ));
+                    }
+                    if !seen.insert(image_id.as_str()) {
+                        return Err(format!("selected image ID is duplicated: {image_id}"));
+                    }
+                    image_ids.push(image_id.clone());
+                }
+                image_ids
+            }
+        };
+        let image_refs = image_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let record = storage::create_annotation_task_record(&paths.sqlite, name, &image_refs)?;
         Ok(task_from_record(record))
     }
 
@@ -1743,11 +2368,52 @@ impl SampleRepository {
         decision: &str,
         note: &str,
     ) -> Result<(), String> {
+        let (status, qa_status) = match decision {
+            "approved" | "通过" => ("通过", "通过"),
+            "rejected" | "驳回" => ("草稿", "驳回"),
+            other => return Err(format!("unknown review decision: {other}")),
+        };
+        match crate::data_project_versioning::update_active_data_project_checkout_image_state(
+            project_id,
+            image_id,
+            Some(status),
+            Some(qa_status),
+            Some(Some(note)),
+            None,
+        ) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => return Err(error),
+        }
         let paths = project_fs::project_paths(project_id);
         storage::review_image(&paths.sqlite, image_id, decision, note)
     }
 
     pub fn review_queue(&self, project_id: &str) -> Result<Vec<DatasetImage>, String> {
+        if let Some(entries) =
+            crate::data_project_versioning::active_data_project_checkout_entries(project_id)?
+        {
+            return Ok(entries
+                .into_iter()
+                .filter(|entry| {
+                    matches!(
+                        entry.qa_status.trim().to_ascii_lowercase().as_str(),
+                        "待质检" | "pending" | "pendingreview" | "pending_review"
+                    )
+                })
+                .map(|entry| DatasetImage {
+                    id: entry.image_id,
+                    file_name: entry.file_name,
+                    width: entry.width,
+                    height: entry.height,
+                    split: entry.split.clone(),
+                    status: entry.status,
+                    qa_status: entry.qa_status,
+                    review_note: None,
+                    tags: vec![format!("split={}", entry.split)],
+                })
+                .collect());
+        }
         let paths = project_fs::project_paths(project_id);
         Ok(storage::read_review_queue(&paths.sqlite)?
             .into_iter()
@@ -2526,7 +3192,12 @@ fn bridge_object_from_legacy(object: LegacySnapshotObject) -> Result<BridgeObjec
 
 fn validate_snapshot_stable_id(value: &str) -> Result<(), &'static str> {
     validate_snapshot_text(value)?;
-    if value.contains(':') {
+    // IDs are persisted as path components and must be portable between
+    // desktop and mobile platforms.  On Unix a backslash is otherwise
+    // treated as an ordinary filename character, but on Windows it is a
+    // separator; accepting it here would make the same ID address different
+    // storage locations on different clients.
+    if value.contains(':') || value.contains('\\') {
         return Err("stable ID must not contain a path prefix");
     }
     let path = Path::new(value);
@@ -3335,17 +4006,40 @@ fn validate_existing_source_label(
     height: u32,
     classes: &[storage::StoredClass],
 ) -> Result<(), String> {
-    if !label_path.exists() { return Ok(()); }
-    let source = fs::read_to_string(label_path)
-        .map_err(|error| format!("read existing source label {}: {error}", label_path.display()))?;
-    let labels = classes.iter().map(|class| class.label.clone()).collect::<Vec<_>>();
+    if !label_path.exists() {
+        return Ok(());
+    }
+    let source = fs::read_to_string(label_path).map_err(|error| {
+        format!(
+            "read existing source label {}: {error}",
+            label_path.display()
+        )
+    })?;
+    let labels = classes
+        .iter()
+        .map(|class| class.label.clone())
+        .collect::<Vec<_>>();
     if format == "voc-detect" {
-        voc::parse_voc_annotations(&source, &labels)
-            .map_err(|error| format!("invalid existing VOC label {}: {error}", label_path.display()))?;
+        voc::parse_voc_annotations(&source, &labels).map_err(|error| {
+            format!(
+                "invalid existing VOC label {}: {error}",
+                label_path.display()
+            )
+        })?;
     } else {
-        for (index, line) in source.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()) {
+        for (index, line) in source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+        {
             yolo::line_to_annotation(line, width, height, &labels, index, format == "yolo-seg")
-                .map_err(|error| format!("invalid existing YOLO label {} line {}: {error}", label_path.display(), index + 1))?;
+                .map_err(|error| {
+                    format!(
+                        "invalid existing YOLO label {} line {}: {error}",
+                        label_path.display(),
+                        index + 1
+                    )
+                })?;
         }
     }
     Ok(())
@@ -3579,6 +4273,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn creates_selected_annotation_task_items_and_outbox_payload_only() {
+        let project_id = format!(
+            "selected-task-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let paths = project_fs::ensure_workspace_project_dirs(&project_id).unwrap();
+        storage::initialize_project_database(&paths.sqlite).unwrap();
+        let manifest = project_fs::ProjectManifest {
+            id: project_id.clone(),
+            name: "Selected task fixture".to_string(),
+            source_dataset_key: "unit-test".to_string(),
+            format: "yolo-detect".to_string(),
+            root_path: paths.root.to_string_lossy().to_string(),
+            created_at: "0".to_string(),
+            class_count: 0,
+            image_count: 2,
+        };
+        storage::upsert_project_index(
+            &paths.sqlite,
+            &manifest,
+            &[
+                storage::StoredImage {
+                    id: "image-a".to_string(),
+                    file_name: "image-a.png".to_string(),
+                    width: 8,
+                    height: 8,
+                    split: "train".to_string(),
+                    status: "草稿".to_string(),
+                    qa_status: String::new(),
+                    review_note: None,
+                },
+                storage::StoredImage {
+                    id: "image-b".to_string(),
+                    file_name: "image-b.png".to_string(),
+                    width: 8,
+                    height: 8,
+                    split: "train".to_string(),
+                    status: "草稿".to_string(),
+                    qa_status: String::new(),
+                    review_note: None,
+                },
+            ],
+            &[],
+        )
+        .unwrap();
+
+        let repository = SampleRepository::new();
+        let selected = vec!["image-b".to_string()];
+        let task = repository
+            .create_annotation_task_for_images(&project_id, "Selected one", Some(&selected))
+            .unwrap();
+
+        let task_items = repository.task_items(&project_id, &task.id).unwrap();
+        assert_eq!(task_items.len(), 1);
+        assert_eq!(task_items[0].image_id, "image-b");
+
+        let connection = rusqlite::Connection::open(&paths.sqlite).unwrap();
+        let payload: String = connection
+            .query_row(
+                "SELECT payload_json FROM sync_outbox WHERE entity_type='task' AND entity_id=?1",
+                [&task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["imageIds"], json!(["image-b"]));
+
+        let empty =
+            repository.create_annotation_task_for_images(&project_id, "Empty selection", Some(&[]));
+        assert!(empty.unwrap_err().contains("at least one image"));
+        let foreign = vec!["not-in-project".to_string()];
+        let foreign = repository.create_annotation_task_for_images(
+            &project_id,
+            "Foreign selection",
+            Some(&foreign),
+        );
+        assert!(foreign.unwrap_err().contains("does not belong to project"));
+
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
     fn demo_detection_project_publishes_ready_snapshot_bridge() {
         let name = format!(
             "Bridge Detection Demo {}",
@@ -3697,6 +4476,67 @@ mod tests {
         assert!(ambiguous.is_err());
         assert_eq!(repository.dataset_snapshots(project_id).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn image_path_resolves_indexed_source_linked_asset() {
+        let repository = SampleRepository::new();
+        let project_id = format!(
+            "source-linked-image-path-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let paths = project_fs::project_paths(&project_id);
+        let source_root = std::env::temp_dir().join(&project_id);
+        let _ = std::fs::remove_dir_all(&paths.root);
+        let _ = std::fs::remove_dir_all(&source_root);
+        project_fs::ensure_workspace_project_dirs(&project_id).unwrap();
+        std::fs::create_dir_all(source_root.join("JPEGImages")).unwrap();
+        let file_name = "JPEGImages/source-linked.png";
+        let source_path = source_root.join(file_name);
+        image::RgbImage::from_pixel(12, 8, image::Rgb([1, 2, 3]))
+            .save(&source_path)
+            .unwrap();
+        storage::initialize_project_database(&paths.sqlite).unwrap();
+        let manifest = project_fs::ProjectManifest {
+            id: project_id.clone(),
+            name: "Source linked path".to_string(),
+            source_dataset_key: "local-linked".to_string(),
+            format: "voc-detect".to_string(),
+            root_path: source_root.to_string_lossy().to_string(),
+            created_at: now_unix_string(),
+            class_count: 0,
+            image_count: 1,
+        };
+        storage::upsert_project_index(
+            &paths.sqlite,
+            &manifest,
+            &[storage::StoredImage {
+                id: "JPEGImages_source_linked".to_string(),
+                file_name: file_name.to_string(),
+                width: 12,
+                height: 8,
+                split: "local".to_string(),
+                status: "已标注".to_string(),
+                qa_status: String::new(),
+                review_note: None,
+            }],
+            &[],
+        )
+        .unwrap();
+
+        let resolved = repository
+            .image_path(&project_id, "JPEGImages_source_linked")
+            .unwrap();
+        assert_eq!(
+            std::fs::canonicalize(resolved).unwrap(),
+            std::fs::canonicalize(source_path).unwrap()
+        );
+
+        let _ = std::fs::remove_dir_all(paths.root);
+        let _ = std::fs::remove_dir_all(source_root);
     }
 
     #[test]
@@ -3843,14 +4683,31 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let save_error = SampleRepository::new().save_image_annotations_with_revision(
-            &project.id, &image.id, None, vec![AnnotationObject::bbox(
-                "safe-box".to_string(), 0, "person".to_string(),
-                BBox { x: 2.0, y: 2.0, width: 4.0, height: 4.0 },
-            )],
-        ).unwrap_err();
-        assert!(save_error.contains("invalid existing YOLO label"), "{save_error}");
-        assert!(storage::read_annotation_payload(&paths.sqlite, &image.id).unwrap().is_none());
+        let save_error = SampleRepository::new()
+            .save_image_annotations_with_revision(
+                &project.id,
+                &image.id,
+                None,
+                vec![AnnotationObject::bbox(
+                    "safe-box".to_string(),
+                    0,
+                    "person".to_string(),
+                    BBox {
+                        x: 2.0,
+                        y: 2.0,
+                        width: 4.0,
+                        height: 4.0,
+                    },
+                )],
+            )
+            .unwrap_err();
+        assert!(
+            save_error.contains("invalid existing YOLO label"),
+            "{save_error}"
+        );
+        assert!(storage::read_annotation_payload(&paths.sqlite, &image.id)
+            .unwrap()
+            .is_none());
         let strict = SampleRepository::new()
             .snapshot_annotation_state_strict(&paths, &manifest, &classes, &paths.raw, &image);
         assert!(
@@ -5186,7 +6043,10 @@ mod tests {
                 "symlink escape reached storage: {error}"
             );
             assert_eq!(std::fs::read(&marker_path).unwrap(), b"outside");
-            std::fs::remove_dir(&project_link).unwrap();
+            // A directory symlink must be unlinked as a symlink.  Calling
+            // remove_dir follows it on some platforms and returns
+            // NotADirectory, which would mask the path-validation assertion.
+            std::fs::remove_file(&project_link).unwrap();
         } else {
             assert!(ensure_project_root_is_in_workspace(&external_root).is_err());
         }

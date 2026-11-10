@@ -126,9 +126,13 @@ pub async fn project_resource_snapshot() -> Result<Snapshot, String> {
 }
 
 pub fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
-    tauri::plugin::Builder::new("project-resource-monitor")
-        .js_init_script(include_str!("project-resource-monitor.js").to_string())
-        .build()
+    // The process monitor is a desktop-only overlay. Keep the plugin and its
+    // IPC command available on mobile for command compatibility, but do not
+    // inject the fixed desktop monitor script over the mobile shell.
+    let builder = tauri::plugin::Builder::new("project-resource-monitor");
+    #[cfg(desktop)]
+    let builder = builder.js_init_script(include_str!("project-resource-monitor.js").to_string());
+    builder.build()
 }
 
 #[cfg(test)]

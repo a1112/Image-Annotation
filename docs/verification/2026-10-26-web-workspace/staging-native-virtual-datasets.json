@@ -1,0 +1,48 @@
+{
+  "passed": true,
+  "projectId": "4bde4ca6-4b14-482a-9bf9-58ab1676560c",
+  "datasetId": "4bde4ca6-4b14-482a-9bf9-58ab1676560c::961529a07-day",
+  "branch": "web-native-469bcbfc",
+  "commitId": "718d5bba-9ef3-4466-aa75-6b5fa57f5ff9",
+  "newImageId": "4b2e1230-205d-4483-8cd2-7834a8cffa3d",
+  "sourceHash": "fee5141d46f701eaafe807d0be2f1127b3b99e67f0754cd5c4fe9d8d9c5d9f89",
+  "checks": [
+    {
+      "name": "every native project dataset has an openable web dataset card",
+      "passed": true
+    },
+    {
+      "name": "native dataset cards retain readable manifest names",
+      "passed": true
+    },
+    {
+      "name": "native dataset detail and class schema are readable",
+      "passed": true
+    },
+    {
+      "name": "native main remains clean before browser edits",
+      "passed": true
+    },
+    {
+      "name": "virtual dataset accepts a real web upload and annotation",
+      "passed": true
+    },
+    {
+      "name": "virtual dataset original bytes retain exact hash",
+      "passed": true
+    },
+    {
+      "name": "branch upload never alters main data or head",
+      "passed": true
+    },
+    {
+      "name": "desktop native clone switches to browser-created native-dataset branch",
+      "passed": true
+    },
+    {
+      "name": "browser upload and labels materialize as exact bytes in native desktop",
+      "passed": true
+    }
+  ],
+  "nativeCloneProjectId": "data-project-8b2ab239-cdcf-4e29-8d4d-c2543664efcc"
+}

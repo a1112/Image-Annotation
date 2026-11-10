@@ -1,0 +1,26 @@
+{
+  "passed": true,
+  "projectId": "ae7aa61d-c98f-47b6-8b1d-4706853d3898",
+  "checks": [
+    {
+      "name": "removing the only dataset remains a dirty removal across repeated reads",
+      "passed": true
+    },
+    {
+      "name": "committed empty project remains clean",
+      "passed": true
+    },
+    {
+      "name": "removed dataset remains in immutable historical commit",
+      "passed": true
+    },
+    {
+      "name": "deleted branch is absent from active branch list",
+      "passed": true
+    },
+    {
+      "name": "commit cannot revive a deleted branch",
+      "passed": true
+    }
+  ]
+}

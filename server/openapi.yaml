@@ -5,19 +5,46 @@ info:
   description: |
     Remote API for hybrid image-annotation projects. Mutating requests are
     authenticated, authorized per project, audited, and exposed through the
-    incremental change stream.
+    incremental change stream. The browser workspace uses same-origin
+    HttpOnly-cookie sessions and a PostgreSQL-backed command/worktree API;
+    image bytes and transform outputs are stored in the configured S3-compatible
+    object store. Generated URLs use PUBLIC_BASE_URL, including any reverse
+    proxy path prefix.
 servers:
   - url: http://127.0.0.1:8080
     description: Local development
+x-deployment:
+  description: Runtime configuration is deployment-specific; this document does not claim that a production instance is currently running.
+  staticApp:
+    path: /app/
+    directoryEnvironment: WEB_DIST_DIR
+    defaultDirectory: ../dist-web
+  publicBaseUrl:
+    environment: PUBLIC_BASE_URL
+    purpose: Cookie Path and generated API polling/download URLs
+    reverseProxyExample: https://host.example/image-annotation
+  persistence:
+    metadata: PostgreSQL
+    objects: S3-compatible storage (MinIO supported)
+  additiveMigrations:
+    - 0005_data_projects.sql
+    - 0006_image_transforms.sql
+    - 0007_web_workspace.sql
+    - 0008_project_blob_references.sql
 security:
   - bearerAuth: []
 tags:
   - name: System
+  - name: Auth
   - name: Projects
   - name: Assets
   - name: Annotations
+  - name: Collaboration
   - name: Issues
   - name: Sync
+  - name: Datasets
+  - name: Web Workspace
+  - name: Image Transforms
 paths:
   /health:
     get:
@@ -35,6 +62,80 @@ paths:
                   status:
                     type: string
                     const: ok
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      security: []
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Access token and rotating refresh token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      security: []
+      operationId: refreshSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "200":
+          description: Rotated refresh token and new access token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/auth/me:
+    get:
+      tags: [Auth]
+      operationId: currentUser
+      responses:
+        "200":
+          description: Current account and registered devices
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      responses:
+        "200":
+          description: Current session revoked
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/auth/devices/{deviceId}:
+    parameters:
+      - name: deviceId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    delete:
+      tags: [Auth]
+      operationId: revokeDevice
+      responses:
+        "200":
+          description: Device and its sessions revoked
+        default:
+          $ref: "#/components/responses/Error"
   /api/v1/projects:
     get:
       tags: [Projects]
@@ -45,13 +146,9 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [items]
-                properties:
-                  items:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/Project"
+                type: array
+                items:
+                  $ref: "#/components/schemas/Project"
         default:
           $ref: "#/components/responses/Error"
     post:
@@ -125,12 +222,9 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  items:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/ProjectMember"
+                type: array
+                items:
+                  $ref: "#/components/schemas/ProjectMember"
         default:
           $ref: "#/components/responses/Error"
     post:
@@ -152,6 +246,68 @@ paths:
       responses:
         "200":
           description: Added or updated member
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/projects/{projectId}/members/{memberId}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - name: memberId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    delete:
+      tags: [Projects]
+      operationId: removeProjectMember
+      responses:
+        "200":
+          description: Project membership revoked
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/projects/{projectId}/invitations:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    post:
+      tags: [Auth, Projects]
+      operationId: inviteProjectMember
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, role]
+              properties:
+                email: { type: string, format: email }
+                role: { $ref: "#/components/schemas/ProjectRole" }
+      responses:
+        "200":
+          description: Invitation token (deliver it out of band)
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/auth/invitations/{token}/accept:
+    parameters:
+      - name: token
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [Auth]
+      security: []
+      operationId: acceptProjectInvitation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AcceptInvitationRequest"
+      responses:
+        "200":
+          description: Account/session created and membership accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
         default:
           $ref: "#/components/responses/Error"
   /api/v1/projects/{projectId}/images:
@@ -225,6 +381,13 @@ paths:
   /api/v1/assets/{assetId}/download-url:
     parameters:
       - $ref: "#/components/parameters/AssetId"
+      - name: variant
+        in: query
+        required: false
+        schema:
+          type: string
+          enum: [original, thumb, thumbnail]
+          default: original
     get:
       tags: [Assets]
       operationId: getAssetDownloadUrl
@@ -315,6 +478,125 @@ paths:
       responses:
         "204":
           description: Lease released
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/projects/{projectId}/tasks:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [Collaboration]
+      operationId: listTasks
+      responses:
+        "200":
+          description: Project tasks
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      tags: [Collaboration]
+      operationId: createTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TaskWrite" }
+      responses:
+        "200":
+          description: Created task and item IDs
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/tasks/{taskId}/items:
+    parameters:
+      - $ref: "#/components/parameters/TaskId"
+    get:
+      tags: [Collaboration]
+      operationId: listTaskItems
+      responses:
+        "200":
+          description: Task items and claim state
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/tasks/{taskId}/items/{imageId}/claim:
+    parameters:
+      - $ref: "#/components/parameters/TaskId"
+      - $ref: "#/components/parameters/ImageId"
+    post:
+      tags: [Collaboration]
+      operationId: claimTaskItem
+      responses:
+        "200":
+          description: Atomically claimed item
+        "409":
+          description: Item is already claimed
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      tags: [Collaboration]
+      operationId: releaseTaskItem
+      responses:
+        "200":
+          description: Item released
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/projects/{projectId}/review-queue:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [Collaboration]
+      operationId: reviewQueue
+      responses:
+        "200":
+          description: Images awaiting review with complete annotation objects
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/projects/{projectId}/images/{imageId}/review:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/ImageId"
+    post:
+      tags: [Collaboration]
+      operationId: reviewAnnotation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReviewWrite" }
+      responses:
+        "200":
+          description: Applied review with complete remote annotation payload
+        "409":
+          description: Annotation revision conflict
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/projects/{projectId}/label-schema:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [Collaboration]
+      operationId: getLabelSchema
+      responses:
+        "200":
+          description: Current project label schema
+        default:
+          $ref: "#/components/responses/Error"
+    put:
+      tags: [Collaboration]
+      operationId: putLabelSchema
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SchemaWrite" }
+      responses:
+        "200":
+          description: Updated project schema and class list
+        "409":
+          description: Schema revision conflict
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
         default:
           $ref: "#/components/responses/Error"
   /api/v1/projects/{projectId}/issues:
@@ -433,6 +715,36 @@ paths:
                 $ref: "#/components/schemas/DownloadTicket"
         default:
           $ref: "#/components/responses/Error"
+  /api/v1/object-tickets/{token}:
+    parameters:
+      - name: token
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Assets]
+      security: []
+      operationId: streamObjectTicket
+      responses:
+        "200":
+          description: Private object stream; ticket expires in five minutes
+          content:
+            application/octet-stream: {}
+        default:
+          $ref: "#/components/responses/Error"
+    put:
+      tags: [Assets]
+      security: []
+      operationId: uploadObjectTicket
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: {}
+      responses:
+        "204":
+          description: Object uploaded
+        default:
+          $ref: "#/components/responses/Error"
   /api/v1/sync/push:
     post:
       tags: [Sync]
@@ -495,12 +807,608 @@ paths:
           description: Full remote project snapshot and starting cursor
         default:
           $ref: "#/components/responses/Error"
+  /api/v1/datasets:
+    get:
+      tags: [Datasets]
+      operationId: listDatasets
+      responses:
+        "200":
+          description: Datasets visible to the current organization member
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Dataset" }
+        default: { $ref: "#/components/responses/Error" }
+    post:
+      tags: [Datasets]
+      operationId: createDataset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DatasetWrite" }
+      responses:
+        "200":
+          description: Created dataset
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Dataset" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/datasets/{datasetId}:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    get:
+      tags: [Datasets]
+      operationId: getDataset
+      responses:
+        "200":
+          description: Dataset summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Dataset" }
+        default: { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [Datasets]
+      operationId: updateDataset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DatasetUpdate" }
+      responses:
+        "200":
+          description: Updated dataset
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Dataset" }
+        default: { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [Datasets]
+      operationId: archiveDataset
+      responses:
+        "200":
+          description: Archived dataset
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/datasets/{datasetId}/members:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    get:
+      tags: [Datasets]
+      operationId: listDatasetMembers
+      responses:
+        "200":
+          description: Dataset ACL members
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/DatasetMember" }
+        default: { $ref: "#/components/responses/Error" }
+    post:
+      tags: [Datasets]
+      operationId: addDatasetMember
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DatasetMemberWrite" }
+      responses:
+        "200":
+          description: Dataset member upserted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DatasetMember" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/datasets/{datasetId}/members/{memberId}:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+      - $ref: "#/components/parameters/DatasetMemberId"
+    delete:
+      tags: [Datasets]
+      operationId: removeDatasetMember
+      responses:
+        "200": { description: Dataset member removed }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/datasets/{datasetId}/items:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    get:
+      tags: [Datasets]
+      operationId: listDatasetItems
+      responses:
+        "200":
+          description: Current working dataset items and independent annotations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/datasets/{datasetId}/capture:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    post:
+      tags: [Datasets]
+      operationId: captureProjectToDataset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DatasetCapture" }
+      responses:
+        "200":
+          description: Idempotent capture result
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/datasets/{datasetId}/versions:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    get:
+      tags: [Datasets]
+      operationId: listDatasetVersions
+      responses:
+        "200":
+          description: Immutable dataset versions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/DatasetVersion" }
+        default: { $ref: "#/components/responses/Error" }
+    post:
+      tags: [Datasets]
+      operationId: createDatasetVersion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DatasetVersionWrite" }
+      responses:
+        "200":
+          description: Immutable version creation result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DatasetVersionResult" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/datasets/{datasetId}/versions/{versionId}:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+      - $ref: "#/components/parameters/DatasetVersionId"
+    get:
+      tags: [Datasets]
+      operationId: getDatasetVersion
+      responses:
+        "200":
+          description: Full immutable manifest
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DatasetVersionDetail" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/datasets/{datasetId}/reuse:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    post:
+      tags: [Datasets]
+      operationId: reuseDatasetVersion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DatasetReuse" }
+      responses:
+        "200":
+          description: Materialized project and independent annotation rows
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/storage/quota:
+    get:
+      tags: [Datasets]
+      operationId: getStorageQuota
+      responses:
+        "200":
+          description: Organization storage usage and hard limits
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StorageQuota" }
+        default: { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [Datasets]
+      operationId: updateStorageQuota
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StorageQuotaWrite" }
+      responses:
+        "200":
+          description: Updated organization quota
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StorageQuota" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/datasets/{datasetId}/jobs/import:
+    $ref: "#/components/pathItems/DatasetImportJob"
+  /api/v1/datasets/{datasetId}/imports:
+    $ref: "#/components/pathItems/DatasetImportJobAlias"
+  /api/v1/datasets/{datasetId}/jobs/export:
+    $ref: "#/components/pathItems/DatasetExportJob"
+  /api/v1/datasets/{datasetId}/exports:
+    $ref: "#/components/pathItems/DatasetExportJobAlias"
+  /api/v1/datasets/{datasetId}/jobs:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    get:
+      tags: [Datasets]
+      operationId: listDatasetJobs
+      responses:
+        "200":
+          description: Durable import/export jobs
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/DatasetJob" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/dataset-jobs/{jobId}:
+    parameters:
+      - $ref: "#/components/parameters/DatasetJobId"
+    get:
+      tags: [Datasets]
+      operationId: getDatasetJob
+      responses:
+        "200":
+          description: Dataset job status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DatasetJob" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/dataset-jobs/{jobId}/download:
+    parameters:
+      - $ref: "#/components/parameters/DatasetJobId"
+    get:
+      tags: [Datasets]
+      operationId: downloadDatasetJob
+      responses:
+        "200":
+          description: Export ZIP stream
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/web/auth/login:
+    post:
+      tags: [Web Workspace]
+      security: []
+      summary: Start a same-origin browser session
+      description: |
+        The server validates the browser Origin and sets rotating HttpOnly
+        `ia_web_access` and `ia_web_refresh` cookies. Access and refresh tokens
+        are not returned in the JSON response. Cookie Path and generated URLs
+        follow the configured PUBLIC_BASE_URL prefix.
+      parameters:
+        - $ref: "#/components/parameters/BrowserOrigin"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebLogin" }
+      responses:
+        "200":
+          description: Authenticated browser session; Set-Cookie headers are returned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebSession" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/web/auth/refresh:
+    post:
+      tags: [Web Workspace]
+      security:
+        - webRefreshCookie: []
+      summary: Rotate the browser refresh session
+      parameters:
+        - $ref: "#/components/parameters/BrowserOrigin"
+      responses:
+        "200":
+          description: Refreshed browser session; Set-Cookie headers are returned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebSession" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/web/auth/session:
+    get:
+      tags: [Web Workspace]
+      security:
+        - webAccessCookie: []
+      summary: Read the current browser account
+      responses:
+        "200":
+          description: Current cookie-authenticated account
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebSession" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/web/auth/logout:
+    post:
+      tags: [Web Workspace]
+      security: []
+      summary: Revoke the browser refresh session
+      parameters:
+        - $ref: "#/components/parameters/BrowserOrigin"
+      responses:
+        "200":
+          description: Session revoked and cookies expired
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [authenticated, revoked]
+                properties:
+                  authenticated: { type: boolean, const: false }
+                  revoked: { type: boolean, const: true }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/web/commands/{command}:
+    parameters:
+      - name: command
+        in: path
+        required: true
+        description: CamelCase or snake/kebab-case browser command name
+        schema: { type: string, minLength: 1 }
+    post:
+      tags: [Web Workspace]
+      security:
+        - webAccessCookie: []
+      summary: Execute a PostgreSQL-backed browser workspace command
+      description: |
+        The body is either the command arguments or `{ "args": { ... } }`.
+        Supported command families include project/dataset discovery, image
+        listing and upload state, annotations/classes, branches, immutable
+        commits, three-way merge/conflict resolution, restore/export, review
+        queues, tasks, and project membership. Each command re-checks the
+        current project or dataset ACL.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebCommandRequest" }
+      responses:
+        "200":
+          description: Command result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebCommandResponse" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/web/datasets/{datasetId}/images/upload:
+    parameters:
+      - $ref: "#/components/parameters/WebDatasetId"
+      - name: fileName
+        in: query
+        required: true
+        schema: { type: string, minLength: 1 }
+      - name: branch
+        in: query
+        required: false
+        schema: { type: string }
+      - name: X-Object-Size
+        in: header
+        required: false
+        description: Optional exact byte count checked against the request body
+        schema: { type: integer, format: int64, minimum: 0, maximum: 268435456 }
+    put:
+      tags: [Web Workspace]
+      security:
+        - webAccessCookie: []
+      summary: Upload and verify a browser workspace image
+      description: Image bytes are decoded and bounded at 256 MiB/100 million pixels before a new project-scoped object and worktree entry are created.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+          image/*:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: Uploaded image and worktree entry
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebUploadResponse" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/web/datasets/{datasetId}/images/{imageId}/content:
+    parameters:
+      - $ref: "#/components/parameters/WebDatasetId"
+      - $ref: "#/components/parameters/WebImageId"
+      - name: branch
+        in: query
+        required: false
+        schema: { type: string }
+    get:
+      tags: [Web Workspace]
+      security:
+        - webAccessCookie: []
+      summary: Stream a project or standalone dataset image
+      responses:
+        "200":
+          description: Authenticated image bytes
+          content:
+            image/*:
+              schema: { type: string, format: binary }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/web/projects/{projectId}/objects/{hash}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/ObjectHash"
+    get:
+      tags: [Web Workspace]
+      security:
+        - webAccessCookie: []
+      summary: Stream a project-scoped content-addressed object
+      responses:
+        "200":
+          description: Authenticated object bytes
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+            image/*:
+              schema: { type: string, format: binary }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/projects/{projectId}/image-transforms:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    post:
+      tags: [Image Transforms]
+      security:
+        - bearerAuth: []
+        - webAccessCookie: []
+      summary: Queue a transform for a legacy project asset
+      description: The source asset is read-only; the worker writes a new output object and durable task result.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ImageTransformRequest" }
+      responses:
+        "202":
+          description: Transform task queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImageTransformAccepted" }
+        "200":
+          description: Existing idempotent task returned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImageTransformAccepted" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/data-projects/{projectId}/image-transforms:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [Image Transforms]
+      security:
+        - bearerAuth: []
+        - webAccessCookie: []
+      summary: List durable transforms for a data project
+      parameters:
+        - name: datasetKey
+          in: query
+          required: false
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        "200":
+          description: Transform history, filtered by current project ACL
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ImageTransformTask" }
+        default: { $ref: "#/components/responses/Error" }
+    post:
+      tags: [Image Transforms]
+      security:
+        - bearerAuth: []
+        - webAccessCookie: []
+      summary: Queue a transform for a data-project object
+      description: The data-project source uses sourceHash and an optional canonical datasetKey.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ImageTransformRequest" }
+      responses:
+        "202":
+          description: Transform task queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImageTransformAccepted" }
+        "200":
+          description: Existing idempotent task returned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImageTransformAccepted" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/image-transforms/{taskId}:
+    parameters:
+      - $ref: "#/components/parameters/TaskId"
+    get:
+      tags: [Image Transforms]
+      security:
+        - bearerAuth: []
+        - webAccessCookie: []
+      summary: Read a transform task and output metadata
+      responses:
+        "200":
+          description: Durable transform task
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImageTransformTask" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/image-transforms/{taskId}/download:
+    parameters:
+      - $ref: "#/components/parameters/TaskId"
+    get:
+      tags: [Image Transforms]
+      security:
+        - bearerAuth: []
+        - webAccessCookie: []
+      summary: Download a completed transform output
+      description: The source project/data-project ACL is checked again at download time; output is returned as a private attachment and the source remains unchanged.
+      responses:
+        "200":
+          description: JPEG, PNG, WebP, or TIFF output bytes
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+            image/png:
+              schema: { type: string, format: binary }
+            image/webp:
+              schema: { type: string, format: binary }
+            image/tiff:
+              schema: { type: string, format: binary }
+        default: { $ref: "#/components/responses/Error" }
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: JWT
+    webAccessCookie:
+      type: apiKey
+      in: cookie
+      name: ia_web_access
+      description: HttpOnly access cookie set by the same-origin Web login endpoint.
+    webRefreshCookie:
+      type: apiKey
+      in: cookie
+      name: ia_web_refresh
+      description: HttpOnly rotating refresh cookie used by Web refresh/logout.
   parameters:
     ProjectId:
       name: projectId
@@ -518,6 +1426,13 @@ components:
         format: uuid
     ImageId:
       name: imageId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    TaskId:
+      name: taskId
       in: path
       required: true
       schema:
@@ -544,6 +1459,60 @@ components:
       description: Current integer revision expected by the writer
       schema:
         type: string
+    DatasetId:
+      name: datasetId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    DatasetVersionId:
+      name: versionId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    DatasetJobId:
+      name: jobId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    DatasetMemberId:
+      name: memberId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    BrowserOrigin:
+      name: Origin
+      in: header
+      required: true
+      description: Browser origin checked against the configured PUBLIC_BASE_URL host and scheme.
+      schema: { type: string, format: uri }
+    WebDatasetId:
+      name: datasetId
+      in: path
+      required: true
+      description: UUID for a standalone dataset or projectUUID::canonicalKey for a project dataset.
+      schema: { type: string, minLength: 1 }
+    WebImageId:
+      name: imageId
+      in: path
+      required: true
+      description: Project image identifier or UUID for a standalone dataset item.
+      schema: { type: string, minLength: 1 }
+    ObjectHash:
+      name: hash
+      in: path
+      required: true
+      description: Lowercase SHA-256 content digest.
+      schema:
+        type: string
+        pattern: "^[a-fA-F0-9]{64}$"
   responses:
     Error:
       description: Structured API error
@@ -551,7 +1520,465 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+  pathItems:
+    DatasetImportJob:
+      parameters:
+        - $ref: "#/components/parameters/DatasetId"
+        - name: format
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/DatasetFormat"
+        - name: X-Operation-Id
+          in: header
+          required: true
+          schema: { type: string, maxLength: 200 }
+        - name: X-Content-SHA256
+          in: header
+          required: false
+          schema: { type: string, pattern: "^[a-fA-F0-9]{64}$" }
+      post:
+        tags: [Datasets]
+        operationId: importDatasetArchive
+        requestBody:
+          required: true
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        responses:
+          "200":
+            description: Queued or existing idempotent import job
+            content:
+              application/json:
+                schema: { $ref: "#/components/schemas/DatasetJob" }
+          default: { $ref: "#/components/responses/Error" }
+    DatasetExportJob:
+      parameters:
+        - $ref: "#/components/parameters/DatasetId"
+      post:
+        tags: [Datasets]
+        operationId: exportDatasetVersion
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DatasetExportWrite" }
+        responses:
+          "200":
+            description: Queued or existing idempotent export job
+            content:
+              application/json:
+                schema: { $ref: "#/components/schemas/DatasetJob" }
+          default: { $ref: "#/components/responses/Error" }
+    DatasetImportJobAlias:
+      parameters:
+        - $ref: "#/components/parameters/DatasetId"
+        - name: format
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/DatasetFormat"
+        - name: X-Operation-Id
+          in: header
+          required: true
+          schema: { type: string, maxLength: 200 }
+        - name: X-Content-SHA256
+          in: header
+          required: false
+          schema: { type: string, pattern: "^[a-fA-F0-9]{64}$" }
+      post:
+        tags: [Datasets]
+        operationId: importDatasetArchiveAlias
+        requestBody:
+          required: true
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        responses:
+          "200":
+            description: Queued or existing idempotent import job
+            content:
+              application/json:
+                schema: { $ref: "#/components/schemas/DatasetJob" }
+          default: { $ref: "#/components/responses/Error" }
+    DatasetExportJobAlias:
+      parameters:
+        - $ref: "#/components/parameters/DatasetId"
+      post:
+        tags: [Datasets]
+        operationId: exportDatasetVersionAlias
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DatasetExportWrite" }
+        responses:
+          "200":
+            description: Queued or existing idempotent export job
+            content:
+              application/json:
+                schema: { $ref: "#/components/schemas/DatasetJob" }
+          default: { $ref: "#/components/responses/Error" }
   schemas:
+    WebLogin:
+      type: object
+      required: [email, password, deviceId]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, format: password }
+        deviceId: { type: string, minLength: 1 }
+        deviceName: { type: string }
+    WebSession:
+      type: object
+      required: [authenticated]
+      properties:
+        authenticated: { type: boolean }
+        deviceId: { type: [string, "null"] }
+        user:
+          type: [object, "null"]
+          additionalProperties: true
+    WebCommandRequest:
+      type: object
+      description: Command arguments, optionally wrapped in an args object. The command route enforces a 32 MiB JSON body limit.
+      additionalProperties: true
+      properties:
+        args:
+          type: object
+          additionalProperties: true
+    WebCommandResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok: { type: boolean, const: true }
+        data:
+          description: Command-specific PostgreSQL-backed workspace result.
+          additionalProperties: true
+    WebUploadResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok: { type: boolean, const: true }
+        data:
+          type: object
+          required: [imageId, imageHash, byteSize, width, height]
+          properties:
+            dataProjectId: { type: string, format: uuid }
+            datasetId: { type: string }
+            branch: { type: string }
+            imageId: { type: string }
+            imageHash:
+              type: string
+              pattern: "^[a-fA-F0-9]{64}$"
+            byteSize: { type: integer, format: int64 }
+            width: { type: integer }
+            height: { type: integer }
+            imageUrl: { type: string, format: uri-reference }
+    Crop:
+      type: object
+      required: [x, y, width, height]
+      properties:
+        x: { type: integer, minimum: 0, maximum: 32768 }
+        y: { type: integer, minimum: 0, maximum: 32768 }
+        width: { type: integer, minimum: 1, maximum: 32768 }
+        height: { type: integer, minimum: 1, maximum: 32768 }
+    ImageTransformRequest:
+      type: object
+      required: [operationId, format]
+      properties:
+        operationId: { type: string, minLength: 1, maxLength: 160 }
+        sourceAssetId: { type: [string, "null"], format: uuid }
+        sourceHash:
+          type: [string, "null"]
+          pattern: "^[a-fA-F0-9]{64}$"
+        datasetId: { type: [string, "null"], format: uuid }
+        datasetKey: { type: [string, "null"] }
+        format: { type: string, enum: [jpeg, jpg, png, webp, tiff, tif] }
+        width: { type: [integer, "null"], minimum: 1, maximum: 32768 }
+        height: { type: [integer, "null"], minimum: 1, maximum: 32768 }
+        crop: { $ref: "#/components/schemas/Crop" }
+        rotate: { type: integer, enum: [0, 90, 180, 270], default: 0 }
+        flip: { type: string, enum: [none, horizontal, vertical, both], default: none }
+        quality: { type: [integer, "null"], minimum: 1, maximum: 100, default: 85 }
+    ImageTransformAccepted:
+      type: object
+      required: [taskId, status, created, pollUrl]
+      properties:
+        taskId: { type: string, format: uuid }
+        status: { type: string, enum: [queued, running, succeeded, failed] }
+        created: { type: boolean }
+        pollUrl: { type: string, format: uri }
+    ImageTransformTask:
+      type: object
+      required: [taskId, operationId, sourceScope, projectId, sourceHash, format, status]
+      properties:
+        taskId: { type: string, format: uuid }
+        operationId: { type: string }
+        sourceScope: { type: string, enum: [project, data-project] }
+        projectId: { type: string, format: uuid }
+        sourceAssetId: { type: [string, "null"], format: uuid }
+        sourceDatasetId: { type: [string, "null"], format: uuid }
+        sourceDatasetKey: { type: [string, "null"] }
+        sourceHash:
+          type: string
+          pattern: "^[a-fA-F0-9]{64}$"
+        sourceMimeType: { type: string }
+        sourceByteSize: { type: integer, format: int64 }
+        sourceWidth: { type: [integer, "null"] }
+        sourceHeight: { type: [integer, "null"] }
+        format: { type: string, enum: [jpeg, png, webp, tiff] }
+        width: { type: [integer, "null"] }
+        height: { type: [integer, "null"] }
+        crop: { type: [object, "null"], additionalProperties: true }
+        rotate: { type: integer, enum: [0, 90, 180, 270] }
+        flip: { type: string, enum: [none, horizontal, vertical, both] }
+        quality: { type: integer, minimum: 1, maximum: 100 }
+        status: { type: string, enum: [queued, running, succeeded, failed] }
+        outputHash:
+          type: [string, "null"]
+          pattern: "^[a-fA-F0-9]{64}$"
+        outputMimeType: { type: [string, "null"] }
+        outputByteSize: { type: [integer, "null"], format: int64 }
+        outputWidth: { type: [integer, "null"] }
+        outputHeight: { type: [integer, "null"] }
+        errorCode: { type: [string, "null"] }
+        errorMessage: { type: [string, "null"] }
+        downloadUrl: { type: [string, "null"], format: uri }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        startedAt: { type: [string, "null"], format: date-time }
+        finishedAt: { type: [string, "null"], format: date-time }
+    DatasetFormat:
+      type: string
+      enum: [native, coco, yolo, yolo-seg, labelme]
+    Dataset:
+      type: object
+      required: [id, name, description, revision, itemCount, totalBytes, role, status]
+      properties:
+        id: { type: string, format: uuid }
+        organizationId: { type: string, format: uuid }
+        ownerId: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string }
+        schema: { type: object, additionalProperties: true }
+        status: { type: string, enum: [active, archived, deleted] }
+        revision: { type: integer, format: int64 }
+        itemCount: { type: integer, format: int64 }
+        totalBytes: { type: integer, format: int64 }
+        role: { type: string, enum: [owner, manager, viewer] }
+        latestVersionId: { type: [string, "null"], format: uuid }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    DatasetWrite:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 240 }
+        description: { type: string }
+    DatasetUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        name: { type: [string, "null"], maxLength: 240 }
+        description: { type: [string, "null"] }
+        baseRevision: { type: [integer, "null"], format: int64 }
+    DatasetMember:
+      type: object
+      required: [userId, role]
+      properties:
+        userId: { type: string, format: uuid }
+        role: { type: string, enum: [owner, manager, viewer] }
+        email: { type: [string, "null"], format: email }
+        displayName: { type: [string, "null"] }
+        joinedAt: { type: string, format: date-time }
+    DatasetMemberWrite:
+      type: object
+      required: [role]
+      properties:
+        userId: { type: [string, "null"], format: uuid }
+        email: { type: [string, "null"], format: email }
+        role: { type: string, enum: [manager, viewer] }
+      oneOf:
+        - required: [userId]
+          properties:
+            email: { type: "null" }
+        - required: [email]
+          properties:
+            userId: { type: "null" }
+    DatasetCapture:
+      type: object
+      required: [projectId, operationId]
+      properties:
+        projectId: { type: string, format: uuid }
+        operationId: { type: string, maxLength: 200 }
+    DatasetVersionWrite:
+      type: object
+      required: [name, operationId]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 240 }
+        operationId: { type: string, maxLength: 200 }
+        baseRevision: { type: [integer, "null"], format: int64 }
+    DatasetVersion:
+      type: object
+      required: [id, datasetId, version, name, manifestHash, itemCount, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        datasetId: { type: string, format: uuid }
+        version: { type: integer, format: int64 }
+        name: { type: string }
+        manifestHash: { type: string, pattern: "^[a-fA-F0-9]{64}$" }
+        manifestByteSize: { type: integer, format: int64 }
+        itemCount: { type: integer, format: int64 }
+        createdBy: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+    DatasetVersionResult:
+      type: object
+      required: [datasetId, versionId, version, name, manifestHash, itemCount, operationId]
+      properties:
+        datasetId: { type: string, format: uuid }
+        versionId: { type: string, format: uuid }
+        version: { type: integer, format: int64 }
+        name: { type: string }
+        manifestHash: { type: string, pattern: "^[a-fA-F0-9]{64}$" }
+        manifestByteSize: { type: integer, format: int64 }
+        itemCount: { type: integer, format: int64 }
+        revision: { type: integer, format: int64 }
+        operationId: { type: string }
+    DatasetVersionDetail:
+      allOf:
+        - $ref: "#/components/schemas/DatasetVersion"
+        - type: object
+          required: [manifest]
+          properties:
+            manifest: { type: object, additionalProperties: true }
+    DatasetReuse:
+      type: object
+      required: [versionId, operationId]
+      properties:
+        versionId: { type: string, format: uuid }
+        targetProjectId: { type: [string, "null"], format: uuid }
+        projectName: { type: [string, "null"] }
+        operationId: { type: string, maxLength: 200 }
+    StorageQuota:
+      type: object
+      required: [organizationId, limitBytes, usedBytes, reservedBytes, maxAssets, usedAssets, reservedAssets, revision, canManage]
+      properties:
+        organizationId: { type: string, format: uuid }
+        limitBytes: { type: integer, format: int64 }
+        usedBytes: { type: integer, format: int64 }
+        reservedBytes: { type: integer, format: int64 }
+        maxAssets: { type: integer, format: int64 }
+        usedAssets: { type: integer, format: int64 }
+        reservedAssets: { type: integer, format: int64 }
+        revision: { type: integer, format: int64 }
+        canManage: { type: boolean }
+        updatedAt: { type: string, format: date-time }
+    StorageQuotaWrite:
+      type: object
+      minProperties: 1
+      properties:
+        limitBytes: { type: [integer, "null"], minimum: 0, format: int64 }
+        maxAssets: { type: [integer, "null"], minimum: 0, format: int64 }
+    DatasetExportWrite:
+      type: object
+      required: [versionId, format, operationId]
+      properties:
+        versionId: { type: string, format: uuid }
+        format: { $ref: "#/components/schemas/DatasetFormat" }
+        operationId: { type: string, maxLength: 200 }
+    DatasetJob:
+      type: object
+      required: [id, datasetId, kind, format, operationId, status]
+      properties:
+        id: { type: string, format: uuid }
+        datasetId: { type: string, format: uuid }
+        kind: { type: string, enum: [import, export] }
+        format: { $ref: "#/components/schemas/DatasetFormat" }
+        operationId: { type: string }
+        requestedBy: { type: string, format: uuid }
+        versionId: { type: [string, "null"], format: uuid }
+        status: { type: string, enum: [queued, running, succeeded, failed] }
+        inputContentHash: { type: [string, "null"] }
+        outputContentHash: { type: [string, "null"] }
+        inputByteSize: { type: [integer, "null"], format: int64 }
+        outputByteSize: { type: [integer, "null"], format: int64 }
+        errorCode: { type: [string, "null"] }
+        errorMessage: { type: [string, "null"] }
+
+    LoginRequest:
+      type: object
+      required: [email, password, deviceId, platform]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 10, format: password }
+        deviceId: { type: string }
+        platform: { type: string, enum: [ios, android, desktop, web] }
+        deviceName: { type: string }
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken: { type: string }
+        deviceId: { type: [string, "null"] }
+    AcceptInvitationRequest:
+      type: object
+      required: [displayName, password, deviceId, platform]
+      properties:
+        displayName: { type: string }
+        password: { type: string, minLength: 10, format: password }
+        deviceId: { type: string }
+        platform: { type: string, enum: [ios, android, desktop, web] }
+        deviceName: { type: string }
+    Session:
+      type: object
+      required: [accessToken, refreshToken, tokenType, expiresAt, refreshExpiresAt]
+      properties:
+        accessToken: { type: string }
+        tokenType: { type: string, const: Bearer }
+        expiresAt: { type: string, format: date-time }
+        expiresAtUnix: { type: integer, format: int64 }
+        expiresIn: { type: integer }
+        refreshToken: { type: string }
+        refreshExpiresAt: { type: string, format: date-time }
+        sessionId: { type: string, format: uuid }
+        deviceId: { type: string }
+        accountId: { type: string, format: uuid }
+        user:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            email: { type: string, format: email }
+            displayName: { type: string }
+            organizationId: { type: [string, "null"], format: uuid }
+    TaskWrite:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1 }
+        status: { type: string, default: unassigned }
+        imageIds:
+          type: array
+          items: { type: string }
+        assigneeId: { type: [string, "null"], format: uuid }
+    ReviewWrite:
+      type: object
+      required: [decision, annotationRevision]
+      properties:
+        decision: { type: string, enum: [approved, rejected] }
+        note: { type: string }
+        annotationRevision: { type: integer, format: int64 }
+        operationId: { type: string }
+        issueClientKey: { type: string }
+    SchemaWrite:
+      type: object
+      properties:
+        baseRevision: { type: [integer, "null"], format: int64 }
+        classes:
+          type: array
+          items: { type: object, additionalProperties: true }
+        schema:
+          type: object
+          additionalProperties: true
+      minProperties: 1
     ProjectRole:
       type: string
       enum: [owner, manager, annotator, reviewer, viewer]
@@ -568,7 +1995,7 @@ components:
           type: [string, "null"]
         mode:
           type: string
-          enum: [cloud_linked, mirrored]
+          enum: [local_only, cloud_linked, mirrored]
         revision:
           type: integer
           format: int64
@@ -585,7 +2012,7 @@ components:
           type: [string, "null"]
         mode:
           type: string
-          enum: [cloud_linked, mirrored]
+          enum: [local_only, cloud_linked, mirrored]
     ProjectMember:
       type: object
       required: [userId, role]
@@ -636,6 +2063,16 @@ components:
           enum: [uploading, ready, failed]
         revision:
           type: integer
+          format: int64
+        thumbnailKey:
+          type: [string, "null"]
+        thumbnailContentHash:
+          type: [string, "null"]
+          pattern: "^[a-fA-F0-9]{64}$"
+        thumbnailMimeType:
+          type: [string, "null"]
+        thumbnailByteSize:
+          type: [integer, "null"]
           format: int64
     AssetUploadRequest:
       type: object
@@ -693,11 +2130,19 @@ components:
         uploadUrl:
           type: [string, "null"]
           format: uri
+        url:
+          type: [string, "null"]
+          format: uri
         method:
           type: string
           const: PUT
         expiresIn:
           type: integer
+        expiresAt:
+          type: [string, "null"]
+          format: date-time
+        contentHash:
+          type: [string, "null"]
         alreadyComplete:
           type: boolean
     DownloadTicket:
@@ -713,6 +2158,11 @@ components:
         downloadUrl:
           type: string
           format: uri
+        url:
+          type: string
+          format: uri
+        variant:
+          type: string
         fileName:
           type: string
         contentHash:

@@ -1,0 +1,12 @@
+{
+  "passed": true,
+  "checkedAt": "2026-10-26T17:26:13.536681+00:00",
+  "originalObjects": 5774,
+  "changedOrMissingObjects": 0,
+  "checks": [
+    {
+      "name": "all pre-release S3 objects retain exact key, size and ETag",
+      "passed": true
+    }
+  ]
+}

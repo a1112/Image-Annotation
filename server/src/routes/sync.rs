@@ -1,6 +1,12 @@
-use super::{projects::write_audit, projects::write_change, ApiError};
+use super::{
+    collaboration::{perform_review, schema_classes, ReviewRequest},
+    projects::{write_audit, write_change},
+    ApiError,
+};
 use crate::{
-    auth::{require_project_permission, AuthUser, ProjectPermission},
+    auth::{
+        require_deleted_project_changes, require_project_permission, AuthUser, ProjectPermission,
+    },
     state::AppState,
 };
 use axum::{
@@ -20,7 +26,7 @@ pub struct PushRequest {
     operations: Vec<PushOperation>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PushOperation {
     operation_id: String,
@@ -47,45 +53,180 @@ pub struct ChangeQuery {
     limit: Option<i64>,
 }
 
+enum OperationReservation {
+    Claimed,
+    Processing,
+    Completed(Value),
+}
+
+async fn reserve_operation(
+    state: &AppState,
+    project_id: Uuid,
+    operation: &PushOperation,
+) -> Result<OperationReservation, ApiError> {
+    let operation_hash = operation_fingerprint(operation);
+    let mut tx = state.pool.begin().await?;
+    // A stale reservation is reclaimed only while holding the project lock,
+    // so event allocation and subsequent business writes remain serialized.
+    sqlx::query("SELECT id FROM projects WHERE id = $1 FOR UPDATE")
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+    let inserted = sqlx::query(
+        "INSERT INTO processed_operations (operation_id, project_id, result_json, state, claimed_at, request_hash) VALUES ($1, $2, '{}', 'processing', now(), $3) ON CONFLICT(operation_id) DO NOTHING RETURNING operation_id",
+    )
+    .bind(&operation.operation_id)
+    .bind(project_id)
+    .bind(&operation_hash)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if inserted.is_some() {
+        tx.commit().await?;
+        return Ok(OperationReservation::Claimed);
+    }
+    let row = sqlx::query(
+        "SELECT project_id, state, result_json, request_hash, claimed_at FROM processed_operations WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::internal_message("operation reservation disappeared"))?;
+    if row.get::<Uuid, _>("project_id") != project_id {
+        tx.rollback().await?;
+        return Err(ApiError::conflict(
+            "OPERATION_ID_REUSED",
+            "operationId belongs to another project",
+            Value::Null,
+        ));
+    }
+    if row
+        .get::<Option<String>, _>("request_hash")
+        .is_some_and(|hash| hash != operation_hash)
+    {
+        tx.rollback().await?;
+        return Err(ApiError::conflict(
+            "OPERATION_ID_REUSED",
+            "operationId was already used with a different payload",
+            Value::Null,
+        ));
+    }
+    if row.get::<String, _>("state") == "completed" {
+        let result = row.get("result_json");
+        tx.commit().await?;
+        Ok(OperationReservation::Completed(result))
+    } else if row
+        .get::<Option<chrono::DateTime<chrono::Utc>>, _>("claimed_at")
+        .is_some_and(|claimed_at| claimed_at < chrono::Utc::now() - chrono::Duration::minutes(5))
+    {
+        let reclaimed = sqlx::query(
+            "UPDATE processed_operations SET claimed_at = now(), request_hash = $3 WHERE operation_id = $1 AND project_id = $2 AND state = 'processing' AND claimed_at < now() - interval '5 minutes' RETURNING operation_id",
+        )
+        .bind(&operation.operation_id)
+        .bind(project_id)
+        .bind(&operation_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if reclaimed.is_some() {
+            Ok(OperationReservation::Claimed)
+        } else {
+            Ok(OperationReservation::Processing)
+        }
+    } else {
+        tx.commit().await?;
+        Ok(OperationReservation::Processing)
+    }
+}
+
+fn operation_fingerprint(operation: &PushOperation) -> String {
+    use sha2::{Digest, Sha256};
+    let encoded = serde_json::to_vec(operation).unwrap_or_default();
+    hex::encode(Sha256::digest(encoded))
+}
+
+async fn release_operation(
+    state: &AppState,
+    project_id: Uuid,
+    operation: &PushOperation,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "DELETE FROM processed_operations WHERE operation_id = $1 AND project_id = $2 AND state = 'processing' AND (request_hash IS NULL OR request_hash = $3)",
+    )
+    .bind(&operation.operation_id)
+    .bind(project_id)
+    .bind(operation_fingerprint(operation))
+    .execute(&state.pool)
+    .await?;
+    Ok(())
+}
+
+/// Persist the idempotency result in the same business transaction as the
+/// entity mutation.  The push handler may update it again after the function
+/// returns, but the in-transaction write closes the crash window between a
+/// successful mutation and an acknowledgement.
+pub(crate) async fn complete_operation_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    project_id: Uuid,
+    operation_id: &str,
+    revision: i64,
+    payload: &Value,
+) -> Result<(), ApiError> {
+    let result = json!({
+        "operationId": operation_id,
+        "status": "applied",
+        "serverRevision": revision,
+        "remotePayload": payload
+    });
+    sqlx::query(
+        "UPDATE processed_operations SET result_json = $3, state = 'completed', completed_at = now(), processed_at = now() WHERE operation_id = $1 AND project_id = $2",
+    )
+    .bind(operation_id)
+    .bind(project_id)
+    .bind(result)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn push(
     State(state): State<AppState>,
     user: AuthUser,
     Json(input): Json<PushRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    require_project_permission(
-        &state,
-        user.id,
-        input.project_id,
-        ProjectPermission::View,
-    )
-    .await?;
+    require_project_permission(&state, user.id, input.project_id, ProjectPermission::View).await?;
     if input.operations.len() > 500 {
         return Err(ApiError::bad_request("sync batch exceeds 500 operations"));
     }
     let mut results = Vec::with_capacity(input.operations.len());
     for operation in input.operations {
-        if let Some(row) = sqlx::query(
-            "SELECT result_json FROM processed_operations WHERE operation_id = $1 AND project_id = $2",
-        )
-        .bind(&operation.operation_id)
-        .bind(input.project_id)
-        .fetch_optional(&state.pool)
-        .await?
-        {
-            let stored: Value = row.get("result_json");
-            results.push(PushResult {
-                operation_id: operation.operation_id,
-                status: "duplicate".to_string(),
-                server_revision: stored.get("serverRevision").and_then(Value::as_i64),
-                remote_payload: stored.get("remotePayload").cloned(),
-                error: None,
-            });
-            continue;
+        match reserve_operation(&state, input.project_id, &operation).await? {
+            OperationReservation::Completed(stored) => {
+                results.push(PushResult {
+                    operation_id: operation.operation_id,
+                    status: "duplicate".to_string(),
+                    server_revision: stored.get("serverRevision").and_then(Value::as_i64),
+                    remote_payload: stored.get("remotePayload").cloned(),
+                    error: None,
+                });
+                continue;
+            }
+            OperationReservation::Processing => {
+                results.push(PushResult {
+                    operation_id: operation.operation_id,
+                    status: "retryable".to_string(),
+                    server_revision: None,
+                    remote_payload: None,
+                    error: Some("operation is already being applied".to_string()),
+                });
+                continue;
+            }
+            OperationReservation::Claimed => {}
         }
         let permission = permission_for(&operation);
         if let Err((_, message)) =
             require_project_permission(&state, user.id, input.project_id, permission).await
         {
+            release_operation(&state, input.project_id, &operation).await?;
             results.push(PushResult {
                 operation_id: operation.operation_id,
                 status: "rejected".to_string(),
@@ -112,7 +253,7 @@ pub async fn push(
                     "remotePayload": payload
                 });
                 sqlx::query(
-                    "INSERT INTO processed_operations (operation_id, project_id, result_json) VALUES ($1, $2, $3)",
+                    "UPDATE processed_operations SET result_json = $3, state = 'completed', completed_at = now(), processed_at = now() WHERE operation_id = $1 AND project_id = $2",
                 )
                 .bind(&operation.operation_id)
                 .bind(input.project_id)
@@ -130,27 +271,36 @@ pub async fn push(
             Err(OperationError::Conflict {
                 current_revision,
                 remote,
-            }) => results.push(PushResult {
-                operation_id: operation.operation_id,
-                status: "conflict".to_string(),
-                server_revision: Some(current_revision),
-                remote_payload: Some(remote),
-                error: None,
-            }),
-            Err(OperationError::Rejected(message)) => results.push(PushResult {
-                operation_id: operation.operation_id,
-                status: "rejected".to_string(),
-                server_revision: None,
-                remote_payload: None,
-                error: Some(message),
-            }),
-            Err(OperationError::Retryable(message)) => results.push(PushResult {
-                operation_id: operation.operation_id,
-                status: "retryable".to_string(),
-                server_revision: None,
-                remote_payload: None,
-                error: Some(message),
-            }),
+            }) => {
+                release_operation(&state, input.project_id, &operation).await?;
+                results.push(PushResult {
+                    operation_id: operation.operation_id,
+                    status: "conflict".to_string(),
+                    server_revision: Some(current_revision),
+                    remote_payload: Some(remote),
+                    error: None,
+                })
+            }
+            Err(OperationError::Rejected(message)) => {
+                release_operation(&state, input.project_id, &operation).await?;
+                results.push(PushResult {
+                    operation_id: operation.operation_id,
+                    status: "rejected".to_string(),
+                    server_revision: None,
+                    remote_payload: None,
+                    error: Some(message),
+                })
+            }
+            Err(OperationError::Retryable(message)) => {
+                release_operation(&state, input.project_id, &operation).await?;
+                results.push(PushResult {
+                    operation_id: operation.operation_id,
+                    status: "retryable".to_string(),
+                    server_revision: None,
+                    remote_payload: None,
+                    error: Some(message),
+                })
+            }
         }
     }
     Ok(Json(json!({ "results": results })))
@@ -162,7 +312,13 @@ pub async fn changes(
     Path(project_id): Path<Uuid>,
     Query(query): Query<ChangeQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    require_project_permission(&state, user.id, project_id, ProjectPermission::View).await?;
+    match require_project_permission(&state, user.id, project_id, ProjectPermission::View).await {
+        Ok(_) => {}
+        Err((status, _)) if status == axum::http::StatusCode::FORBIDDEN => {
+            require_deleted_project_changes(&state, user.id, project_id).await?;
+        }
+        Err(error) => return Err(error.into()),
+    }
     let cursor = query.cursor.unwrap_or(0).max(0);
     let limit = query.limit.unwrap_or(500).clamp(1, 500);
     let rows = sqlx::query(
@@ -200,69 +356,97 @@ pub async fn bootstrap(
     Path(project_id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
     require_project_permission(&state, user.id, project_id, ProjectPermission::View).await?;
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await?;
     let project = sqlx::query(
         "SELECT id, name, description, mode, status, revision, updated_at FROM projects WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(project_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| ApiError::not_found("project not found"))?;
     let assets = sqlx::query(
-        "SELECT id, client_key, file_name, object_key, content_hash, mime_type, width, height, byte_size, split, status, revision, updated_at FROM assets WHERE project_id = $1 AND deleted_at IS NULL ORDER BY id",
+        "SELECT id, client_key, file_name, object_key, content_hash, mime_type, width, height, byte_size, split, status, revision, updated_at, thumbnail_key, thumbnail_content_hash, thumbnail_mime_type, thumbnail_byte_size FROM assets WHERE project_id = $1 AND deleted_at IS NULL ORDER BY id",
     )
     .bind(project_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *tx)
     .await?;
     let annotations = sqlx::query(
         "SELECT id, image_id, revision, schema_version_id, object_json, status, updated_by, updated_at FROM annotations WHERE project_id = $1 AND deleted_at IS NULL",
     )
     .bind(project_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *tx)
     .await?;
     let issues = sqlx::query(
         "SELECT id, client_key, image_id, annotation_object_id, title, description, severity, status, reporter_id, assignee_id, revision, updated_at FROM issues WHERE project_id = $1 AND deleted_at IS NULL",
     )
     .bind(project_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *tx)
     .await?;
     let folders = sqlx::query(
         "SELECT id, client_key, parent_id, name, sort_order, revision, updated_at FROM folders WHERE project_id = $1 AND deleted_at IS NULL",
     )
     .bind(project_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *tx)
     .await?;
     let comments = sqlx::query(
-        "SELECT c.id, c.issue_id, c.author_id, c.content, c.revision, c.created_at FROM issue_comments c JOIN issues i ON i.id = c.issue_id WHERE i.project_id = $1 AND c.deleted_at IS NULL ORDER BY c.created_at, c.id",
+        "SELECT c.id, c.issue_id, c.client_key, c.author_id, c.content, c.revision, c.created_at FROM issue_comments c JOIN issues i ON i.id = c.issue_id WHERE i.project_id = $1 AND c.deleted_at IS NULL ORDER BY c.created_at, c.id",
     )
     .bind(project_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *tx)
     .await?;
     let attachments = sqlx::query(
         "SELECT id, issue_id, client_key, file_name, object_key, content_hash, mime_type, byte_size, status, revision, created_by, created_at FROM issue_attachments WHERE project_id = $1 AND deleted_at IS NULL ORDER BY created_at, id",
     )
     .bind(project_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *tx)
     .await?;
     let members = sqlx::query(
         "SELECT user_id, role, joined_at FROM project_members WHERE project_id = $1 AND deleted_at IS NULL ORDER BY joined_at, user_id",
     )
     .bind(project_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *tx)
     .await?;
     let folder_members = sqlx::query(
         "SELECT fm.folder_id, fm.image_id, fm.revision FROM folder_members fm JOIN folders f ON f.id = fm.folder_id WHERE f.project_id = $1 AND fm.deleted_at IS NULL ORDER BY fm.folder_id, fm.image_id",
     )
     .bind(project_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *tx)
+    .await?;
+    let tasks = sqlx::query(
+        "SELECT id, name, status, assignee_id, revision, created_by, updated_by, created_at, updated_at FROM tasks WHERE project_id = $1 AND deleted_at IS NULL ORDER BY updated_at, id",
+    )
+    .bind(project_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let task_items = sqlx::query(
+        "SELECT ti.id, ti.task_id, ti.image_id, a.client_key, ti.status, ti.assignee_id, ti.claimed_at, ti.revision, ti.updated_at FROM task_items ti JOIN tasks t ON t.id = ti.task_id JOIN assets a ON a.id = ti.image_id WHERE t.project_id = $1 AND ti.deleted_at IS NULL ORDER BY ti.task_id, ti.id",
+    )
+    .bind(project_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let qa_reviews = sqlx::query(
+        "SELECT id, image_id, annotation_revision, decision, note, reviewer_id, operation_id, created_at FROM qa_reviews WHERE project_id = $1 ORDER BY created_at, id",
+    )
+    .bind(project_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let label_schemas = sqlx::query(
+        "SELECT id, name, schema_json, revision, created_by, updated_by, created_at, updated_at FROM label_schemas WHERE project_id = $1 AND deleted_at IS NULL ORDER BY updated_at, id",
+    )
+    .bind(project_id)
+    .fetch_all(&mut *tx)
     .await?;
     let max_sequence = sqlx::query(
         "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM change_events WHERE project_id = $1",
     )
     .bind(project_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await?
     .get::<i64, _>("sequence");
-    Ok(Json(json!({
+    let response = json!({
         "cursor": max_sequence.to_string(),
         "project": {
             "id": project.get::<Uuid, _>("id"),
@@ -283,6 +467,10 @@ pub async fn bootstrap(
             "width": row.get::<i32, _>("width"),
             "height": row.get::<i32, _>("height"),
             "byteSize": row.get::<i64, _>("byte_size"),
+            "thumbnailKey": row.get::<Option<String>, _>("thumbnail_key"),
+            "thumbnailContentHash": row.get::<Option<String>, _>("thumbnail_content_hash"),
+            "thumbnailMimeType": row.get::<Option<String>, _>("thumbnail_mime_type"),
+            "thumbnailByteSize": row.get::<Option<i64>, _>("thumbnail_byte_size"),
             "split": row.get::<String, _>("split"),
             "status": row.get::<String, _>("status"),
             "revision": row.get::<i64, _>("revision")
@@ -320,6 +508,7 @@ pub async fn bootstrap(
         "issueComments": comments.iter().map(|row| json!({
             "id": row.get::<Uuid, _>("id"),
             "issueId": row.get::<Uuid, _>("issue_id"),
+            "clientKey": row.get::<Option<String>, _>("client_key"),
             "authorId": row.get::<Uuid, _>("author_id"),
             "content": row.get::<String, _>("content"),
             "revision": row.get::<i64, _>("revision"),
@@ -345,12 +534,73 @@ pub async fn bootstrap(
             "role": row.get::<String, _>("role"),
             "joinedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("joined_at")
         })).collect::<Vec<_>>(),
+        "tasks": tasks.iter().map(|row| json!({
+            "id": row.get::<Uuid, _>("id"),
+            "projectId": project_id,
+            "name": row.get::<String, _>("name"),
+            "status": row.get::<String, _>("status"),
+            "assigneeId": row.get::<Option<Uuid>, _>("assignee_id"),
+            "revision": row.get::<i64, _>("revision"),
+            "createdBy": row.get::<Uuid, _>("created_by"),
+            "updatedBy": row.get::<Uuid, _>("updated_by"),
+            "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+            "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+        })).collect::<Vec<_>>(),
+        "taskItems": task_items.iter().map(|row| json!({
+            "id": row.get::<Uuid, _>("id"),
+            "taskId": row.get::<Uuid, _>("task_id"),
+            "imageId": row.get::<Uuid, _>("image_id"),
+            "clientImageId": row.get::<Option<String>, _>("client_key"),
+            "status": row.get::<String, _>("status"),
+            "assigneeId": row.get::<Option<Uuid>, _>("assignee_id"),
+            "claimedAt": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("claimed_at"),
+            "revision": row.get::<i64, _>("revision"),
+            "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+        })).collect::<Vec<_>>(),
+        "qaReviews": qa_reviews.iter().map(|row| json!({
+            "id": row.get::<Uuid, _>("id"),
+            "imageId": row.get::<Uuid, _>("image_id"),
+            "annotationRevision": row.get::<i64, _>("annotation_revision"),
+            "decision": row.get::<String, _>("decision"),
+            "note": row.get::<String, _>("note"),
+            "reviewerId": row.get::<Uuid, _>("reviewer_id"),
+            "operationId": row.get::<Option<String>, _>("operation_id"),
+            "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+        })).collect::<Vec<_>>(),
+        "labelSchemas": label_schemas.iter().map(|row| json!({
+            "id": row.get::<Uuid, _>("id"),
+            "projectId": project_id,
+            "name": row.get::<String, _>("name"),
+            "schemaJson": row.get::<Value, _>("schema_json"),
+            "schema": row.get::<Value, _>("schema_json"),
+            "classes": schema_classes(&row.get::<Value, _>("schema_json")),
+            "revision": row.get::<i64, _>("revision"),
+            "createdBy": row.get::<Uuid, _>("created_by"),
+            "updatedBy": row.get::<Uuid, _>("updated_by"),
+            "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+            "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+        })).collect::<Vec<_>>(),
+        "labelSchema": label_schemas.last().map(|row| json!({
+            "id": row.get::<Uuid, _>("id"),
+            "projectId": project_id,
+            "name": row.get::<String, _>("name"),
+            "schemaJson": row.get::<Value, _>("schema_json"),
+            "schema": row.get::<Value, _>("schema_json"),
+            "classes": schema_classes(&row.get::<Value, _>("schema_json")),
+            "revision": row.get::<i64, _>("revision"),
+            "createdBy": row.get::<Uuid, _>("created_by"),
+            "updatedBy": row.get::<Uuid, _>("updated_by"),
+            "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+            "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+        })),
         "folderMembers": folder_members.iter().map(|row| json!({
             "folderId": row.get::<Uuid, _>("folder_id"),
             "imageId": row.get::<Uuid, _>("image_id"),
             "revision": row.get::<i64, _>("revision")
         })).collect::<Vec<_>>()
-    })))
+    });
+    tx.commit().await?;
+    Ok(Json(response))
 }
 
 enum OperationError {
@@ -376,6 +626,14 @@ async fn apply_operation(
         ("annotation", "submit") => {
             apply_annotation_submit(state, user, project_id, device_id, operation).await
         }
+        ("qa_review", "transition")
+        | ("qa_review", "review")
+        | ("review", "transition")
+        | ("review", "review") => apply_qa_review(state, user, project_id, operation).await,
+        ("task_item", "claim") | ("task_item", "release") => {
+            apply_task_item(state, user, project_id, operation).await
+        }
+        ("task", "create") => apply_task_create(state, user, project_id, operation).await,
         ("issue", "create") => apply_issue_create(state, user, project_id, operation).await,
         ("issue", "transition") | ("issue", "update") => {
             apply_issue_update(state, user, project_id, operation).await
@@ -389,7 +647,7 @@ async fn apply_operation(
         ("folder_member", "update") => {
             apply_folder_member(state, user, project_id, operation).await
         }
-        ("project", "update") => Ok((1, operation.payload.clone())),
+        ("project", "update") => apply_project_update(state, user, project_id, operation).await,
         _ => Err(OperationError::Rejected(format!(
             "unsupported operation: {}/{}",
             operation.entity_type, operation.operation
@@ -410,21 +668,43 @@ async fn apply_annotation(
         .begin()
         .await
         .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    lock_project_tx(&mut tx, project_id).await?;
     let current = sqlx::query(
-        "SELECT id, revision, object_json FROM annotations WHERE project_id = $1 AND image_id = $2 AND deleted_at IS NULL FOR UPDATE",
+        "SELECT id, image_id, revision, object_json, status FROM annotations WHERE project_id = $1 AND image_id = $2 AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(project_id)
     .bind(image_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|error| OperationError::Retryable(error.to_string()))?;
-    let current_revision = current.as_ref().map(|row| row.get("revision")).unwrap_or(0_i64);
+    let current_revision = current
+        .as_ref()
+        .map(|row| row.get("revision"))
+        .unwrap_or(0_i64);
     if operation.base_revision.unwrap_or(0) != current_revision {
+        let remote = current
+            .as_ref()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "imageId": row.get::<Uuid, _>("image_id"),
+                    "revision": row.get::<i64, _>("revision"),
+                    "objects": row.get::<Value, _>("object_json"),
+                    "status": row.get::<String, _>("status")
+                })
+            })
+            .unwrap_or_else(|| {
+                json!({
+                    "id": Value::Null,
+                    "imageId": image_id,
+                    "revision": 0,
+                    "objects": [],
+                    "status": "draft"
+                })
+            });
         return Err(OperationError::Conflict {
             current_revision,
-            remote: current
-                .map(|row| row.get("object_json"))
-                .unwrap_or_else(|| json!([])),
+            remote,
         });
     }
     let annotation_id = current
@@ -488,6 +768,15 @@ async fn apply_annotation(
     .execute(&mut *tx)
     .await
     .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    complete_operation_tx(
+        &mut tx,
+        project_id,
+        &operation.operation_id,
+        revision,
+        &payload,
+    )
+    .await
+    .map_err(|error| OperationError::Retryable(error.message))?;
     tx.commit()
         .await
         .map_err(|error| OperationError::Retryable(error.to_string()))?;
@@ -502,18 +791,555 @@ async fn apply_annotation_submit(
     operation: &PushOperation,
 ) -> Result<(i64, Value), OperationError> {
     let image_id = resolve_asset_id(state, project_id, &operation.entity_id).await?;
-    let row = sqlx::query(
-        "UPDATE annotations SET status = 'submitted', revision = revision + 1, updated_by = $3, updated_at = now() WHERE project_id = $1 AND image_id = $2 RETURNING id, revision",
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    lock_project_tx(&mut tx, project_id).await?;
+    let current = sqlx::query(
+        "SELECT id, image_id, revision, object_json, status FROM annotations WHERE project_id = $1 AND image_id = $2 AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(project_id)
     .bind(image_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| OperationError::Retryable(error.to_string()))?
+    .ok_or_else(|| OperationError::Rejected("annotation not found".to_string()))?;
+    let current_revision: i64 = current.get("revision");
+    if operation
+        .base_revision
+        .is_some_and(|base| base != current_revision)
+    {
+        return Err(OperationError::Conflict {
+            current_revision,
+            remote: json!({
+                "id": current.get::<Uuid, _>("id"),
+                "imageId": image_id,
+                "revision": current_revision,
+                "objects": current.get::<Value, _>("object_json"),
+                "status": current.get::<String, _>("status")
+            }),
+        });
+    }
+    let revision = current_revision + 1;
+    let row = sqlx::query(
+        "UPDATE annotations SET status = 'submitted', revision = $3, updated_by = $4, updated_at = now() WHERE id = $1 AND project_id = $2 RETURNING id, image_id, revision, object_json, status",
+    )
+    .bind(current.get::<Uuid, _>("id"))
+    .bind(project_id)
+    .bind(revision)
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    sqlx::query(
+        "UPDATE assets SET status = 'pending_review', revision = revision + 1, updated_by = $3, updated_at = now() WHERE id = $1 AND project_id = $2",
+    )
+    .bind(image_id)
+    .bind(project_id)
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    let payload = json!({
+        "id": row.get::<Uuid, _>("id"),
+        "imageId": image_id,
+        "clientImageId": operation.entity_id,
+        "revision": row.get::<i64, _>("revision"),
+        "objects": row.get::<Value, _>("object_json"),
+        "status": row.get::<String, _>("status")
+    });
+    write_change(
+        &mut tx,
+        project_id,
+        "annotation",
+        &operation.entity_id,
+        "submit",
+        revision,
+        payload.clone(),
+    )
+    .await
+    .map_err(|error| OperationError::Retryable(error.message))?;
+    write_audit(
+        &mut tx,
+        project_id,
+        user.id,
+        "annotation.submit",
+        "annotation",
+        &row.get::<Uuid, _>("id").to_string(),
+    )
+    .await
+    .map_err(|error| OperationError::Retryable(error.message))?;
+    complete_operation_tx(
+        &mut tx,
+        project_id,
+        &operation.operation_id,
+        revision,
+        &payload,
+    )
+    .await
+    .map_err(|error| OperationError::Retryable(error.message))?;
+    tx.commit()
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    Ok((revision, payload))
+}
+
+async fn apply_qa_review(
+    state: &AppState,
+    user: &AuthUser,
+    project_id: Uuid,
+    operation: &PushOperation,
+) -> Result<(i64, Value), OperationError> {
+    let image_key = operation
+        .payload
+        .get("imageId")
+        .and_then(Value::as_str)
+        .unwrap_or(&operation.entity_id);
+    let image_id = resolve_asset_id(state, project_id, image_key).await?;
+    let decision = operation
+        .payload
+        .get("decision")
+        .or_else(|| operation.payload.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("rejected")
+        .to_string();
+    let annotation_revision = operation.base_revision.or_else(|| {
+        operation
+            .payload
+            .get("annotationRevision")
+            .and_then(Value::as_i64)
+    });
+    let request = ReviewRequest {
+        decision,
+        note: operation
+            .payload
+            .get("note")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        annotation_revision,
+        operation_id: Some(operation.operation_id.clone()),
+        issue_client_key: operation
+            .payload
+            .get("issueClientKey")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+    };
+    match perform_review(state, user, project_id, image_id, &request).await {
+        Ok(payload) => Ok((
+            payload
+                .get("revision")
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+            payload,
+        )),
+        Err(error) if error.code == "ANNOTATION_REVISION_CONFLICT" => {
+            let current_revision = error
+                .details
+                .get("currentRevision")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            let remote = error
+                .details
+                .get("remoteAnnotation")
+                .cloned()
+                .unwrap_or_else(|| error.details.clone());
+            Err(OperationError::Conflict {
+                current_revision,
+                remote,
+            })
+        }
+        Err(error) if error.status.is_client_error() => {
+            Err(OperationError::Rejected(error.message))
+        }
+        Err(error) => Err(OperationError::Retryable(error.message)),
+    }
+}
+
+async fn apply_task_item(
+    state: &AppState,
+    user: &AuthUser,
+    project_id: Uuid,
+    operation: &PushOperation,
+) -> Result<(i64, Value), OperationError> {
+    let task_id = operation
+        .payload
+        .get("taskId")
+        .and_then(Value::as_str)
+        .or_else(|| operation.entity_id.split(':').next())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| OperationError::Rejected("taskId is required".to_string()))?;
+    let image_key = operation
+        .payload
+        .get("imageId")
+        .and_then(Value::as_str)
+        .or_else(|| operation.entity_id.split(':').nth(1))
+        .ok_or_else(|| OperationError::Rejected("imageId is required".to_string()))?;
+    let image_id = resolve_asset_id(state, project_id, image_key).await?;
+    if let Some(base) = operation.base_revision {
+        if let Some(row) = sqlx::query(
+            "SELECT ti.id, ti.task_id, ti.image_id, ti.status, ti.assignee_id, ti.revision FROM task_items ti JOIN tasks t ON t.id = ti.task_id WHERE t.project_id = $1 AND ti.task_id = $2 AND ti.image_id = $3 AND ti.deleted_at IS NULL",
+        )
+        .bind(project_id)
+        .bind(task_id)
+        .bind(image_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?
+        {
+            let current: i64 = row.get("revision");
+            if current != base {
+                return Err(OperationError::Conflict {
+                    current_revision: current,
+                    remote: json!({
+                        "id": row.get::<Uuid, _>("id"),
+                        "taskId": task_id,
+                        "imageId": image_id,
+                        "status": row.get::<String, _>("status"),
+                        "assigneeId": row.get::<Option<Uuid>, _>("assignee_id"),
+                        "revision": current,
+                        "objects": []
+                    }),
+                });
+            }
+        }
+    }
+    let role = sqlx::query_scalar::<_, String>(
+        "SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(project_id)
     .bind(user.id)
     .fetch_optional(&state.pool)
     .await
     .map_err(|error| OperationError::Retryable(error.to_string()))?
-    .ok_or_else(|| OperationError::Rejected("annotation not found".to_string()))?;
-    let revision: i64 = row.get("revision");
-    Ok((revision, json!({ "imageId": image_id, "status": "submitted" })))
+    .unwrap_or_else(|| "annotator".to_string());
+    let result = if operation.operation == "claim" {
+        super::collaboration::claim_task_item(
+            state,
+            user,
+            project_id,
+            task_id,
+            image_id,
+            &role,
+            operation.base_revision,
+            Some(&operation.operation_id),
+        )
+        .await
+    } else {
+        super::collaboration::release_task_item(
+            state,
+            user,
+            project_id,
+            task_id,
+            image_id,
+            &role,
+            operation.base_revision,
+            Some(&operation.operation_id),
+        )
+        .await
+    };
+    match result {
+        Ok(payload) => Ok((
+            payload
+                .get("revision")
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+            payload,
+        )),
+        Err(error) if error.status == axum::http::StatusCode::CONFLICT => {
+            Err(OperationError::Conflict {
+                current_revision: error
+                    .details
+                    .get("revision")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
+                remote: error.details,
+            })
+        }
+        Err(error) if error.status.is_client_error() => {
+            Err(OperationError::Rejected(error.message))
+        }
+        Err(error) => Err(OperationError::Retryable(error.message)),
+    }
+}
+
+async fn apply_task_create(
+    state: &AppState,
+    user: &AuthUser,
+    project_id: Uuid,
+    operation: &PushOperation,
+) -> Result<(i64, Value), OperationError> {
+    let name = operation
+        .payload
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("移动任务");
+    if name.trim().is_empty() {
+        return Err(OperationError::Rejected(
+            "task name is required".to_string(),
+        ));
+    }
+    let status = operation
+        .payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unassigned");
+    let task_id = Uuid::parse_str(&operation.entity_id).unwrap_or_else(|_| Uuid::new_v4());
+    let assignee = operation
+        .payload
+        .get("assigneeId")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let image_ids = operation
+        .payload
+        .get("imageIds")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    lock_project_tx(&mut tx, project_id).await?;
+    let task = sqlx::query(
+        "INSERT INTO tasks (id, project_id, name, status, assignee_id, created_by, updated_by) VALUES ($1, $2, $3, $4, $5, $6, $6) ON CONFLICT(id) DO UPDATE SET name = excluded.name, status = excluded.status, assignee_id = excluded.assignee_id, updated_by = excluded.updated_by, updated_at = now() RETURNING id, revision",
+    )
+    .bind(task_id)
+    .bind(project_id)
+    .bind(name.trim())
+    .bind(status)
+    .bind(assignee)
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    let mut item_ids = Vec::new();
+    for image in image_ids {
+        let key = image
+            .as_str()
+            .ok_or_else(|| OperationError::Rejected("imageIds must be strings".to_string()))?;
+        let row = sqlx::query(
+            "SELECT id FROM assets WHERE project_id = $1 AND (id::text = $2 OR client_key = $2) AND deleted_at IS NULL",
+        )
+        .bind(project_id)
+        .bind(key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?
+        .ok_or_else(|| OperationError::Rejected(format!("asset not found: {key}")))?;
+        let image_id: Uuid = row.get("id");
+        let item = sqlx::query(
+            "INSERT INTO task_items (task_id, image_id, status, assignee_id, updated_by) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(task_id, image_id) DO UPDATE SET deleted_at = NULL, status = excluded.status, assignee_id = excluded.assignee_id, updated_by = excluded.updated_by, updated_at = now() RETURNING id",
+        )
+        .bind(task_id)
+        .bind(image_id)
+        .bind(status)
+        .bind(assignee)
+        .bind(user.id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
+        item_ids.push(item.get::<Uuid, _>("id"));
+    }
+    let revision: i64 = task.get("revision");
+    let payload = json!({
+        "id": task_id,
+        "projectId": project_id,
+        "name": name,
+        "status": status,
+        "assigneeId": assignee,
+        "itemIds": item_ids,
+        "revision": revision
+    });
+    write_change(
+        &mut tx,
+        project_id,
+        "task",
+        &operation.entity_id,
+        "create",
+        revision,
+        payload.clone(),
+    )
+    .await
+    .map_err(|error| OperationError::Retryable(error.message))?;
+    write_audit(
+        &mut tx,
+        project_id,
+        user.id,
+        "task.create",
+        "task",
+        &task_id.to_string(),
+    )
+    .await
+    .map_err(|error| OperationError::Retryable(error.message))?;
+    complete_operation_tx(
+        &mut tx,
+        project_id,
+        &operation.operation_id,
+        revision,
+        &payload,
+    )
+    .await
+    .map_err(|error| OperationError::Retryable(error.message))?;
+    tx.commit()
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    Ok((revision, payload))
+}
+
+async fn lock_project_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    project_id: Uuid,
+) -> Result<(), OperationError> {
+    sqlx::query("SELECT id FROM projects WHERE id = $1 FOR UPDATE")
+        .bind(project_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    Ok(())
+}
+
+async fn finish_operation_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    project_id: Uuid,
+    user_id: Uuid,
+    audit_action: &str,
+    entity_type: &str,
+    entity_id: &str,
+    operation: &str,
+    revision: i64,
+    operation_id: &str,
+    payload: &Value,
+) -> Result<(), OperationError> {
+    write_change(
+        tx,
+        project_id,
+        entity_type,
+        entity_id,
+        operation,
+        revision,
+        payload.clone(),
+    )
+    .await
+    .map_err(|error| OperationError::Retryable(error.message))?;
+    write_audit(
+        tx,
+        project_id,
+        user_id,
+        audit_action,
+        entity_type,
+        entity_id,
+    )
+    .await
+    .map_err(|error| OperationError::Retryable(error.message))?;
+    complete_operation_tx(tx, project_id, operation_id, revision, payload)
+        .await
+        .map_err(|error| OperationError::Retryable(error.message))?;
+    Ok(())
+}
+
+async fn complete_only_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    project_id: Uuid,
+    operation_id: &str,
+    revision: i64,
+    payload: &Value,
+) -> Result<(), OperationError> {
+    complete_operation_tx(tx, project_id, operation_id, revision, payload)
+        .await
+        .map_err(|error| OperationError::Retryable(error.message))
+}
+
+async fn apply_project_update(
+    _state: &AppState,
+    user: &AuthUser,
+    project_id: Uuid,
+    operation: &PushOperation,
+) -> Result<(i64, Value), OperationError> {
+    let mode = operation.payload.get("mode").and_then(Value::as_str);
+    if mode.is_some_and(|value| !matches!(value, "local_only" | "cloud_linked" | "mirrored")) {
+        return Err(OperationError::Rejected("invalid project mode".to_string()));
+    }
+    let status = operation.payload.get("status").and_then(Value::as_str);
+    if status.is_some_and(|value| !matches!(value, "draft" | "active" | "archived" | "deleted")) {
+        return Err(OperationError::Rejected(
+            "invalid project status".to_string(),
+        ));
+    }
+    let mut tx = _state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    lock_project_tx(&mut tx, project_id).await?;
+    let current = sqlx::query(
+        "SELECT id, name, description, mode, status, revision FROM projects WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(project_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| OperationError::Retryable(error.to_string()))?
+    .ok_or_else(|| OperationError::Rejected("project not found".to_string()))?;
+    let current_revision: i64 = current.get("revision");
+    if operation
+        .base_revision
+        .is_some_and(|base| base != current_revision)
+    {
+        return Err(OperationError::Conflict {
+            current_revision,
+            remote: json!({
+                "id": project_id,
+                "name": current.get::<String, _>("name"),
+                "description": current.get::<String, _>("description"),
+                "mode": current.get::<String, _>("mode"),
+                "status": current.get::<String, _>("status"),
+                "revision": current_revision
+            }),
+        });
+    }
+    let updated = sqlx::query(
+        "UPDATE projects SET mode = COALESCE($2, mode), status = COALESCE($3, status), name = COALESCE($4, name), description = COALESCE($5, description), revision = revision + 1, updated_by = $6, updated_at = now() WHERE id = $1 RETURNING id, name, description, mode, status, revision, updated_by, updated_at",
+    )
+    .bind(project_id)
+    .bind(mode)
+    .bind(status)
+    .bind(operation.payload.get("name").and_then(Value::as_str))
+    .bind(operation.payload.get("description").and_then(Value::as_str))
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    let revision: i64 = updated.get("revision");
+    let payload = json!({
+        "id": updated.get::<Uuid, _>("id"),
+        "name": updated.get::<String, _>("name"),
+        "description": updated.get::<String, _>("description"),
+        "mode": updated.get::<String, _>("mode"),
+        "status": updated.get::<String, _>("status"),
+        "revision": revision,
+        "updatedBy": updated.get::<Uuid, _>("updated_by"),
+        "updatedAt": updated.get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+    });
+    finish_operation_tx(
+        &mut tx,
+        project_id,
+        user.id,
+        "project.update",
+        "project",
+        &project_id.to_string(),
+        &operation.operation,
+        revision,
+        &operation.operation_id,
+        &payload,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    Ok((revision, payload))
 }
 
 async fn apply_issue_create(
@@ -528,80 +1354,159 @@ async fn apply_issue_create(
         .and_then(Value::as_str)
         .ok_or_else(|| OperationError::Rejected("issue imageId is required".to_string()))?;
     let image_id = resolve_asset_id(state, project_id, image_key).await?;
-    let issue_id = Uuid::new_v4();
+    let title = operation
+        .payload
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("本地缺陷");
+    let description = operation
+        .payload
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let severity = operation
+        .payload
+        .get("severity")
+        .and_then(Value::as_str)
+        .unwrap_or("major");
+    let source = operation
+        .payload
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("sync");
+    let annotation_object_id = operation
+        .payload
+        .get("annotationObjectId")
+        .and_then(Value::as_str);
+    let assignee_id = operation
+        .payload
+        .get("assigneeId")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    lock_project_tx(&mut tx, project_id).await?;
     let row = sqlx::query(
-        "INSERT INTO issues (id, project_id, client_key, image_id, annotation_object_id, title, description, severity, status, source, reporter_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', $9, $10) ON CONFLICT(project_id, client_key) WHERE client_key IS NOT NULL DO UPDATE SET updated_at = issues.updated_at RETURNING id, revision",
+        "INSERT INTO issues (id, project_id, client_key, image_id, annotation_object_id, title, description, severity, status, source, reporter_id, assignee_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', $9, $10, $11) ON CONFLICT(project_id, client_key) WHERE client_key IS NOT NULL DO NOTHING RETURNING id, image_id, annotation_object_id, title, description, severity, status, source, reporter_id, assignee_id, revision",
     )
-    .bind(issue_id)
+    .bind(Uuid::new_v4())
     .bind(project_id)
     .bind(&operation.entity_id)
     .bind(image_id)
-    .bind(operation.payload.get("annotationObjectId").and_then(Value::as_str))
-    .bind(operation.payload.get("title").and_then(Value::as_str).unwrap_or("本地缺陷"))
-    .bind(operation.payload.get("description").and_then(Value::as_str).unwrap_or(""))
-    .bind(operation.payload.get("severity").and_then(Value::as_str).unwrap_or("major"))
-    .bind(operation.payload.get("source").and_then(Value::as_str).unwrap_or("sync"))
+    .bind(annotation_object_id)
+    .bind(title)
+    .bind(description)
+    .bind(severity)
+    .bind(source)
     .bind(user.id)
-    .fetch_one(&state.pool)
+    .bind(assignee_id)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    let inserted = row.is_some();
+    let row = if let Some(row) = row {
+        row
+    } else {
+        sqlx::query(
+            "SELECT id, image_id, annotation_object_id, title, description, severity, status, source, reporter_id, assignee_id, revision FROM issues WHERE project_id = $1 AND client_key = $2 AND deleted_at IS NULL",
+        )
+        .bind(project_id)
+        .bind(&operation.entity_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?
+        .ok_or_else(|| OperationError::Retryable("issue insert disappeared".to_string()))?
+    };
     let id: Uuid = row.get("id");
     let revision: i64 = row.get("revision");
     let payload = json!({
         "id": id,
         "clientKey": operation.entity_id,
-        "imageId": image_id,
+        "imageId": row.get::<Uuid, _>("image_id"),
         "clientImageId": image_key,
-        "annotationObjectId": operation.payload.get("annotationObjectId"),
-        "title": operation.payload.get("title").and_then(Value::as_str).unwrap_or("本地缺陷"),
-        "description": operation.payload.get("description").and_then(Value::as_str).unwrap_or(""),
-        "severity": operation.payload.get("severity").and_then(Value::as_str).unwrap_or("major"),
-        "status": "open",
-        "reporterId": user.id,
-        "assigneeId": Value::Null,
+        "annotationObjectId": row.get::<Option<String>, _>("annotation_object_id"),
+        "title": row.get::<String, _>("title"),
+        "description": row.get::<String, _>("description"),
+        "severity": row.get::<String, _>("severity"),
+        "status": row.get::<String, _>("status"),
+        "source": row.get::<String, _>("source"),
+        "reporterId": row.get::<Uuid, _>("reporter_id"),
+        "assigneeId": row.get::<Option<Uuid>, _>("assignee_id"),
         "revision": revision
     });
-    write_change_pool(
-        state,
-        project_id,
-        "issue",
-        &operation.entity_id,
-        "create",
-        revision,
-        &payload,
-    )
-    .await?;
+    if inserted {
+        finish_operation_tx(
+            &mut tx,
+            project_id,
+            user.id,
+            "issue.create",
+            "issue",
+            &id.to_string(),
+            "create",
+            revision,
+            &operation.operation_id,
+            &payload,
+        )
+        .await?;
+    } else {
+        complete_only_tx(
+            &mut tx,
+            project_id,
+            &operation.operation_id,
+            revision,
+            &payload,
+        )
+        .await?;
+    }
+    tx.commit()
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
     Ok((revision, payload))
 }
 
 async fn apply_issue_update(
     state: &AppState,
-    _user: &AuthUser,
+    user: &AuthUser,
     project_id: Uuid,
     operation: &PushOperation,
 ) -> Result<(i64, Value), OperationError> {
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    lock_project_tx(&mut tx, project_id).await?;
     let row = sqlx::query(
-        "SELECT id, revision, status, title, description, severity FROM issues WHERE project_id = $1 AND (id::text = $2 OR client_key = $2) AND deleted_at IS NULL",
+        "SELECT id, revision, status, title, description, severity, image_id, reporter_id, assignee_id, client_key FROM issues WHERE project_id = $1 AND (id::text = $2 OR client_key = $2) AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(project_id)
     .bind(&operation.entity_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|error| OperationError::Retryable(error.to_string()))?
     .ok_or_else(|| OperationError::Rejected("issue not found".to_string()))?;
     let revision: i64 = row.get("revision");
+    let id: Uuid = row.get("id");
     if operation.base_revision.is_some_and(|base| base != revision) {
         return Err(OperationError::Conflict {
             current_revision: revision,
             remote: json!({
+                "id": id,
+                "clientKey": row.get::<Option<String>, _>("client_key"),
+                "imageId": row.get::<Uuid, _>("image_id"),
                 "status": row.get::<String, _>("status"),
                 "title": row.get::<String, _>("title"),
                 "description": row.get::<String, _>("description"),
-                "severity": row.get::<String, _>("severity")
+                "severity": row.get::<String, _>("severity"),
+                "reporterId": row.get::<Uuid, _>("reporter_id"),
+                "assigneeId": row.get::<Option<Uuid>, _>("assignee_id"),
+                "revision": revision
             }),
         });
     }
-    let id: Uuid = row.get("id");
     let status = operation
         .payload
         .get("status")
@@ -609,14 +1514,14 @@ async fn apply_issue_update(
         .map(str::to_owned)
         .unwrap_or_else(|| row.get::<String, _>("status"));
     let updated = sqlx::query(
-        "UPDATE issues SET status = $2, title = COALESCE($3, title), description = COALESCE($4, description), severity = COALESCE($5, severity), revision = revision + 1, updated_at = now() WHERE id = $1 RETURNING revision, status, title, description, severity, image_id, reporter_id, assignee_id, client_key",
+        "UPDATE issues SET status = $2, title = COALESCE($3, title), description = COALESCE($4, description), severity = COALESCE($5, severity), revision = revision + 1, updated_at = now() WHERE id = $1 RETURNING id, revision, status, title, description, severity, image_id, reporter_id, assignee_id, client_key",
     )
     .bind(id)
     .bind(&status)
     .bind(operation.payload.get("title").and_then(Value::as_str))
     .bind(operation.payload.get("description").and_then(Value::as_str))
     .bind(operation.payload.get("severity").and_then(Value::as_str))
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|error| OperationError::Retryable(error.to_string()))?;
     let next_revision: i64 = updated.get("revision");
@@ -632,16 +1537,26 @@ async fn apply_issue_update(
         "assigneeId": updated.get::<Option<Uuid>, _>("assignee_id"),
         "revision": next_revision
     });
-    write_change_pool(
-        state,
+    finish_operation_tx(
+        &mut tx,
         project_id,
+        user.id,
+        if operation.operation == "transition" {
+            "issue.transition"
+        } else {
+            "issue.update"
+        },
         "issue",
-        &operation.entity_id,
+        &id.to_string(),
         &operation.operation,
         next_revision,
+        &operation.operation_id,
         &payload,
     )
     .await?;
+    tx.commit()
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
     Ok((next_revision, payload))
 }
 
@@ -666,40 +1581,81 @@ async fn apply_issue_comment(
     .map_err(|error| OperationError::Retryable(error.to_string()))?
     .ok_or_else(|| OperationError::Rejected("issue not found".to_string()))?;
     let issue_id: Uuid = issue.get("id");
-    let id = Uuid::new_v4();
     let content = operation
         .payload
         .get("content")
         .and_then(Value::as_str)
         .unwrap_or("");
-    sqlx::query(
-        "INSERT INTO issue_comments (id, issue_id, author_id, content) VALUES ($1, $2, $3, $4)",
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    lock_project_tx(&mut tx, project_id).await?;
+    let inserted_row = sqlx::query(
+        "INSERT INTO issue_comments (id, issue_id, client_key, author_id, content) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(issue_id, client_key) WHERE client_key IS NOT NULL DO NOTHING RETURNING id, revision, created_at, author_id, content",
     )
-    .bind(id)
+    .bind(Uuid::new_v4())
     .bind(issue_id)
+    .bind(&operation.entity_id)
     .bind(user.id)
     .bind(content)
-    .execute(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    let inserted = inserted_row.is_some();
+    let row = if let Some(row) = inserted_row {
+        row
+    } else {
+        sqlx::query(
+            "SELECT id, revision, created_at, author_id, content FROM issue_comments WHERE issue_id = $1 AND client_key = $2 AND deleted_at IS NULL",
+        )
+        .bind(issue_id)
+        .bind(&operation.entity_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?
+        .ok_or_else(|| OperationError::Retryable("issue comment insert disappeared".to_string()))?
+    };
+    let id: Uuid = row.get("id");
+    let revision: i64 = row.get("revision");
     let payload = json!({
         "id": id,
         "clientKey": operation.entity_id,
         "issueId": issue_id,
-        "content": content,
-        "revision": 1
+        "authorId": row.get::<Uuid, _>("author_id"),
+        "content": row.get::<String, _>("content"),
+        "revision": revision,
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at")
     });
-    write_change_pool(
-        state,
-        project_id,
-        "issue_comment",
-        &operation.entity_id,
-        "comment",
-        1,
-        &payload,
-    )
-    .await?;
-    Ok((1, payload))
+    if inserted {
+        finish_operation_tx(
+            &mut tx,
+            project_id,
+            user.id,
+            "issue.comment",
+            "issue_comment",
+            &id.to_string(),
+            "comment",
+            revision,
+            &operation.operation_id,
+            &payload,
+        )
+        .await?;
+    } else {
+        complete_only_tx(
+            &mut tx,
+            project_id,
+            &operation.operation_id,
+            revision,
+            &payload,
+        )
+        .await?;
+    }
+    tx.commit()
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    Ok((revision, payload))
 }
 
 async fn apply_folder(
@@ -708,46 +1664,87 @@ async fn apply_folder(
     project_id: Uuid,
     operation: &PushOperation,
 ) -> Result<(i64, Value), OperationError> {
-    if operation.operation == "create" {
-        let id = Uuid::new_v4();
-        let row = sqlx::query(
-            "INSERT INTO folders (id, project_id, client_key, name, sort_order, created_by, updated_by) VALUES ($1, $2, $3, $4, $5, $6, $6) ON CONFLICT(project_id, client_key) WHERE client_key IS NOT NULL DO UPDATE SET deleted_at = NULL RETURNING id, revision",
-        )
-        .bind(id)
-        .bind(project_id)
-        .bind(&operation.entity_id)
-        .bind(operation.payload.get("name").and_then(Value::as_str).unwrap_or("文件夹"))
-        .bind(operation.payload.get("sortOrder").and_then(Value::as_i64).unwrap_or(0) as i32)
-        .bind(user.id)
-        .fetch_one(&state.pool)
+    let mut tx = state
+        .pool
+        .begin()
         .await
         .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    lock_project_tx(&mut tx, project_id).await?;
+    if operation.operation == "create" {
+        let existing = sqlx::query(
+            "SELECT id, revision, name, sort_order FROM folders WHERE project_id = $1 AND client_key = $2 FOR UPDATE",
+        )
+        .bind(project_id)
+        .bind(&operation.entity_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
+        let inserted = existing.is_none();
+        let row = if let Some(row) = existing {
+            sqlx::query("UPDATE folders SET deleted_at = NULL, updated_at = now(), updated_by = $2 WHERE id = $1 RETURNING id, revision, name, sort_order")
+                .bind(row.get::<Uuid, _>("id"))
+                .bind(user.id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|error| OperationError::Retryable(error.to_string()))?
+        } else {
+            sqlx::query(
+                "INSERT INTO folders (id, project_id, client_key, name, sort_order, created_by, updated_by) VALUES ($1, $2, $3, $4, $5, $6, $6) RETURNING id, revision, name, sort_order",
+            )
+            .bind(Uuid::new_v4())
+            .bind(project_id)
+            .bind(&operation.entity_id)
+            .bind(operation.payload.get("name").and_then(Value::as_str).unwrap_or("文件夹"))
+            .bind(operation.payload.get("sortOrder").and_then(Value::as_i64).unwrap_or(0) as i32)
+            .bind(user.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| OperationError::Retryable(error.to_string()))?
+        };
+        let id: Uuid = row.get("id");
         let revision: i64 = row.get("revision");
         let payload = json!({
-            "id": row.get::<Uuid, _>("id"),
+            "id": id,
             "clientKey": operation.entity_id,
-            "name": operation.payload.get("name").and_then(Value::as_str).unwrap_or("文件夹"),
-            "sortOrder": operation.payload.get("sortOrder").and_then(Value::as_i64).unwrap_or(0),
+            "name": row.get::<String, _>("name"),
+            "sortOrder": row.get::<i32, _>("sort_order"),
             "revision": revision
         });
-        write_change_pool(
-            state,
-            project_id,
-            "folder",
-            &operation.entity_id,
-            "create",
-            revision,
-            &payload,
-        )
-        .await?;
+        if inserted {
+            finish_operation_tx(
+                &mut tx,
+                project_id,
+                user.id,
+                "folder.create",
+                "folder",
+                &id.to_string(),
+                "create",
+                revision,
+                &operation.operation_id,
+                &payload,
+            )
+            .await?;
+        } else {
+            complete_only_tx(
+                &mut tx,
+                project_id,
+                &operation.operation_id,
+                revision,
+                &payload,
+            )
+            .await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|error| OperationError::Retryable(error.to_string()))?;
         return Ok((revision, payload));
     }
     let row = sqlx::query(
-        "SELECT id, revision, name FROM folders WHERE project_id = $1 AND (id::text = $2 OR client_key = $2) AND deleted_at IS NULL",
+        "SELECT id, client_key, revision, name, sort_order FROM folders WHERE project_id = $1 AND (id::text = $2 OR client_key = $2) AND deleted_at IS NULL",
     )
     .bind(project_id)
     .bind(&operation.entity_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|error| OperationError::Retryable(error.to_string()))?
     .ok_or_else(|| OperationError::Rejected("folder not found".to_string()))?;
@@ -756,7 +1753,13 @@ async fn apply_folder(
     if operation.base_revision.is_some_and(|base| base != revision) {
         return Err(OperationError::Conflict {
             current_revision: revision,
-            remote: json!({ "name": row.get::<String, _>("name") }),
+            remote: json!({
+                "id": id,
+                "clientKey": row.get::<Option<String>, _>("client_key"),
+                "name": row.get::<String, _>("name"),
+                "sortOrder": row.get::<i32, _>("sort_order"),
+                "revision": revision
+            }),
         });
     }
     let updated = if operation.operation == "delete" {
@@ -765,7 +1768,7 @@ async fn apply_folder(
         )
         .bind(id)
         .bind(user.id)
-        .fetch_one(&state.pool)
+        .fetch_one(&mut *tx)
         .await
     } else {
         sqlx::query(
@@ -774,7 +1777,7 @@ async fn apply_folder(
         .bind(id)
         .bind(operation.payload.get("name").and_then(Value::as_str))
         .bind(user.id)
-        .fetch_one(&state.pool)
+        .fetch_one(&mut *tx)
         .await
     }
     .map_err(|error| OperationError::Retryable(error.to_string()))?;
@@ -787,22 +1790,32 @@ async fn apply_folder(
         "sortOrder": updated.get::<i32, _>("sort_order"),
         "revision": revision
     });
-    write_change_pool(
-        state,
+    finish_operation_tx(
+        &mut tx,
         project_id,
+        user.id,
+        if operation.operation == "delete" {
+            "folder.delete"
+        } else {
+            "folder.update"
+        },
         "folder",
-        &operation.entity_id,
+        &id.to_string(),
         &operation.operation,
         revision,
+        &operation.operation_id,
         &payload,
     )
     .await?;
+    tx.commit()
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
     Ok((revision, payload))
 }
 
 async fn apply_folder_member(
     state: &AppState,
-    _user: &AuthUser,
+    user: &AuthUser,
     project_id: Uuid,
     operation: &PushOperation,
 ) -> Result<(i64, Value), OperationError> {
@@ -827,12 +1840,41 @@ async fn apply_folder_member(
     .ok_or_else(|| OperationError::Rejected("folder not found".to_string()))?;
     let folder_id: Uuid = folder.get("id");
     let image_id = resolve_asset_id(state, project_id, image_key).await?;
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
+    lock_project_tx(&mut tx, project_id).await?;
+    if let Some(base) = operation.base_revision {
+        if let Some(current) = sqlx::query(
+            "SELECT revision FROM folder_members WHERE folder_id = $1 AND image_id = $2 FOR UPDATE",
+        )
+        .bind(folder_id)
+        .bind(image_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?
+        {
+            let current_revision: i64 = current.get("revision");
+            if current_revision != base {
+                return Err(OperationError::Conflict {
+                    current_revision,
+                    remote: json!({
+                        "folderId": folder_id,
+                        "imageId": image_id,
+                        "revision": current_revision
+                    }),
+                });
+            }
+        }
+    }
     let row = sqlx::query(
         "INSERT INTO folder_members (folder_id, image_id, revision) VALUES ($1, $2, 1) ON CONFLICT(folder_id, image_id) DO UPDATE SET revision = folder_members.revision + 1, deleted_at = NULL RETURNING revision",
     )
     .bind(folder_id)
     .bind(image_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|error| OperationError::Retryable(error.to_string()))?;
     let revision: i64 = row.get("revision");
@@ -842,16 +1884,22 @@ async fn apply_folder_member(
         "revision": revision
     });
     let entity_id = format!("{folder_id}:{image_id}");
-    write_change_pool(
-        state,
+    finish_operation_tx(
+        &mut tx,
         project_id,
+        user.id,
+        "folder.member.update",
         "folder_member",
         &entity_id,
         "update",
         revision,
+        &operation.operation_id,
         &payload,
     )
     .await?;
+    tx.commit()
+        .await
+        .map_err(|error| OperationError::Retryable(error.to_string()))?;
     Ok((revision, payload))
 }
 
@@ -875,32 +1923,18 @@ async fn resolve_asset_id(
 fn permission_for(operation: &PushOperation) -> ProjectPermission {
     match operation.entity_type.as_str() {
         "annotation" => ProjectPermission::Annotate,
-        "issue" | "issue_comment" => ProjectPermission::Review,
+        "qa_review" | "review" => ProjectPermission::Review,
+        "task_item" => ProjectPermission::TaskClaim,
+        "task" => ProjectPermission::ManageData,
+        "issue" => {
+            if operation.operation == "create" {
+                ProjectPermission::IssueWrite
+            } else {
+                ProjectPermission::Review
+            }
+        }
+        "issue_comment" => ProjectPermission::IssueWrite,
         "folder" | "folder_member" | "project" => ProjectPermission::ManageData,
         _ => ProjectPermission::View,
     }
-}
-
-async fn write_change_pool(
-    state: &AppState,
-    project_id: Uuid,
-    entity_type: &str,
-    entity_id: &str,
-    operation: &str,
-    revision: i64,
-    payload: &Value,
-) -> Result<(), OperationError> {
-    sqlx::query(
-        "INSERT INTO change_events (project_id, entity_type, entity_id, operation, revision, payload) VALUES ($1, $2, $3, $4, $5, $6)",
-    )
-    .bind(project_id)
-    .bind(entity_type)
-    .bind(entity_id)
-    .bind(operation)
-    .bind(revision)
-    .bind(payload)
-    .execute(&state.pool)
-    .await
-    .map_err(|error| OperationError::Retryable(error.to_string()))?;
-    Ok(())
 }

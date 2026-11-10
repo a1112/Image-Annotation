@@ -1,0 +1,19 @@
+{
+  "passed": true,
+  "checkedAt": "2026-10-26T12:41:05.334245+00:00",
+  "service": "isolated remote PostgreSQL through authenticated SSH tunnel",
+  "tests": {
+    "pg_image_transforms": 2,
+    "pg_web_workspace": 2
+  },
+  "checks": [
+    {
+      "name": "durable branch/draft/merge schema and CAS on real PostgreSQL",
+      "passed": true
+    },
+    {
+      "name": "conversion constraints and restart recovery on real PostgreSQL",
+      "passed": true
+    }
+  ]
+}

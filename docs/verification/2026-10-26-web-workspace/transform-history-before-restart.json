@@ -1,0 +1,29 @@
+{
+  "projectId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c",
+  "outputs": [
+    {
+      "taskId": "2af6679b-178b-4b8e-9d82-8df0fced2618",
+      "format": "tiff",
+      "sha256": "30c7dcf3638691bf4fa71983c93877829ace553e69b096a773b145917afa9888",
+      "size": 246
+    },
+    {
+      "taskId": "4c0ce994-7b93-40e6-85bc-b42bdc8b12f9",
+      "format": "webp",
+      "sha256": "efd623cc42d25f605732505b8f3c9f8bfb481d1c661145f60f5d8b7f2480b389",
+      "size": 176
+    },
+    {
+      "taskId": "f88a9ce3-c49b-40c9-8f1e-bb1724e68857",
+      "format": "png",
+      "sha256": "a9c7db0015b15fa638e76ae80b775d77b3d1cb07feb34492f824888eaa26ca10",
+      "size": 89
+    },
+    {
+      "taskId": "5450f2e1-3eae-40dc-94fe-cd4887e8a861",
+      "format": "jpeg",
+      "sha256": "f90fb9ef5d329771337a1c7722b1d106c8e596b476a261076725dee635e34e71",
+      "size": 655
+    }
+  ]
+}

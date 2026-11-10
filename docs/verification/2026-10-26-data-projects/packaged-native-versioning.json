@@ -1,0 +1,78 @@
+{
+  "passed": true,
+  "checkedAt": "2026-10-26T11:01:52.778826+00:00",
+  "nativeBackend": "http://127.0.0.1:17331",
+  "projectId": "data-project-aa451c43-a573-4159-ad06-1f9b163b04ac",
+  "datasetIds": [
+    "53b05e4ff-day",
+    "53b05e4ff-night"
+  ],
+  "initialCommitId": "5b7cb5f1-568d-433c-9462-f1d79d2880db",
+  "finalCommitId": "b4cdcc71-7920-4638-8334-03655b2cbc1a",
+  "checks": [
+    {
+      "name": "project contains two datasets",
+      "passed": true
+    },
+    {
+      "name": "switch restores actual annotation API",
+      "passed": true
+    },
+    {
+      "name": "independent edits merge with two parents",
+      "passed": true
+    },
+    {
+      "name": "merge restores both edits to annotation workbench",
+      "passed": true
+    },
+    {
+      "name": "merged working tree is clean",
+      "passed": true
+    },
+    {
+      "name": "conflict retains base ours theirs without overwriting worktree",
+      "passed": true
+    },
+    {
+      "name": "explicit resolution produces merge commit",
+      "passed": true
+    },
+    {
+      "name": "revert creates a new commit and restores actual labels",
+      "passed": true
+    },
+    {
+      "name": "revert preserves earlier history",
+      "passed": true
+    },
+    {
+      "name": "dirty switch is rejected and saved draft remains",
+      "passed": true
+    },
+    {
+      "name": "final tree is clean",
+      "passed": true
+    },
+    {
+      "name": "merged disposable branch deletes without changing history",
+      "passed": true
+    },
+    {
+      "name": "main branch remains protected from deletion",
+      "passed": true
+    },
+    {
+      "name": "all original imported image bytes are preserved",
+      "passed": true
+    }
+  ],
+  "sourceImageHashes": {
+    "/tmp/image-annotation-data-project-v2/gui-acceptance/workspaces/default/projects/53b05e4ff-day/assets/original/images/train/demo_001.png": "a3f91ea913037423188c7befae76cd01f92e0e425f180fc3e08b0984c2b4ef9d",
+    "/tmp/image-annotation-data-project-v2/gui-acceptance/workspaces/default/projects/53b05e4ff-day/assets/original/images/train/demo_002.png": "fef92e4d26eae8fd961889e7b058b5ca793675e4d3787e837da98a4a1683d7dd",
+    "/tmp/image-annotation-data-project-v2/gui-acceptance/workspaces/default/projects/53b05e4ff-day/assets/original/images/train/demo_003.png": "d67f7eefc8bde8b6929528ad74bce7235914662528d585223bfe7f471b2f3ba4",
+    "/tmp/image-annotation-data-project-v2/gui-acceptance/workspaces/default/projects/53b05e4ff-night/assets/original/images/train/demo_001.png": "a3f91ea913037423188c7befae76cd01f92e0e425f180fc3e08b0984c2b4ef9d",
+    "/tmp/image-annotation-data-project-v2/gui-acceptance/workspaces/default/projects/53b05e4ff-night/assets/original/images/train/demo_002.png": "fef92e4d26eae8fd961889e7b058b5ca793675e4d3787e837da98a4a1683d7dd",
+    "/tmp/image-annotation-data-project-v2/gui-acceptance/workspaces/default/projects/53b05e4ff-night/assets/original/images/train/demo_003.png": "d67f7eefc8bde8b6929528ad74bce7235914662528d585223bfe7f471b2f3ba4"
+  }
+}

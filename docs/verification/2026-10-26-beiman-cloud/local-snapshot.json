@@ -1,0 +1,12 @@
+{
+  "data": {
+    "bridgeManifestPath": "snapshots/snapshot-7660b220-75bf-48be-9c10-d01a647cb419/visualai-bridge.json",
+    "bridgeStatus": "ready",
+    "createdAt": "1793002556",
+    "id": "snapshot-7660b220-75bf-48be-9c10-d01a647cb419",
+    "imageCount": 6036,
+    "manifestPath": "/Users/a1-6/project/Image-Annotation/data/workspaces/default/projects/local-dataset-f84178fa0c2ea9eb/snapshots/snapshot-7660b220-75bf-48be-9c10-d01a647cb419/manifest.json",
+    "name": "高线检测数据-云端发布原始快照-20261026"
+  },
+  "ok": true
+}

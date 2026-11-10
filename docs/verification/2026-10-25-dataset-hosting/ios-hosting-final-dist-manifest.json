@@ -1,0 +1,19 @@
+{
+  "algorithm": "sha256(concat(sorted file-sha256 + two spaces + dist-relative-path + LF))",
+  "fileCount": 3,
+  "sha256": "a0603cedd10beeac69a3710e5818d56fb32d5f859910d4c5d8a074f2e11296fb",
+  "files": [
+    {
+      "path": "dist/assets/index-BXBDhCpR.js",
+      "sha256": "5191173c28d71ff734dc7203b6af6f5b7a341e420845ce59e68439e6b0f86021"
+    },
+    {
+      "path": "dist/assets/index-DI0zy5Wd.css",
+      "sha256": "14e8fcc1006be2fb6434f47312b54224e258fddedefbb9b81759a4a6adbf8a59"
+    },
+    {
+      "path": "dist/index.html",
+      "sha256": "9c19359e5e36c90aa587b9ef8f84d8e39b1403a4d9f7cf4344d8f565cb45d70d"
+    }
+  ]
+}

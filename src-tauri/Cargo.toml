@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 monitor-sysinfo = { package = "sysinfo", version = "0.33", default-features = false, features = ["system"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 base64 = "0.22"
 tauri = { version = "2", features = ["macos-private-api", "protocol-asset"] }
 tauri-plugin-notification = "2.3.3"
@@ -26,9 +27,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 walkdir = "2.5"
 zip = "2.2"
 quick-xml = { version = "0.39", features = ["serialize"] }
-rfd = "0.15"
-keyring = { version = "4.1.5", features = ["v1"] }
 sha2 = "0.10"
+uuid = { version = "1.23.1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
 tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
@@ -44,5 +44,17 @@ window-vibrancy = "0.7.1"
 objc2-app-kit = { version = "0.3.2", features = ["NSView", "NSWindow", "objc2-quartz-core"] }
 objc2-quartz-core = { version = "0.3.2", features = ["CALayer"] }
 
+[target.'cfg(target_os = "ios")'.dependencies]
+apple-native-keyring-store = { version = "1.0.1", features = ["protected"] }
+keyring-core = "1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "1.0.0"
+keyring-core = "1"
+
 [target.'cfg(not(mobile))'.dependencies]
 tauri-plugin-single-instance = "2.4.1"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+keyring = { version = "4.1.5", features = ["v1"] }
+rfd = "0.15"

@@ -1,0 +1,64 @@
+{
+  "checkedAt": "2026-10-26T12:04:00+00:00",
+  "implementationComplete": true,
+  "frontendTests": {
+    "vitest": 210,
+    "nativeChrome": 12,
+    "passed": true
+  },
+  "nativeTests": {
+    "passed": true,
+    "count": 143
+  },
+  "production": {
+    "url": "https://175.178.16.90/image-annotation",
+    "reports": {
+      "packaged-native-versioning.json": {
+        "passed": true,
+        "checks": 14
+      },
+      "native-sync-production.json": {
+        "passed": true,
+        "checks": 15
+      },
+      "native-viewer-production.json": {
+        "passed": true,
+        "checks": 15
+      },
+      "http-production.json": {
+        "passed": true,
+        "checks": 30
+      },
+      "collaboration-production-regression.json": {
+        "passed": true,
+        "checks": 34
+      },
+      "hosting-production-regression.json": {
+        "passed": true,
+        "checks": 69
+      },
+      "existing-data-after.json": {
+        "passed": true,
+        "checks": 0
+      },
+      "packaged-gui-cloud-production.json": {
+        "passed": true,
+        "checks": 9
+      }
+    }
+  },
+  "packagedUI": {
+    "localBranchCommitMergeRestore": "passed",
+    "readableConflictScreenshot": "screenshots/final-readable-conflict.png",
+    "original6036ImageProjectScreenshot": "screenshots/final-original-project.png",
+    "cloudLoginVisualCheck": "passed",
+    "cloudReport": "packaged-gui-cloud-production.json"
+  },
+  "dataIntegrity": "Existing three dataset manifests and image/annotation counts unchanged",
+  "package": "package-receipt.json",
+  "gitDelivery": "Local source changes retained; no commit or push requested",
+  "acceptanceScope": "Desktop/native data-project acceptance; web workspace and server image conversion are verified separately",
+  "finalizedAt": "2026-10-26T12:32:01.001053+00:00",
+  "finalDesktopPackageVisualCheck": "passed",
+  "finalDesktopPackageVisualScreenshot": "screenshots/final-account-panel.png"
+}

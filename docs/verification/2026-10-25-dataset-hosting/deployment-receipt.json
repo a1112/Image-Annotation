@@ -1,0 +1,15 @@
+{
+  "deployedAt": "2026-10-25T15:54:41.295336+00:00",
+  "service": "serverall-image-annotation.service",
+  "releasePath": "/home/ubuntu/projects/.deployment/releases/image-annotation/20261025-hosting-caafd1e56a19",
+  "binarySha256": "d6be8a4f6a9dc6e43fc03bbfb85844312f1ea7cd98d33fff14661d1efb1a94a6",
+  "sourceManifestSha256": "caafd1e56a19290bf2a3ff075945a1868215135535489cd564c6c758c73c1e17",
+  "backupPath": "/home/ubuntu/projects/.deployment/image-annotation-hosting-20261025/backup",
+  "previousBinaryPath": "/home/ubuntu/projects/.deployment/releases/image-annotation/20261025-collaboration-0fbf08e250f1/image-annotation-server",
+  "dropIn": "/etc/systemd/system/serverall-image-annotation.service.d/91-codex-hosting-20261025.conf",
+  "databaseMigration": "0004_dataset_hosting.sql",
+  "backupObjectCount": 28,
+  "backupObjectBytes": 203484,
+  "health": "ok",
+  "note": "Existing HTTPS prefix, private PostgreSQL/MinIO, and service environment retained; only additive migration and executable override applied"
+}

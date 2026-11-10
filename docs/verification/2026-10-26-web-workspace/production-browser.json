@@ -1,0 +1,57 @@
+{
+  "passed": true,
+  "checkedAt": "2026-10-26T17:30:57.892244+00:00",
+  "url": "https://175.178.16.90/image-annotation/app/",
+  "browser": "Microsoft Edge",
+  "projectId": "4a8e2989-2935-4c00-bb4b-03daddac960d",
+  "taskId": "124f56e6-f232-4ec7-91ce-309974b04636",
+  "download": {
+    "sha256": "7d919e93c791dac70f296723acfd1545aa2c9cb070e99cbc8dd0f73a222253be",
+    "byteSize": 3026,
+    "width": 320,
+    "height": 210
+  },
+  "checks": [
+    {
+      "name": "formal HTTPS browser login and HttpOnly session",
+      "passed": true
+    },
+    {
+      "name": "both desktop-origin datasets display named cards with previews",
+      "passed": true
+    },
+    {
+      "name": "desktop accepted HEAD b6290a98 is retained",
+      "passed": true
+    },
+    {
+      "name": "native dataset opens real 640x420 image and two saved boxes",
+      "passed": true
+    },
+    {
+      "name": "production GUI submits image resize using cookie authentication",
+      "passed": true
+    },
+    {
+      "name": "production conversion history shows succeeded task",
+      "passed": true
+    },
+    {
+      "name": "browser downloads 320x210 PNG with exact server SHA256 and size",
+      "passed": true
+    },
+    {
+      "name": "conversion preserves original project HEAD and clean tree",
+      "passed": true
+    },
+    {
+      "name": "annotation canvas, object inspector and thumbnail strip pass visual inspection",
+      "passed": true
+    }
+  ],
+  "screenshots": [
+    "screenshots/production-native-project.png",
+    "screenshots/production-annotation.png",
+    "screenshots/production-conversion.png"
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "checkedAt": "2026-10-26T09:32:28.933261+00:00",
+  "publicationComplete": true,
+  "mobileHostingVisible": {
+    "dataset": "高线检测数据",
+    "items": 6036,
+    "versions": 12,
+    "role": "viewer",
+    "members": 3
+  },
+  "iphoneFlow": {
+    "claimed": true,
+    "openedOriginalImage": true,
+    "sourceObjects": 2,
+    "editedBBoxX": {
+      "before": 280.0,
+      "after": 285.1
+    },
+    "saved": true,
+    "submittedRevision": 3,
+    "reopenedApprovedRevision": 4,
+    "screenshot": "iphone-approved.png"
+  },
+  "ipadFlow": {
+    "openedSubmittedOriginalAndAnnotations": true,
+    "reviewedAnnotationRevision": 3,
+    "decision": "approved",
+    "serverAnnotationRevisionAfterReview": 4,
+    "onlineAfterStatusRefresh": true,
+    "pendingOperations": 0,
+    "conflicts": 0,
+    "screenshot": "ipad-review-approved.png"
+  },
+  "desktopReadback": {
+    "cloudOverviewObserved": true,
+    "imageCount": 6036,
+    "classCount": 4,
+    "sampleAnnotationObserved": true,
+    "qaStatus": "通过",
+    "objectCount": 2,
+    "firstBBoxX": 285.1,
+    "screenshots": [
+      "desktop-cloud-project.png",
+      "desktop-approved-annotations.png"
+    ],
+    "limitation": "Concurrent frontend editing temporarily caused a JSX error; it recovered without edits by this task. The latest workbench toolbar layout is still affected by current concurrent styles; data/status read-back was verified, not general desktop visual regression."
+  },
+  "limitations": [
+    "iPad image dirty/pending flag remains despite the acknowledged review operation; actual Outbox is synced and server state correct.",
+    "Task parent assignment status and task item approval status are independent.",
+    "Real Android/iOS device runs were not performed; this run used iPhone/iPad simulators."
+  ],
+  "productSourceEditedByThisTask": false,
+  "artifactRebuiltByThisTask": false
+}

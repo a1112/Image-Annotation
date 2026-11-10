@@ -1,0 +1,22 @@
+{
+  "passed": true,
+  "projectId": "4bde4ca6-4b14-482a-9bf9-58ab1676560c",
+  "checks": [
+    {
+      "name": "web opens existing native cloud graph without creating a dirty worktree",
+      "passed": true
+    },
+    {
+      "name": "two native datasets and three source images remain visible",
+      "passed": true
+    },
+    {
+      "name": "native immutable source bytes are readable with exact hash before a web commit",
+      "passed": true
+    },
+    {
+      "name": "native two-parent merge history remains intact in web",
+      "passed": true
+    }
+  ]
+}

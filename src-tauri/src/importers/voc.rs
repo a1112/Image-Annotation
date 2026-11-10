@@ -170,8 +170,14 @@ pub fn annotations_to_voc_xml_preserving(
                 let bbox = object.bbox.as_ref()?;
                 Some(VocObject {
                     name: object.label.clone(),
-                    pose: Some(object.attributes.get("pose").and_then(|value| value.as_str())
-                        .unwrap_or("Unspecified").to_string()),
+                    pose: Some(
+                        object
+                            .attributes
+                            .get("pose")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("Unspecified")
+                            .to_string(),
+                    ),
                     truncated: Some(attribute_bool(object, "truncated") as u8),
                     difficult: Some(attribute_bool(object, "difficult") as u8),
                     confidence: object
@@ -190,9 +196,13 @@ pub fn annotations_to_voc_xml_preserving(
     };
     if let Some(xml) = existing_xml {
         validate_supported_voc_fields(xml)?;
-        let original: VocAnnotation = quick_xml::de::from_str(xml).map_err(|error| error.to_string())?;
+        let original: VocAnnotation =
+            quick_xml::de::from_str(xml).map_err(|error| error.to_string())?;
         if original.size.width != width || original.size.height != height {
-            return Err("existing VOC dimensions differ from the image; source labels were left unchanged".to_string());
+            return Err(
+                "existing VOC dimensions differ from the image; source labels were left unchanged"
+                    .to_string(),
+            );
         }
         annotation.folder = original.folder;
         annotation.filename = original.filename;
@@ -212,16 +222,40 @@ fn validate_supported_voc_fields(xml: &str) -> Result<(), String> {
         match reader.read_event().map_err(|error| error.to_string())? {
             Event::Start(event) | Event::Empty(event) => {
                 let name = String::from_utf8_lossy(event.name().as_ref()).to_string();
-                if !matches!(name.as_str(), "annotation" | "folder" | "filename" | "path"
-                    | "source" | "database" | "source_path" | "size" | "width" | "height"
-                    | "depth" | "segmented" | "object" | "name" | "pose" | "truncated"
-                    | "difficult" | "confidence" | "bndbox" | "xmin" | "ymin" | "xmax" | "ymax")
-                    || event.attributes().next().is_some() {
+                if !matches!(
+                    name.as_str(),
+                    "annotation"
+                        | "folder"
+                        | "filename"
+                        | "path"
+                        | "source"
+                        | "database"
+                        | "source_path"
+                        | "size"
+                        | "width"
+                        | "height"
+                        | "depth"
+                        | "segmented"
+                        | "object"
+                        | "name"
+                        | "pose"
+                        | "truncated"
+                        | "difficult"
+                        | "confidence"
+                        | "bndbox"
+                        | "xmin"
+                        | "ymin"
+                        | "xmax"
+                        | "ymax"
+                ) || event.attributes().next().is_some()
+                {
                     return Err(format!("VOC source contains unsupported '{name}' metadata"));
                 }
             }
             Event::Comment(_) | Event::PI(_) | Event::DocType(_) => {
-                return Err("VOC source contains comments or extensions that must be preserved".to_string());
+                return Err(
+                    "VOC source contains comments or extensions that must be preserved".to_string(),
+                );
             }
             Event::Eof => break,
             _ => {}
@@ -231,9 +265,17 @@ fn validate_supported_voc_fields(xml: &str) -> Result<(), String> {
 }
 
 fn attribute_bool(object: &AnnotationObject, key: &str) -> bool {
-    object.attributes.get(key).and_then(|value| value.as_bool()).unwrap_or(false)
-        || object.attributes.get("flags").and_then(|value| value.get(key))
-            .and_then(|value| value.as_bool()).unwrap_or(false)
+    object
+        .attributes
+        .get(key)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || object
+            .attributes
+            .get("flags")
+            .and_then(|value| value.get(key))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -294,16 +336,31 @@ mod tests {
     fn preserves_existing_voc_metadata_and_rejects_unknown_extensions() {
         let original = "<annotation><folder>original</folder><filename>a.jpg</filename><source><database>labelImg</database></source><size><width>100</width><height>80</height><depth>1</depth></size><segmented>1</segmented><object><name>person</name><pose>Left</pose><truncated>1</truncated><difficult>0</difficult><bndbox><xmin>1</xmin><ymin>2</ymin><xmax>11</xmax><ymax>12</ymax></bndbox></object></annotation>";
         let mut objects = parse_voc_annotations(original, &["person".to_string()]).unwrap();
-        objects[0].attributes.insert("flags".into(), json!({"difficult": true}));
-        let written = annotations_to_voc_xml_preserving(Path::new("a.jpg"), 100, 80, &objects, Some(original)).unwrap();
+        objects[0]
+            .attributes
+            .insert("flags".into(), json!({"difficult": true}));
+        let written = annotations_to_voc_xml_preserving(
+            Path::new("a.jpg"),
+            100,
+            80,
+            &objects,
+            Some(original),
+        )
+        .unwrap();
         assert!(written.contains("<database>labelImg</database>"));
         assert!(written.contains("<folder>original</folder>"));
         assert!(written.contains("<pose>Left</pose>"));
         assert!(written.contains("<difficult>1</difficult>"));
         assert!(written.contains("<segmented>1</segmented>"));
-        assert!(annotations_to_voc_xml_preserving(Path::new("a.jpg"), 100, 80, &objects,
-            Some(&original.replace("</annotation>", "<custom>retain</custom></annotation>"))).unwrap_err()
-            .contains("unsupported"));
+        assert!(annotations_to_voc_xml_preserving(
+            Path::new("a.jpg"),
+            100,
+            80,
+            &objects,
+            Some(&original.replace("</annotation>", "<custom>retain</custom></annotation>"))
+        )
+        .unwrap_err()
+        .contains("unsupported"));
     }
 
     #[test]

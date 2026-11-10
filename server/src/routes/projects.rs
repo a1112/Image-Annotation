@@ -42,10 +42,7 @@ fn default_mode() -> String {
     "cloud_linked".to_string()
 }
 
-pub async fn list(
-    State(state): State<AppState>,
-    user: AuthUser,
-) -> Result<Json<Value>, ApiError> {
+pub async fn list(State(state): State<AppState>, user: AuthUser) -> Result<Json<Value>, ApiError> {
     let rows = sqlx::query(
         r#"
         SELECT p.id, p.organization_id, p.name, p.description, p.mode, p.status,
@@ -70,8 +67,20 @@ pub async fn create(
     if input.name.trim().is_empty() {
         return Err(ApiError::bad_request("project name is required"));
     }
-    if !matches!(input.mode.as_str(), "local_only" | "cloud_linked" | "mirrored") {
+    if !matches!(
+        input.mode.as_str(),
+        "local_only" | "cloud_linked" | "mirrored"
+    ) {
         return Err(ApiError::bad_request("invalid project mode"));
+    }
+    if input.organization_id.is_some_and(|organization_id| {
+        user.organization_id
+            .is_some_and(|user_organization| user_organization != organization_id)
+            || user.organization_id.is_none()
+    }) {
+        return Err(ApiError::forbidden(
+            "project organization must match the signed-in user",
+        ));
     }
     let id = Uuid::new_v4();
     let mut tx = state.pool.begin().await?;
@@ -86,23 +95,36 @@ pub async fn create(
     .bind(user.id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(
-        "INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, 'owner')",
-    )
-    .bind(id)
-    .bind(user.id)
-    .execute(&mut *tx)
-    .await?;
-    write_change(&mut tx, id, "project", &id.to_string(), "create", 1, json!({
-        "id": id,
-        "name": input.name,
-        "description": input.description,
-        "mode": input.mode,
-        "status": "active"
-    }))
-    .await?;
-    write_audit(&mut tx, id, user.id, "project.create", "project", &id.to_string())
+    sqlx::query("INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, 'owner')")
+        .bind(id)
+        .bind(user.id)
+        .execute(&mut *tx)
         .await?;
+    write_change(
+        &mut tx,
+        id,
+        "project",
+        &id.to_string(),
+        "create",
+        1,
+        json!({
+            "id": id,
+            "name": input.name,
+            "description": input.description,
+            "mode": input.mode,
+            "status": "active"
+        }),
+    )
+    .await?;
+    write_audit(
+        &mut tx,
+        id,
+        user.id,
+        "project.create",
+        "project",
+        &id.to_string(),
+    )
+    .await?;
     tx.commit().await?;
     get(State(state), user, Path(id)).await
 }
@@ -169,15 +191,30 @@ pub async fn update(
     .await?
     .ok_or_else(|| ApiError::not_found("project not found"))?;
     let revision: i64 = row.get("revision");
-    write_change(&mut tx, project_id, "project", &project_id.to_string(), "update", revision, json!({
-        "name": input.name,
-        "description": input.description,
-        "status": input.status,
-        "mode": input.mode
-    }))
+    write_change(
+        &mut tx,
+        project_id,
+        "project",
+        &project_id.to_string(),
+        "update",
+        revision,
+        json!({
+            "name": input.name,
+            "description": input.description,
+            "status": input.status,
+            "mode": input.mode
+        }),
+    )
     .await?;
-    write_audit(&mut tx, project_id, user.id, "project.update", "project", &project_id.to_string())
-        .await?;
+    write_audit(
+        &mut tx,
+        project_id,
+        user.id,
+        "project.update",
+        "project",
+        &project_id.to_string(),
+    )
+    .await?;
     tx.commit().await?;
     get(State(state), user, Path(project_id)).await
 }
@@ -197,7 +234,7 @@ pub async fn delete(
     }
     let mut tx = state.pool.begin().await?;
     let row = sqlx::query(
-        "UPDATE projects SET status = 'deleted', deleted_at = now(), revision = revision + 1, updated_by = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING revision",
+        "UPDATE projects SET status = 'deleted', deleted_at = now(), revision = revision + 1, updated_by = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING id, name, description, mode, status, revision, updated_by, updated_at, deleted_at",
     )
     .bind(project_id)
     .bind(user.id)
@@ -211,11 +248,28 @@ pub async fn delete(
         &project_id.to_string(),
         "delete",
         row.get("revision"),
-        json!({ "deletedAt": chrono::Utc::now() }),
+        json!({
+            "id": row.get::<Uuid, _>("id"),
+            "name": row.get::<String, _>("name"),
+            "description": row.get::<String, _>("description"),
+            "mode": row.get::<String, _>("mode"),
+            "status": row.get::<String, _>("status"),
+            "revision": row.get::<i64, _>("revision"),
+            "updatedBy": row.get::<Uuid, _>("updated_by"),
+            "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+            "deletedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("deleted_at")
+        }),
     )
     .await?;
-    write_audit(&mut tx, project_id, user.id, "project.delete", "project", &project_id.to_string())
-        .await?;
+    write_audit(
+        &mut tx,
+        project_id,
+        user.id,
+        "project.delete",
+        "project",
+        &project_id.to_string(),
+    )
+    .await?;
     tx.commit().await?;
     Ok(Json(json!({ "deleted": true })))
 }
@@ -251,9 +305,13 @@ pub async fn add_member(
     Path(project_id): Path<Uuid>,
     Json(input): Json<AddMember>,
 ) -> Result<Json<Value>, ApiError> {
-    let actor_role =
-        require_project_permission(&state, user.id, project_id, ProjectPermission::ManageMembers)
-            .await?;
+    let actor_role = require_project_permission(
+        &state,
+        user.id,
+        project_id,
+        ProjectPermission::ManageMembers,
+    )
+    .await?;
     if !matches!(
         input.role.as_str(),
         "owner" | "manager" | "annotator" | "reviewer" | "viewer"
@@ -263,6 +321,21 @@ pub async fn add_member(
     if input.role == "owner" && actor_role != "owner" {
         return Err(ApiError::forbidden(
             "only an owner can grant the owner role",
+        ));
+    }
+    let organizations = sqlx::query(
+        "SELECT p.organization_id AS project_organization, u.organization_id AS user_organization FROM projects p CROSS JOIN users u WHERE p.id = $1 AND u.id = $2 AND p.deleted_at IS NULL AND u.deleted_at IS NULL",
+    )
+    .bind(project_id)
+    .bind(input.user_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("user not found"))?;
+    let project_organization: Option<Uuid> = organizations.get("project_organization");
+    let user_organization: Option<Uuid> = organizations.get("user_organization");
+    if project_organization.is_some() && project_organization != user_organization {
+        return Err(ApiError::forbidden(
+            "project members must belong to the project organization",
         ));
     }
     let mut tx = state.pool.begin().await?;
@@ -292,8 +365,15 @@ pub async fn add_member(
         json!({ "userId": input.user_id, "role": input.role }),
     )
     .await?;
-    write_audit(&mut tx, project_id, user.id, "member.upsert", "member", &input.user_id.to_string())
-        .await?;
+    write_audit(
+        &mut tx,
+        project_id,
+        user.id,
+        "member.upsert",
+        "member",
+        &input.user_id.to_string(),
+    )
+    .await?;
     tx.commit().await?;
     Ok(Json(json!({ "userId": input.user_id, "role": input.role })))
 }
@@ -303,9 +383,13 @@ pub async fn remove_member(
     user: AuthUser,
     Path((project_id, member_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>, ApiError> {
-    let actor_role =
-        require_project_permission(&state, user.id, project_id, ProjectPermission::ManageMembers)
-            .await?;
+    let actor_role = require_project_permission(
+        &state,
+        user.id,
+        project_id,
+        ProjectPermission::ManageMembers,
+    )
+    .await?;
     let target = sqlx::query(
         "SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2 AND deleted_at IS NULL",
     )
@@ -382,6 +466,13 @@ pub(crate) async fn write_change(
     revision: i64,
     payload: Value,
 ) -> Result<(), ApiError> {
+    // Serialize every project write before allocating the BIGSERIAL event
+    // sequence.  This avoids a committed event being observed ahead of a
+    // rolled-back transaction and gives bootstrap a stable project snapshot.
+    sqlx::query("SELECT id FROM projects WHERE id = $1 FOR UPDATE")
+        .bind(project_id)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query(
         "INSERT INTO change_events (project_id, entity_type, entity_id, operation, revision, payload) VALUES ($1, $2, $3, $4, $5, $6)",
     )

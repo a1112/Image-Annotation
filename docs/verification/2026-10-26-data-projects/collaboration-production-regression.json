@@ -1,0 +1,147 @@
+{
+  "time": "2026-10-26T10:48:13.450179+00:00",
+  "baseUrl": "https://175.178.16.90/image-annotation",
+  "projectId": "172c0a35-b4c7-4d17-9e64-e3c34cae50f8",
+  "imageId": "54453fe5-a8d1-43a4-81d4-264440204074",
+  "taskId": "d2f49b56-f2f6-403b-bf22-39a0dd776faf",
+  "seconds": 141.28,
+  "checks": [
+    {
+      "name": "health",
+      "passed": true
+    },
+    {
+      "name": "invalid password rejected",
+      "passed": true
+    },
+    {
+      "name": "session identity and devices",
+      "passed": true
+    },
+    {
+      "name": "published label schema",
+      "passed": true
+    },
+    {
+      "name": "private storage ticket preserves bytes",
+      "passed": true
+    },
+    {
+      "name": "transfer URL is externally usable",
+      "passed": true
+    },
+    {
+      "name": "thumbnail has independent verified metadata",
+      "passed": true
+    },
+    {
+      "name": "role invitations are single use",
+      "passed": true
+    },
+    {
+      "name": "task claim excludes another annotator",
+      "passed": true
+    },
+    {
+      "name": "mobile task claim",
+      "passed": true
+    },
+    {
+      "name": "concurrent operation id is idempotent",
+      "passed": true
+    },
+    {
+      "name": "duplicate creates one annotation version",
+      "passed": true
+    },
+    {
+      "name": "stale offline edit is visible conflict",
+      "passed": true
+    },
+    {
+      "name": "explicit resolution uses latest revision",
+      "passed": true
+    },
+    {
+      "name": "mobile submits saved annotation",
+      "passed": true
+    },
+    {
+      "name": "second device sees review queue",
+      "passed": true
+    },
+    {
+      "name": "review is revision checked and returns to desktop",
+      "passed": true
+    },
+    {
+      "name": "annotator creates an issue",
+      "passed": true
+    },
+    {
+      "name": "comment retry accepted 0",
+      "passed": true
+    },
+    {
+      "name": "comment retry accepted 1",
+      "passed": true
+    },
+    {
+      "name": "append only comment is not duplicated",
+      "passed": true
+    },
+    {
+      "name": "folder created for deletion sync",
+      "passed": true
+    },
+    {
+      "name": "folder deletion produces tombstone",
+      "passed": true
+    },
+    {
+      "name": "queued review uses accepted annotation revision",
+      "passed": true
+    },
+    {
+      "name": "client and server share rejection issue identity",
+      "passed": true
+    },
+    {
+      "name": "rejection creates one issue across devices",
+      "passed": true
+    },
+    {
+      "name": "issue follows review lifecycle",
+      "passed": true
+    },
+    {
+      "name": "viewer and annotator cannot exceed roles",
+      "passed": true
+    },
+    {
+      "name": "bootstrap includes tasks reviews and schemas",
+      "passed": true
+    },
+    {
+      "name": "changes are ordered and contain review",
+      "passed": true
+    },
+    {
+      "name": "existing member can receive project deletion",
+      "passed": true
+    },
+    {
+      "name": "refresh token rotates once",
+      "passed": true
+    },
+    {
+      "name": "device revocation invalidates existing access",
+      "passed": true
+    },
+    {
+      "name": "cross organization access rejected",
+      "passed": true
+    }
+  ],
+  "passed": true
+}

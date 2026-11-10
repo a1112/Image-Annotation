@@ -1,0 +1,53 @@
+{
+  "passed": true,
+  "checkedAt": "2026-10-26T12:13:28.815294+00:00",
+  "serverUrl": "https://175.178.16.90/image-annotation",
+  "remoteProjectId": "4a8e2989-2935-4c00-bb4b-03daddac960d",
+  "userId": "2bf5ed0d-cb6d-4341-9e9d-2b197103b05c",
+  "role": "editor",
+  "localProjectId": "data-project-25d2d909-cc1b-4fc2-bd2e-23ea77acd131",
+  "headCommitId": "b6290a98-1b95-4f37-a783-471c2baccc2b",
+  "remoteRevision": 11,
+  "checks": [
+    {
+      "name": "packaged UI authenticates with production service",
+      "passed": true
+    },
+    {
+      "name": "GUI discovers authorized data project",
+      "passed": true
+    },
+    {
+      "name": "GUI clones two complete datasets",
+      "passed": true
+    },
+    {
+      "name": "clone image bytes match immutable image hash",
+      "passed": true
+    },
+    {
+      "name": "clone restores actual annotation objects",
+      "passed": true
+    },
+    {
+      "name": "clone retains merge second parents and history",
+      "passed": true
+    },
+    {
+      "name": "GUI commits cloned dataset annotation changes",
+      "passed": true
+    },
+    {
+      "name": "GUI manual sync pushes editor commit to production",
+      "passed": true
+    },
+    {
+      "name": "local and remote HEAD match after GUI synchronization",
+      "passed": true
+    }
+  ],
+  "screenshots": [
+    "screenshots/final-cloud-synced.png",
+    "screenshots/final-cloud-project.png"
+  ]
+}

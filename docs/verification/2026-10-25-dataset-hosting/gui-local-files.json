@@ -1,0 +1,243 @@
+{
+  "schemaVersion": 1,
+  "verification": {
+    "capturedAt": "2026-10-26T00:55:03+08:00",
+    "mode": "read-only",
+    "scope": "GUI dataset hosting reuse and mobile/desktop export files",
+    "credentialsRead": false,
+    "sourceModified": false,
+    "checks": [
+      "simctl app container and appinfo",
+      "SQLite integrity_check and row-level metadata",
+      "asset_cache SHA256 and byte-size comparison",
+      "unzip -t and zipinfo CRC inspection",
+      "manifest.json image/object counts"
+    ]
+  },
+  "simulator": {
+    "deviceId": "782FB55D-8079-4478-80AA-7EE3F4571087",
+    "deviceName": "iPhone 17 Pro Max",
+    "state": "Booted",
+    "bundleId": "com.imageannotation.desktop",
+    "dataContainer": "/Users/a1-6/Library/Developer/CoreSimulator/Devices/782FB55D-8079-4478-80AA-7EE3F4571087/data/Containers/Data/Application/E8BA1D72-F74F-4C90-BCC6-876D2E57DF72",
+    "appInfo": {
+      "shortVersion": "0.1.0",
+      "build": "0.1.0"
+    }
+  },
+  "reusedProject": {
+    "expectedNamePrefix": "MobileHostingReuse2026",
+    "name": "MobileHostingReuse2026-10-26",
+    "localProjectId": "remote-44c2b443472667a32a74ed0b39bc1b5a77ccd9367ad5697e9482957501d5503e",
+    "projectDirectory": "/Users/a1-6/Library/Developer/CoreSimulator/Devices/782FB55D-8079-4478-80AA-7EE3F4571087/data/Containers/Data/Application/E8BA1D72-F74F-4C90-BCC6-876D2E57DF72/Library/Application Support/com.imageannotation.desktop/workspaces/default/projects/remote-44c2b443472667a32a74ed0b39bc1b5a77ccd9367ad5697e9482957501d5503e",
+    "projectSqlite": "/Users/a1-6/Library/Developer/CoreSimulator/Devices/782FB55D-8079-4478-80AA-7EE3F4571087/data/Containers/Data/Application/E8BA1D72-F74F-4C90-BCC6-876D2E57DF72/Library/Application Support/com.imageannotation.desktop/workspaces/default/projects/remote-44c2b443472667a32a74ed0b39bc1b5a77ccd9367ad5697e9482957501d5503e/project.sqlite",
+    "sqliteIntegrity": "ok",
+    "schemaMigrationsMax": 8,
+    "projectRow": {
+      "sourceDatasetKey": "remote:https://175.178.16.90/image-annotation:b4a4d115-3a11-4e7f-abd0-911c87cdc0e8:15441235-ddaa-459c-9212-979333ef0560",
+      "format": "remote",
+      "mode": "cloud_linked",
+      "status": "active",
+      "imageCount": 3,
+      "classCount": 3,
+      "revision": 0,
+      "serverRevision": null,
+      "localRevision": 0,
+      "syncStatus": "local_only",
+      "dirty": 0,
+      "deletedAt": null,
+      "remoteId": null
+    },
+    "hybridRemoteMapping": {
+      "serverUrl": "https://175.178.16.90/image-annotation",
+      "remoteProjectId": "15441235-ddaa-459c-9212-979333ef0560",
+      "accountId": "b4a4d115-3a11-4e7f-abd0-911c87cdc0e8",
+      "deviceId": "d1814ea6-6779-4bc3-8432-165811c375ea",
+      "cachePolicy": "on_demand",
+      "autoSync": true,
+      "syncCursor": "194",
+      "lastPulledAt": 1792947232,
+      "pendingOutbox": 0,
+      "syncEntityBases": 7,
+      "remoteLabelSchemas": 1
+    },
+    "images": [
+      {
+        "id": "d2355506-c746-4bfe-b144-0ddd25f7e142:d536b812-c5bf-4ed4-aa5c-64e9e46d3eb6",
+        "fileName": "images/train/demo_001.png",
+        "width": 640,
+        "height": 420,
+        "contentHash": "a3f91ea913037423188c7befae76cd01f92e0e425f180fc3e08b0984c2b4ef9d",
+        "byteSize": 6942,
+        "remoteId": "229ae818-a6ea-4e1e-8096-0b729cde0bfa",
+        "syncStatus": "synced"
+      },
+      {
+        "id": "d2355506-c746-4bfe-b144-0ddd25f7e142:279eabdf-edc7-4071-a162-cf1dd3ffc65a",
+        "fileName": "images/train/demo_002.png",
+        "width": 640,
+        "height": 420,
+        "contentHash": "fef92e4d26eae8fd961889e7b058b5ca793675e4d3787e837da98a4a1683d7dd",
+        "byteSize": 6942,
+        "remoteId": "29cfec99-d372-4b12-a7fc-41126e1d375c",
+        "syncStatus": "synced"
+      },
+      {
+        "id": "d2355506-c746-4bfe-b144-0ddd25f7e142:efd6c48e-d66f-485f-8285-1793cb08a993",
+        "fileName": "images/train/demo_003.png",
+        "width": 640,
+        "height": 420,
+        "contentHash": "d67f7eefc8bde8b6929528ad74bce7235914662528d585223bfe7f471b2f3ba4",
+        "byteSize": 6942,
+        "remoteId": "87d9d00c-389a-4a8f-94ea-235746a38e6d",
+        "syncStatus": "synced"
+      }
+    ],
+    "annotations": {
+      "imageObjectCountsByFile": {
+        "images/train/demo_001.png": 5,
+        "images/train/demo_002.png": 2,
+        "images/train/demo_003.png": 2
+      },
+      "annotationRows": 3,
+      "objectCount": 9,
+      "allRowsSynced": true,
+      "dirtyRows": 0,
+      "deletedRows": 0
+    },
+    "cache": {
+      "policy": "on_demand",
+      "entries": 3,
+      "originalEntries": 3,
+      "allOriginalImagesPresent": true,
+      "allHashesMatch": true,
+      "allByteSizesMatch": true,
+      "allFilesArePng640x420": true,
+      "pinnedEntries": 0,
+      "note": "三张原图均已按需下载并通过内容哈希和大小校验；当前没有 pinned 缓存。"
+    }
+  },
+  "mobileExport": {
+    "jobId": "6aca655b-0087-46d3-821d-3620d362942e",
+    "path": "/Users/a1-6/Library/Developer/CoreSimulator/Devices/782FB55D-8079-4478-80AA-7EE3F4571087/data/Containers/Data/Application/E8BA1D72-F74F-4C90-BCC6-876D2E57DF72/Documents/Dataset Exports/session-afe28d14d1682d4735403a188f1eb5efdaa750740091a993bafec9415ac16262/dataset-export-6aca655b-0087-46d3-821d-3620d362942e.zip",
+    "scopeDirectory": "session-afe28d14d1682d4735403a188f1eb5efdaa750740091a993bafec9415ac16262",
+    "exists": true,
+    "sizeBytes": 3075,
+    "sha256": "dcc5adff07ae4c16ce476b59df98d1bbf1da414aba30c42cda63491f9883875b",
+    "zipTest": "passed: unzip -t reported all 4 entries OK and no errors",
+    "entries": [
+      {
+        "path": "images/images/train/demo_003.png",
+        "crc32": "282a6596",
+        "compressedBytes": 565,
+        "uncompressedBytes": 6942,
+        "test": "OK"
+      },
+      {
+        "path": "images/images/train/demo_001.png",
+        "crc32": "f508fc9e",
+        "compressedBytes": 567,
+        "uncompressedBytes": 6942,
+        "test": "OK"
+      },
+      {
+        "path": "images/images/train/demo_002.png",
+        "crc32": "6d688a2e",
+        "compressedBytes": 567,
+        "uncompressedBytes": 6942,
+        "test": "OK"
+      },
+      {
+        "path": "manifest.json",
+        "crc32": "004b85fb",
+        "compressedBytes": 832,
+        "uncompressedBytes": 4701,
+        "test": "OK"
+      }
+    ],
+    "manifest": {
+      "datasetId": "2a63c59a-90e9-4d61-af84-1aceb1f85177",
+      "name": "dataset-version-73ae80e6-844c-4d2d-bdbe-0627a823a091",
+      "annotationCount": 3,
+      "objectCountsByFile": {
+        "images/train/demo_001.png": 5,
+        "images/train/demo_002.png": 2,
+        "images/train/demo_003.png": 2
+      },
+      "objectCount": 9,
+      "classCount": 3,
+      "imageFiles": [
+        "images/images/train/demo_001.png",
+        "images/images/train/demo_002.png",
+        "images/images/train/demo_003.png"
+      ]
+    },
+    "verified": true
+  },
+  "desktopExport": {
+    "jobId": "f9fc65a2-7226-4360-b420-c4d053cbd902",
+    "path": "/Users/a1-6/Library/Application Support/com.imageannotation.desktop/exports/session-f728fe36ccadbb7782c5b275c64727dbea9db244e1a08fbdec1b8b51993792d3/dataset-export-f9fc65a2-7226-4360-b420-c4d053cbd902.zip",
+    "scopeDirectory": "session-f728fe36ccadbb7782c5b275c64727dbea9db244e1a08fbdec1b8b51993792d3",
+    "exists": true,
+    "sizeBytes": 3075,
+    "sha256": "dcc5adff07ae4c16ce476b59df98d1bbf1da414aba30c42cda63491f9883875b",
+    "zipTest": "passed: unzip -t reported all 4 entries OK and no errors",
+    "entries": [
+      {
+        "path": "images/images/train/demo_003.png",
+        "crc32": "282a6596",
+        "compressedBytes": 565,
+        "uncompressedBytes": 6942,
+        "test": "OK"
+      },
+      {
+        "path": "images/images/train/demo_001.png",
+        "crc32": "f508fc9e",
+        "compressedBytes": 567,
+        "uncompressedBytes": 6942,
+        "test": "OK"
+      },
+      {
+        "path": "images/images/train/demo_002.png",
+        "crc32": "6d688a2e",
+        "compressedBytes": 567,
+        "uncompressedBytes": 6942,
+        "test": "OK"
+      },
+      {
+        "path": "manifest.json",
+        "crc32": "004b85fb",
+        "compressedBytes": 832,
+        "uncompressedBytes": 4701,
+        "test": "OK"
+      }
+    ],
+    "manifest": {
+      "datasetId": "2a63c59a-90e9-4d61-af84-1aceb1f85177",
+      "name": "dataset-version-73ae80e6-844c-4d2d-bdbe-0627a823a091",
+      "annotationCount": 3,
+      "objectCountsByFile": {
+        "images/train/demo_001.png": 5,
+        "images/train/demo_002.png": 2,
+        "images/train/demo_003.png": 2
+      },
+      "objectCount": 9,
+      "classCount": 3,
+      "imageFiles": [
+        "images/images/train/demo_001.png",
+        "images/images/train/demo_002.png",
+        "images/images/train/demo_003.png"
+      ]
+    },
+    "verified": true
+  },
+  "comparison": {
+    "mobileAndDesktopSizeEqual": true,
+    "mobileAndDesktopSha256Equal": true,
+    "mobileAndDesktopEntriesEqual": true,
+    "mobileAndDesktopManifestCountsEqual": true,
+    "requestedDatasetIdFoundInBothManifests": true,
+    "requestedObjectCountsSatisfied": true,
+    "requestedObjectCount": 9
+  }
+}

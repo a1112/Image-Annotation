@@ -1,0 +1,15 @@
+{
+  "finalizedAt": "2026-10-26T17:39:04.907009+00:00",
+  "packages": [
+    {
+      "file": "Image-Annotation-Web-server-source.tar.gz",
+      "bytes": 511024,
+      "sha256": "eb3fb8e9e9a03cce338991e7c9f8ad3ea54f468df242892254f0be1a8dae3eb5"
+    },
+    {
+      "file": "Image-Annotation-Web-static.zip",
+      "bytes": 165974,
+      "sha256": "afd8f8b2f30ec08d05e405eabef7ab0524e810ea59cbc2d0694b4b7c03fd61ee"
+    }
+  ]
+}

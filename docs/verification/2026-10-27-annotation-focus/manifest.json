@@ -1,0 +1,51 @@
+{
+  "source": [
+    {
+      "path": "src/features/web/WebWorkspaceApp.tsx",
+      "sha256": "44c0841cfd6fac64fa82313e34f83be5a0c5b55b57fcf254e40b931e337860d2"
+    },
+    {
+      "path": "src/features/web/web.css",
+      "sha256": "44d1928719b1f10b5049638261d72ceec5f2ecf1c4f0bc32ebfa17120a702527"
+    },
+    {
+      "path": "src/features/web/ImageTransformsPanel.tsx",
+      "sha256": "c70d5765564de176da89c3c4d90dfcacf72ae1cb019e1dd02d059e44c7787802"
+    },
+    {
+      "path": "src/features/datasets/DatasetCard.tsx",
+      "sha256": "06832cbfd282968729f06e86ae8b8a9a9429673b5bcb2d805b6ff396b5f3a9e9"
+    },
+    {
+      "path": "src/features/datasets/dataset-card.css",
+      "sha256": "360a89ffbdd532a4d93c5b2fb8f0bf568476a6d64dcce47e3826a76a4f2fa0c5"
+    },
+    {
+      "path": "src/features/data-projects/DataProjectHome.tsx",
+      "sha256": "0b758309225e9712ef9e456c66b920d3fef4f9319858a0e16098e9ba265ea67b"
+    },
+    {
+      "path": "src/features/data-projects/data-projects.css",
+      "sha256": "9908ed4be70be43c2199be939dacae486f0af1e737fa207e4dcc01c87b707f9f"
+    },
+    {
+      "path": "src/features/annotation/AnnotationWorkspace.tsx",
+      "sha256": "daac8b86ed2aba6353a9d6c2039ebfdf62e40e3eeecdfd4ab38d69e1bdcd9a21"
+    }
+  ],
+  "web": [
+    {
+      "path": "assets/index-BF9fMwgI.js",
+      "sha256": "d234f3e932128cc6bb790d2994c6fc4e9374fa8e28998543701f176a32da9895"
+    },
+    {
+      "path": "assets/index-BvC8MhLp.css",
+      "sha256": "4c5cec2dbffc9426b8c3018ad6dc0456c2fd6d217859187333fb2c901fcf75cb"
+    },
+    {
+      "path": "index.html",
+      "sha256": "9b3069a423960fb1e28d2834e0f1d61938488b95d36dc1ff1e20df1513e6a33d"
+    }
+  ],
+  "webSha256": "61b21b0a0c06b04fe5aecc99c789f427c314d86142f45aa449f8b2b50b2fa5c9"
+}

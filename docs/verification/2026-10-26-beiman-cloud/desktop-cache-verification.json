@@ -1,0 +1,49 @@
+{
+  "checkedAt": "2026-10-26T09:23:29.126244+00:00",
+  "databasePath": "/Users/a1-6/project/Image-Annotation/data/workspaces/default/projects/remote-4b717a118b0c55465aaa47e93c96cf86ac090ab57394059511e84f449b79b0f3/project.sqlite",
+  "integrity": "ok",
+  "counts": {
+    "images": 6036,
+    "annotations": 6036,
+    "classes": 4
+  },
+  "image": {
+    "id": "JPEGImages_120__2__00001",
+    "file_name": "JPEGImages/120 (2)_00001.jpg",
+    "status": "通过",
+    "qa_status": "通过",
+    "server_revision": 3,
+    "sync_status": "synced",
+    "dirty": 0,
+    "content_hash": "9c67b0ddf0b25ea243dc4a2f0d1c7098eea89f0470ea3eef7343d7cf184d2cdc",
+    "byte_size": 109620
+  },
+  "annotation": {
+    "revision": "server-4",
+    "server_revision": 4,
+    "sync_status": "synced",
+    "dirty": 0,
+    "objectCount": 2,
+    "firstBBox": {
+      "height": 542.0,
+      "width": 50.0,
+      "x": 285.1,
+      "y": 2.0
+    }
+  },
+  "outboxStatuses": {},
+  "gui": {
+    "cloudOverviewObserved": true,
+    "imageCount": 6036,
+    "classCount": 4,
+    "sampleAnnotationObserved": true,
+    "qaStatus": "通过",
+    "objectCount": 2,
+    "firstBBoxX": 285.1,
+    "screenshots": [
+      "desktop-cloud-project.png",
+      "desktop-approved-annotations.png"
+    ],
+    "limitation": "Concurrent frontend editing temporarily caused a JSX error; it recovered without edits by this task. The latest workbench toolbar layout is still affected by current concurrent styles; data/status read-back was verified, not general desktop visual regression."
+  }
+}

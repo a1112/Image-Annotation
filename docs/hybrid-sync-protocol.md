@@ -32,6 +32,37 @@ transaction. The Outbox operation ID is stable across retries.
 
 The server stores operation results before acknowledging them. Repeating an
 operation ID returns the original result without repeating the mutation.
+The server also stores a request fingerprint. Reusing an operation ID with a
+different entity/payload is rejected, while a processing reservation older than
+five minutes can be reclaimed under the project write lock after a crashed
+client/server process.
+
+The current mobile operation vocabulary is:
+
+- `annotation/update` with `entityId` equal to the local image key and a
+  payload `{ "objects": [...] }`.
+- `annotation/submit` with the same image key and `baseRevision`.
+- `qa_review/transition` (the alias `review/transition` is accepted) with
+  `imageId`, `decision`, `note`, and `annotationRevision`.
+- `task/create` with `name`, `status`, `imageIds`, and optional `assigneeId`;
+  `task_item/claim` and `task_item/release` with `taskId`, `imageId`, and the
+  item `baseRevision`.
+- `issue/create` with an issue `clientKey`, image/annotation identity, title,
+  description, severity, and status; `issue/update`/`issue/transition` carry
+  the issue revision and changed fields.
+- `issue_comment/comment` carries the issue identity, stable comment
+  `clientKey`, and content. Replaying the same client key is idempotent.
+- `folder/create`, `folder/update`, `folder/delete`, and
+  `folder_member/update` carry the folder/image client identities and base
+  revision. `project/update` is reserved for explicit project metadata/mode
+  changes; opening or publishing a cache must not enqueue it implicitly.
+
+Every successful or conflicting annotation/review result contains the complete
+remote shape, not only a geometry array: `id`, server `imageId`, `revision`,
+`status`, and `objects`. For a review result `id` is the review UUID and
+`annotationId` identifies the updated annotation. A conflict also includes `baseRevision` and
+`currentRevision` in `details`. This lets a mobile client normalize its local
+image key to the server UUID without losing the remote version.
 
 ## Pull
 
@@ -50,7 +81,9 @@ tombstone until no supported cursor can still reference the old row.
 Bootstrap is used when linking a project, recovering a missing cursor, or when
 the server has compacted changes older than the client cursor.
 
-1. Download the project snapshot and snapshot cursor.
+1. Download the project snapshot and snapshot cursor. The snapshot includes
+   `tasks`, `taskItems`, `qaReviews`, and `labelSchemas` alongside assets,
+   annotations, issues, and members.
 2. Import metadata in one SQLite transaction.
 3. Preserve local dirty entities and convert overlaps to explicit conflicts.
 4. Set the cursor to the snapshot cursor.
@@ -74,6 +107,23 @@ Retryable failures use bounded exponential backoff with jitter:
 
 Authentication and authorization failures do not auto-retry indefinitely.
 Network loss leaves operations durable and resumes when connectivity returns.
+
+## Account and object access
+
+Mobile accounts use `POST /api/v1/auth/login` with a device ID and platform.
+Access JWTs are short lived; `POST /api/v1/auth/refresh` rotates the opaque
+refresh token. `POST /api/v1/projects/{projectId}/invitations` creates a
+seven-day, single-use project invitation, and accepting it creates the first
+account session when the invitee is new. A device revoke invalidates all of its
+sessions.
+
+Images and issue attachments are never returned through a public MinIO URL.
+The upload-session and download-url responses contain a five-minute
+`/api/v1/object-tickets/{token}` URL. The API streams the object through the
+private S3 endpoint and checks expiry, direction, expected size, and one-time
+upload use. Set `PUBLIC_BASE_URL` to the externally reachable HTTPS prefix
+(for example `https://175.178.16.90/image-annotation`) so mobile clients never
+construct an internal storage URL.
 
 ## Diagnostics
 

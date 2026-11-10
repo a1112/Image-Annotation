@@ -1,0 +1,110 @@
+{
+  "baseCommit": "8731402b0c5cd76e911cbdd55d88197376b614c3",
+  "sourceSha256": "0fbf08e250f16c109ba694a924a9985ba1c21a430734e0c3850d1921d1b117bf",
+  "files": [
+    {
+      "path": ".dockerignore",
+      "sha256": "59fff9f1352b7ef4b1c017f65bb17afc67249288426fb16daff48e9ad3501ac0"
+    },
+    {
+      "path": ".env.example",
+      "sha256": "3f2723fbb9dd510932c7745eb872e081e83b646028616336fc77885644433c38"
+    },
+    {
+      "path": "Cargo.lock",
+      "sha256": "a3f5da3eb3adf31eaaf4df2dd2387e140570da0ac914ad0b2bea02443a2d103f"
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "9150d87290c8edaf876592fa948ab7e434cf896af4daf6b17ab5c5140e78463d"
+    },
+    {
+      "path": "Dockerfile",
+      "sha256": "af1ec193d2bfb098c43c9daeabeab92e9466948062ce7a4a7e902587b799cfca"
+    },
+    {
+      "path": "README.md",
+      "sha256": "f9aee055ebbabf06c988c92727e9a7308c6ddf47399e89e8048844d277098526"
+    },
+    {
+      "path": "docker-compose.yml",
+      "sha256": "4139d7b6aec81970503ca77dd74317e6cd680a0b6c86ef10fcc901aa71aa4182"
+    },
+    {
+      "path": "migrations/0001_hybrid_v1.sql",
+      "sha256": "f434981784a0e4ed10a1f09818b26d1731864bdaf6a6de5bca5ab6df3bf5f974"
+    },
+    {
+      "path": "migrations/0002_issue_attachments.sql",
+      "sha256": "82c45273a1a39835a3ed236eb2be6594c2416c9acbdd5fcd8a7a992291f9f22b"
+    },
+    {
+      "path": "migrations/0003_mobile_collaboration.sql",
+      "sha256": "eb0b2b0e0dd57ce79a14b95a68bdf94c5a53dc0fd2c849eeb832f15f6dd880ef"
+    },
+    {
+      "path": "openapi.yaml",
+      "sha256": "eb714abdad98fc645e9102f4a81a54e26a1feec87a91ff2fb5ca0ebe5d219c58"
+    },
+    {
+      "path": "src/auth.rs",
+      "sha256": "b61000846d6b4fc43c8fc57ce308bc4eed4e2e7cf151126d65423b4dc9a8f3c0"
+    },
+    {
+      "path": "src/config.rs",
+      "sha256": "4ebbf239f537f296c87438c6772343d1060ed180d092c9e2e93958a1f88a13c8"
+    },
+    {
+      "path": "src/main.rs",
+      "sha256": "6a79916ab075d708a85deb1bdb010a1cbd800c315b5d410e0db53a73ff61795a"
+    },
+    {
+      "path": "src/routes/account.rs",
+      "sha256": "bfec9e940a3d886e66b89e2fe89688292ee10009e63f3099857e145d2d0e3765"
+    },
+    {
+      "path": "src/routes/annotations.rs",
+      "sha256": "964a8a0eb7d6b852e18be2628e9953ea7834f4f9d56f2312cba2eb8376cb0a4e"
+    },
+    {
+      "path": "src/routes/assets.rs",
+      "sha256": "fedcac2ebd6bd96bf6e1054ff76e9ca56796168a0b65d1cb6f7e52c5a502430a"
+    },
+    {
+      "path": "src/routes/attachments.rs",
+      "sha256": "ad6aa358d8211222899ce90967516de0a035e0f0f75671c52915ba60a9469426"
+    },
+    {
+      "path": "src/routes/collaboration.rs",
+      "sha256": "10aee28eccfe249bfcf07af4fe9b1c029c27fd7b25e9a95435b52e074415db68"
+    },
+    {
+      "path": "src/routes/issues.rs",
+      "sha256": "a9f5cd74ade2d75d3172b7f885ddbe0fa5d5e312025caa5cc548208dda1802ec"
+    },
+    {
+      "path": "src/routes/mod.rs",
+      "sha256": "982c044d800e12111d33c4db2754282c87df55dcd72e74f8402dc539edb655b4"
+    },
+    {
+      "path": "src/routes/objects.rs",
+      "sha256": "1e88735e7aa1af92974bd44ff95822022b478f63f04ced478c8150a2d35d2212"
+    },
+    {
+      "path": "src/routes/projects.rs",
+      "sha256": "027f3f0f65b07b0a6f4855f07598dfaa44ebc60755b7335163675eb4cd044a1f"
+    },
+    {
+      "path": "src/routes/sync.rs",
+      "sha256": "22b185a98cdf38c5e2141c4e72ffb74c69b1b1bcb384145268219d38ae6552f1"
+    },
+    {
+      "path": "src/state.rs",
+      "sha256": "5ab268bdafba460a17912c9294dea31382b66e195db91e233b6f82c041792c25"
+    },
+    {
+      "path": "tests/pg_collaboration.rs",
+      "sha256": "78dfa410396e4fb949aabc65403d7dbd61d48a35c6320c85c82049e417df45fe"
+    }
+  ]
+}

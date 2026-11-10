@@ -1,0 +1,19 @@
+{
+  "algorithm": "sha256(sorted sha256sum lines: file-sha256 + two spaces + dist/path + LF)",
+  "fileCount": 3,
+  "sha256": "03ab4d785c4d23738584bbb31b2ad84ee3369c98149feff5edc06d30a51e3e72",
+  "files": [
+    {
+      "path": "dist/assets/index-COhoVamC.js",
+      "sha256": "d2a2999be4dca328a684a8d03458b31e630456d9db929899be202b40eee7b34b"
+    },
+    {
+      "path": "dist/assets/index-DMz4VnXL.css",
+      "sha256": "c1d4a783e4c136da08a234e983c2ea6d0a75c6c0ddd20daa05b2bef2000227c3"
+    },
+    {
+      "path": "dist/index.html",
+      "sha256": "10ebc75aa41bb82d2520ab748420698b4e4140a74f225ddd83fc2b5481acaa9e"
+    }
+  ]
+}

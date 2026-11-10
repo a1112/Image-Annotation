@@ -97,8 +97,8 @@ pub struct TaskItemRecord {
 pub fn initialize_project_database(path: &Path) -> Result<(), String> {
     hybrid::prepare_database(path)
         .map_err(|err| format!("prepare database {}: {err}", path.display()))?;
-    let mut connection = Connection::open(path)
-        .map_err(|err| format!("open database {}: {err}", path.display()))?;
+    let mut connection =
+        Connection::open(path).map_err(|err| format!("open database {}: {err}", path.display()))?;
     connection
         .execute_batch(
             r#"
@@ -237,7 +237,8 @@ pub fn upsert_project_index(
               root_path = excluded.root_path,
               class_count = excluded.class_count,
               image_count = excluded.image_count,
-              created_at = excluded.created_at
+              created_at = excluded.created_at,
+              deleted_at = NULL
             "#,
             params![
                 manifest.id,
@@ -290,6 +291,45 @@ pub fn upsert_project_index(
         .map_err(|err| format!("commit project index {}: {err}", path.display()))
 }
 
+/// Update only the project row without rebuilding the image/class indexes.
+///
+/// Remote-project bootstrap is idempotent and can be called while a device
+/// has unsynced drafts. Reusing [`upsert_project_index`] there would clear
+/// those rows (and their tombstones), so reopening a project must use this
+/// metadata-only path instead.
+pub fn upsert_project_metadata(path: &Path, manifest: &ProjectManifest) -> Result<(), String> {
+    let connection = Connection::open(path)
+        .map_err(|err| format!("open project metadata {}: {err}", path.display()))?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO projects (id, name, source_dataset_key, format, root_path, class_count, image_count, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(id) DO UPDATE SET
+              name = excluded.name,
+              source_dataset_key = excluded.source_dataset_key,
+              format = excluded.format,
+              root_path = excluded.root_path,
+              class_count = excluded.class_count,
+              image_count = excluded.image_count,
+              created_at = projects.created_at,
+              deleted_at = NULL
+            "#,
+            params![
+                manifest.id,
+                manifest.name,
+                manifest.source_dataset_key,
+                manifest.format,
+                manifest.root_path,
+                manifest.class_count,
+                manifest.image_count,
+                manifest.created_at,
+            ],
+        )
+        .map_err(|err| format!("upsert project metadata {}: {err}", path.display()))?;
+    Ok(())
+}
+
 pub fn read_project_manifest(path: &Path) -> Result<Option<ProjectManifest>, String> {
     if !path.exists() {
         return Ok(None);
@@ -297,7 +337,7 @@ pub fn read_project_manifest(path: &Path) -> Result<Option<ProjectManifest>, Str
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
     connection
         .query_row(
-            "SELECT id, name, source_dataset_key, format, root_path, class_count, image_count, created_at FROM projects LIMIT 1",
+            "SELECT id, name, source_dataset_key, format, root_path, class_count, image_count, created_at FROM projects WHERE deleted_at IS NULL LIMIT 1",
             [],
             |row| {
                 Ok(ProjectManifest {
@@ -323,9 +363,9 @@ pub fn read_images(path: &Path, split: Option<&str>) -> Result<Vec<StoredImage>,
     initialize_project_database(path)?;
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
     let sql = if split.is_some() {
-        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images WHERE split = ?1 ORDER BY file_name"
+        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images WHERE split = ?1 AND deleted_at IS NULL ORDER BY file_name"
     } else {
-        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images ORDER BY file_name"
+        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images WHERE deleted_at IS NULL ORDER BY file_name"
     };
     let mut statement = connection.prepare(sql).map_err(|err| err.to_string())?;
     let rows = if let Some(split) = split {
@@ -344,13 +384,36 @@ pub fn read_images(path: &Path, split: Option<&str>) -> Result<Vec<StoredImage>,
     Ok(rows)
 }
 
-pub fn read_image_status(path: &Path, image_id: &str) -> Result<Option<String>, String> {
-    if !path.exists() { return Ok(None); }
+pub fn read_image(path: &Path, image_id: &str) -> Result<Option<StoredImage>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
     initialize_project_database(path)?;
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
-    connection.query_row(
-        "SELECT status FROM images WHERE id = ?1", params![image_id], |row| row.get(0),
-    ).optional().map_err(|err| err.to_string())
+    connection
+        .query_row(
+            "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images WHERE id = ?1 AND deleted_at IS NULL",
+            params![image_id],
+            stored_image_from_row,
+        )
+        .optional()
+        .map_err(|err| err.to_string())
+}
+
+pub fn read_image_status(path: &Path, image_id: &str) -> Result<Option<String>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    initialize_project_database(path)?;
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    connection
+        .query_row(
+            "SELECT status FROM images WHERE id = ?1 AND deleted_at IS NULL",
+            params![image_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| err.to_string())
 }
 
 pub fn read_images_page(
@@ -366,9 +429,9 @@ pub fn read_images_page(
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
     let limit = limit.clamp(1, 500);
     let sql = if split.is_some() {
-        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images WHERE split = ?1 ORDER BY file_name LIMIT ?2 OFFSET ?3"
+        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images WHERE split = ?1 AND deleted_at IS NULL ORDER BY file_name LIMIT ?2 OFFSET ?3"
     } else {
-        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images ORDER BY file_name LIMIT ?1 OFFSET ?2"
+        "SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images WHERE deleted_at IS NULL ORDER BY file_name LIMIT ?1 OFFSET ?2"
     };
     let mut statement = connection.prepare(sql).map_err(|err| err.to_string())?;
     let rows = if let Some(split) = split {
@@ -507,7 +570,7 @@ pub fn read_annotation_payload(
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
     connection
         .query_row(
-            "SELECT image_id, revision, object_json, updated_at FROM annotations WHERE id = ?1",
+            "SELECT image_id, revision, object_json, updated_at FROM annotations WHERE id = ?1 AND deleted_at IS NULL",
             params![image_id],
             |row| {
                 Ok(AnnotationPayload {
@@ -560,13 +623,13 @@ pub fn submit_image_for_review(path: &Path, image_id: &str) -> Result<(), String
     let transaction = connection.transaction().map_err(|err| err.to_string())?;
     transaction
         .execute(
-            "UPDATE images SET status = '待质检', qa_status = '待质检', review_note = NULL WHERE id = ?1",
+            "UPDATE images SET status = '待质检', qa_status = '待质检', review_note = NULL WHERE id = ?1 AND deleted_at IS NULL",
             params![image_id],
         )
         .map_err(|err| err.to_string())?;
     transaction
         .execute(
-            "UPDATE task_items SET status = '待质检', qa_status = '待质检', review_note = NULL WHERE image_id = ?1",
+            "UPDATE task_items SET status = '待质检', qa_status = '待质检', review_note = NULL WHERE image_id = ?1 AND deleted_at IS NULL",
             params![image_id],
         )
         .map_err(|err| err.to_string())?;
@@ -584,17 +647,27 @@ pub fn set_image_verified(path: &Path, image_id: &str, verified: bool) -> Result
     initialize_project_database(path)?;
     let mut connection = Connection::open(path).map_err(|err| err.to_string())?;
     let transaction = connection.transaction().map_err(|err| err.to_string())?;
-    let exists: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM images WHERE id = ?1)", params![image_id], |row| row.get(0),
-    ).map_err(|err| err.to_string())?;
-    if !exists { return Err(format!("image not found: {image_id}")); }
+    let exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM images WHERE id = ?1 AND deleted_at IS NULL)",
+            params![image_id],
+            |row| row.get(0),
+        )
+        .map_err(|err| err.to_string())?;
+    if !exists {
+        return Err(format!("image not found: {image_id}"));
+    }
     if verified {
         transaction.execute(
             "INSERT INTO image_verifications (image_id, verified_at) VALUES (?1, ?2) ON CONFLICT(image_id) DO UPDATE SET verified_at = excluded.verified_at",
             params![image_id, now_unix_string()],
         ).map_err(|err| err.to_string())?;
     } else {
-        transaction.execute("DELETE FROM image_verifications WHERE image_id = ?1", params![image_id])
+        transaction
+            .execute(
+                "DELETE FROM image_verifications WHERE image_id = ?1",
+                params![image_id],
+            )
             .map_err(|err| err.to_string())?;
     }
     transaction.execute(
@@ -605,13 +678,18 @@ pub fn set_image_verified(path: &Path, image_id: &str, verified: bool) -> Result
 }
 
 pub fn read_image_verified(path: &Path, image_id: &str) -> Result<bool, String> {
-    if !path.exists() { return Ok(false); }
+    if !path.exists() {
+        return Ok(false);
+    }
     initialize_project_database(path)?;
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
-    connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM image_verifications WHERE image_id = ?1)",
-        params![image_id], |row| row.get(0),
-    ).map_err(|err| err.to_string())
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM image_verifications WHERE image_id = ?1)",
+            params![image_id],
+            |row| row.get(0),
+        )
+        .map_err(|err| err.to_string())
 }
 
 pub fn review_image(path: &Path, image_id: &str, decision: &str, note: &str) -> Result<(), String> {
@@ -628,13 +706,13 @@ pub fn review_image(path: &Path, image_id: &str, decision: &str, note: &str) -> 
     let transaction = connection.transaction().map_err(|err| err.to_string())?;
     transaction
         .execute(
-            "UPDATE images SET status = ?2, qa_status = ?3, review_note = ?4 WHERE id = ?1",
+            "UPDATE images SET status = ?2, qa_status = ?3, review_note = ?4 WHERE id = ?1 AND deleted_at IS NULL",
             params![image_id, status, qa_status, note],
         )
         .map_err(|err| err.to_string())?;
     transaction
         .execute(
-            "UPDATE task_items SET status = ?2, qa_status = ?3, review_note = ?4 WHERE image_id = ?1",
+            "UPDATE task_items SET status = ?2, qa_status = ?3, review_note = ?4 WHERE image_id = ?1 AND deleted_at IS NULL",
             params![image_id, status, qa_status, note],
         )
         .map_err(|err| err.to_string())?;
@@ -661,7 +739,7 @@ pub fn read_review_queue(path: &Path) -> Result<Vec<StoredImage>, String> {
     initialize_project_database(path)?;
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
     let mut statement = connection
-        .prepare("SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images WHERE qa_status = '待质检' ORDER BY file_name")
+        .prepare("SELECT id, file_name, width, height, split, status, qa_status, review_note FROM images WHERE qa_status = '待质检' AND deleted_at IS NULL ORDER BY file_name")
         .map_err(|err| err.to_string())?;
     let rows = statement
         .query_map([], stored_image_from_row)
@@ -736,10 +814,7 @@ pub fn list_issue_comment_records(
     hybrid::list_issue_comments(&connection, issue_id)
 }
 
-pub fn read_sync_summary(
-    path: &Path,
-    project_id: &str,
-) -> Result<hybrid::SyncSummary, String> {
+pub fn read_sync_summary(path: &Path, project_id: &str) -> Result<hybrid::SyncSummary, String> {
     initialize_project_database(path)?;
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
     hybrid::sync_summary(&connection, project_id)
@@ -933,6 +1008,35 @@ pub fn create_annotation_task_record(
             )
             .map_err(|err| err.to_string())?;
     }
+    let project_id = transaction
+        .query_row("SELECT id FROM projects LIMIT 1", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some(project_id) = project_id {
+        transaction
+            .execute(
+                "UPDATE tasks SET project_id=?2 WHERE id=?1",
+                params![task.id, project_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE task_items SET project_id=?2 WHERE task_id=?1",
+                params![task.id, project_id],
+            )
+            .map_err(|error| error.to_string())?;
+        hybrid::enqueue_operation(
+            &transaction,
+            &project_id,
+            "task",
+            &task.id,
+            "create",
+            None,
+            serde_json::json!({"name":task.name,"status":"active","imageIds":image_ids}),
+        )?;
+    }
     transaction.commit().map_err(|err| err.to_string())?;
     Ok(task)
 }
@@ -945,7 +1049,7 @@ pub fn list_task_records(path: &Path) -> Result<Vec<TaskRecord>, String> {
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
     let mut statement = connection
         .prepare(
-            "SELECT id, name, status, created_at, updated_at FROM tasks ORDER BY created_at DESC",
+            "SELECT id, name, status, created_at, updated_at FROM tasks WHERE deleted_at IS NULL ORDER BY created_at DESC",
         )
         .map_err(|err| err.to_string())?;
     let rows = statement
@@ -972,7 +1076,7 @@ pub fn list_task_item_records(path: &Path, task_id: &str) -> Result<Vec<TaskItem
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
     let mut statement = connection
         .prepare(
-            "SELECT id, task_id, image_id, status, qa_status, review_note, locked_at FROM task_items WHERE task_id = ?1 ORDER BY image_id",
+            "SELECT id, task_id, image_id, status, qa_status, review_note, locked_at FROM task_items WHERE task_id = ?1 AND deleted_at IS NULL ORDER BY image_id",
         )
         .map_err(|err| err.to_string())?;
     let rows = statement
@@ -998,7 +1102,7 @@ pub fn claim_task_item(path: &Path, task_id: &str, image_id: &str) -> Result<(),
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
     connection
         .execute(
-            "UPDATE task_items SET status = '标注中', locked_at = ?3 WHERE task_id = ?1 AND image_id = ?2",
+            "UPDATE task_items SET status = '标注中', locked_at = ?3 WHERE task_id = ?1 AND image_id = ?2 AND deleted_at IS NULL",
             params![task_id, image_id, now_unix_string()],
         )
         .map_err(|err| err.to_string())?;
@@ -1010,7 +1114,7 @@ pub fn release_task_item(path: &Path, task_id: &str, image_id: &str) -> Result<(
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
     connection
         .execute(
-            "UPDATE task_items SET status = '草稿', locked_at = NULL WHERE task_id = ?1 AND image_id = ?2",
+            "UPDATE task_items SET status = '草稿', locked_at = NULL WHERE task_id = ?1 AND image_id = ?2 AND deleted_at IS NULL",
             params![task_id, image_id],
         )
         .map_err(|err| err.to_string())?;
@@ -1023,7 +1127,7 @@ fn current_annotation_revision(
 ) -> Result<Option<String>, String> {
     connection
         .query_row(
-            "SELECT revision FROM annotations WHERE id = ?1",
+            "SELECT revision FROM annotations WHERE id = ?1 AND deleted_at IS NULL",
             params![image_id],
             |row| row.get(0),
         )
@@ -1039,11 +1143,7 @@ fn now_unix_string() -> String {
 }
 
 fn unique_id(prefix: &str) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    format!("{prefix}-{nanos}")
+    format!("{prefix}-{}", uuid::Uuid::new_v4())
 }
 
 #[cfg(test)]
@@ -1097,6 +1197,54 @@ mod tests {
     }
 
     #[test]
+    fn reads_one_image_by_id_and_hides_missing_or_deleted_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "image_annotation_read_image_{}.sqlite",
+            unique_id("test")
+        ));
+        let _ = std::fs::remove_file(&path);
+        initialize_project_database(&path).unwrap();
+        let expected = StoredImage {
+            id: "img-target".to_string(),
+            file_name: "JPEGImages/target.jpg".to_string(),
+            width: 640,
+            height: 480,
+            split: "train".to_string(),
+            status: "已标注".to_string(),
+            qa_status: "待质检".to_string(),
+            review_note: Some("检查边界".to_string()),
+        };
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO images (id, file_name, width, height, split, status, qa_status, review_note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    &expected.id,
+                    &expected.file_name,
+                    expected.width,
+                    expected.height,
+                    &expected.split,
+                    &expected.status,
+                    &expected.qa_status,
+                    &expected.review_note,
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(read_image(&path, "img-target").unwrap(), Some(expected));
+        assert_eq!(read_image(&path, "missing").unwrap(), None);
+
+        connection
+            .execute(
+                "UPDATE images SET deleted_at = 'deleted-for-test' WHERE id = 'img-target'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(read_image(&path, "img-target").unwrap(), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn saves_annotation_revisions_and_rejects_stale_revision() {
         let path = std::env::temp_dir().join("image_annotation_revision_test.sqlite");
         let _ = std::fs::remove_file(&path);
@@ -1146,14 +1294,20 @@ mod tests {
 
     #[test]
     fn verification_survives_save_and_review_submission() {
-        let path = std::env::temp_dir().join(format!("image_annotation_verify_{}.sqlite", unique_id("test")));
+        let path = std::env::temp_dir().join(format!(
+            "image_annotation_verify_{}.sqlite",
+            unique_id("test")
+        ));
         initialize_project_database(&path).unwrap();
         seed_test_image(&path, "img-1");
         set_image_verified(&path, "img-1", true).unwrap();
         save_annotation_payload(&path, "img-1", None, "[]").unwrap();
         submit_image_for_review(&path, "img-1").unwrap();
         assert!(read_image_verified(&path, "img-1").unwrap());
-        assert_eq!(read_image_status(&path, "img-1").unwrap().as_deref(), Some("待质检"));
+        assert_eq!(
+            read_image_status(&path, "img-1").unwrap().as_deref(),
+            Some("待质检")
+        );
         assert_eq!(read_image_status(&path, "missing").unwrap(), None);
         set_image_verified(&path, "img-1", false).unwrap();
         assert!(!read_image_verified(&path, "img-1").unwrap());

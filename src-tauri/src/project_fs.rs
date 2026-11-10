@@ -2,7 +2,86 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Component, Path, PathBuf},
+    sync::{OnceLock, RwLock},
 };
+
+/// All filesystem access is rooted beneath this value.  Desktop builds keep
+/// the historical repository-adjacent layout, while mobile builds resolve the
+/// root from the application data directory (or the explicit override used by
+/// integration tests).  Keeping the decision in one place prevents a mobile
+/// bundle from accidentally writing beside its read-only executable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageRoots {
+    pub app_data: PathBuf,
+    pub workspace: PathBuf,
+    pub test_data: PathBuf,
+    pub cache: PathBuf,
+}
+
+static STORAGE_ROOTS: OnceLock<RwLock<Option<StorageRoots>>> = OnceLock::new();
+
+fn configured_storage_roots() -> &'static RwLock<Option<StorageRoots>> {
+    STORAGE_ROOTS.get_or_init(|| RwLock::new(None))
+}
+
+/// Override the default roots before opening the repository.
+///
+/// This is intentionally process-scoped: a Tauri app owns one storage root,
+/// and tests can inject an isolated temporary directory without changing the
+/// public domain APIs that still accept project IDs.
+pub fn configure_storage_roots(app_data: impl Into<PathBuf>) -> Result<(), String> {
+    let app_data = std::env::var_os("IMAGE_ANNOTATION_DATA_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| app_data.into());
+    if app_data.as_os_str().is_empty() {
+        return Err("application data directory is empty".to_string());
+    }
+    let roots = StorageRoots {
+        workspace: app_data.join("workspaces").join("default"),
+        test_data: app_data.join("test_data"),
+        cache: app_data.join("cache"),
+        app_data,
+    };
+    let mut configured = configured_storage_roots()
+        .write()
+        .map_err(|_| "storage root lock is poisoned".to_string())?;
+    *configured = Some(roots);
+    Ok(())
+}
+
+pub fn storage_roots() -> StorageRoots {
+    if let Ok(configured) = configured_storage_roots().read() {
+        if let Some(roots) = configured.clone() {
+            return roots;
+        }
+    }
+    let app_data = default_app_data_root();
+    StorageRoots {
+        workspace: app_data.join("workspaces").join("default"),
+        test_data: app_data.join("test_data"),
+        cache: app_data.join("cache"),
+        app_data,
+    }
+}
+
+fn default_app_data_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("IMAGE_ANNOTATION_DATA_DIR") {
+        return PathBuf::from(path);
+    }
+
+    #[cfg(mobile)]
+    {
+        // Tauri's mobile WebView exposes a writable HOME inside the app
+        // sandbox.  Prefer it over current_dir, which is commonly read-only.
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join("Image Annotation");
+        }
+        return PathBuf::from("Image Annotation");
+    }
+
+    workspace_root()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,10 +137,24 @@ pub fn workspace_root() -> PathBuf {
 }
 
 pub fn test_data_root() -> PathBuf {
+    #[cfg(mobile)]
+    {
+        return storage_roots().test_data;
+    }
+    if std::env::var_os("IMAGE_ANNOTATION_DATA_DIR").is_some_and(|value| !value.is_empty()) {
+        return storage_roots().test_data;
+    }
     workspace_root().join("data").join("test_data")
 }
 
 pub fn workspace_data_root() -> PathBuf {
+    #[cfg(mobile)]
+    {
+        return storage_roots().workspace;
+    }
+    if std::env::var_os("IMAGE_ANNOTATION_DATA_DIR").is_some_and(|value| !value.is_empty()) {
+        return storage_roots().workspace;
+    }
     workspace_root()
         .join("data")
         .join("workspaces")
@@ -69,6 +162,10 @@ pub fn workspace_data_root() -> PathBuf {
 }
 
 pub fn downloads_dir() -> PathBuf {
+    #[cfg(mobile)]
+    {
+        return storage_roots().cache.join("downloads");
+    }
     test_data_root().join("cache").join("downloads")
 }
 

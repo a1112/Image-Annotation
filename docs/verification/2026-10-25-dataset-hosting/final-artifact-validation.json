@@ -1,0 +1,21 @@
+{
+  "artifacts/mobile/image-annotation-hosting-arm64-debug-20261025.apk": {
+    "sha256": "474a4370ed905a51adfda5cca83722ad8ca5acbc8d0ea7c80ed732641ae81389",
+    "sizeBytes": 243976608,
+    "receiptMatches": true,
+    "crc": true
+  },
+  "artifacts/ios-hosting-device/Image Annotation-hosting-unsigned.ipa": {
+    "sha256": "d52e7e78986233644c95ac046654c91e948783990d5ac80bb1d279a8c3e215e9",
+    "sizeBytes": 5621993,
+    "receiptMatches": true,
+    "crc": true
+  },
+  "simulator": {
+    "executableSha256": "0190df2f35a49685243c6ff44a3a193b7c785a3eecf4c993021e5c2f65dce237",
+    "installedAndLaunchedDevices": [
+      "782FB55D-8079-4478-80AA-7EE3F4571087",
+      "5927DF91-C3B3-44B6-A110-1A5EBD05B064"
+    ]
+  }
+}

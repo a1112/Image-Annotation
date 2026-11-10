@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
@@ -133,27 +134,38 @@ pub fn source_by_key(dataset_key: &str) -> Option<BuiltinDatasetSource> {
 }
 
 pub fn pick_data_source(selection_type: &str) -> Result<Option<Vec<String>>, String> {
-    let picked = match selection_type {
-        "labels" => rfd::FileDialog::new()
-            .add_filter("Annotation files", &["json", "xml", "txt"])
-            .pick_file().map(|path| vec![path]),
-        "model" => rfd::FileDialog::new()
-            .add_filter("ONNX models", &["onnx"])
-            .pick_file().map(|path| vec![path]),
-        "files" => rfd::FileDialog::new()
-            .add_filter(
-                "Images and labels",
-                &["jpg", "jpeg", "png", "bmp", "webp", "xml", "txt"],
-            )
-            .pick_files(),
-        _ => rfd::FileDialog::new().pick_folder().map(|path| vec![path]),
-    };
-    Ok(picked.map(|paths| {
-        paths
-            .into_iter()
-            .map(|path| path.to_string_lossy().to_string())
-            .collect()
-    }))
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = selection_type;
+        return Err("本地文件选择仅在桌面端可用".to_string());
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let picked = match selection_type {
+            "labels" => rfd::FileDialog::new()
+                .add_filter("Annotation files", &["json", "xml", "txt"])
+                .pick_file()
+                .map(|path| vec![path]),
+            "model" => rfd::FileDialog::new()
+                .add_filter("ONNX models", &["onnx"])
+                .pick_file()
+                .map(|path| vec![path]),
+            "files" => rfd::FileDialog::new()
+                .add_filter(
+                    "Images and labels",
+                    &["jpg", "jpeg", "png", "bmp", "webp", "xml", "txt"],
+                )
+                .pick_files(),
+            _ => rfd::FileDialog::new().pick_folder().map(|path| vec![path]),
+        };
+        Ok(picked.map(|paths| {
+            paths
+                .into_iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect()
+        }))
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,7 +228,9 @@ pub fn download_test_dataset(dataset_key: &str) -> Result<DownloadJob, String> {
         let partial_path = download_path.with_extension("zip.part");
         let download_result = (|| -> Result<(), String> {
             let mut output = fs::File::create(&partial_path).map_err(|err| err.to_string())?;
-            response.copy_to(&mut output).map_err(|err| err.to_string())?;
+            response
+                .copy_to(&mut output)
+                .map_err(|err| err.to_string())?;
             output.sync_all().map_err(|err| err.to_string())?;
             drop(output);
             if !is_valid_dataset_archive(&partial_path) {
@@ -326,73 +340,123 @@ pub fn create_dataset_project(
     demo_template: &str,
 ) -> Result<domain::DatasetProject, String> {
     project_fs::ensure_test_data_dirs()?;
-    let project_id = project_id_from_name(name, demo_template);
     let format = match dataset_type {
         "yolo-seg" => "yolo-seg",
         "image-classification" => "image-classification",
         _ => "yolo-detect",
     };
-    let source = BuiltinDatasetSource {
-        key: project_id.clone(),
-        name: name.trim().to_string(),
-        description: "本地新建数据集".to_string(),
-        task_type: match format {
-            "yolo-seg" => "实例分割".to_string(),
-            "image-classification" => "图像分类".to_string(),
-            _ => "目标检测".to_string(),
-        },
-        format: format.to_string(),
-        download_url: String::new(),
-    };
-    let paths = project_fs::ensure_workspace_project_dirs(&source.key)?;
-    if demo_template != "empty" {
-        create_demo_files(&paths.raw, &source.format, demo_template)?;
-    }
+    let (project_id, paths) = reserve_workspace_project(name, demo_template)?;
+    let result = (|| {
+        let source = BuiltinDatasetSource {
+            key: project_id.clone(),
+            name: name.trim().to_string(),
+            description: "本地新建数据集".to_string(),
+            task_type: match format {
+                "yolo-seg" => "实例分割".to_string(),
+                "image-classification" => "图像分类".to_string(),
+                _ => "目标检测".to_string(),
+            },
+            format: format.to_string(),
+            download_url: String::new(),
+        };
+        if demo_template != "empty" {
+            create_demo_files(&paths.raw, &source.format, demo_template)?;
+        }
 
-    let images = indexed_images(&paths.raw)?;
-    let labels = demo_class_labels();
-    let classes: Vec<_> = labels
-        .iter()
-        .enumerate()
-        .map(|(index, label)| storage::StoredClass {
-            id: index as u32,
-            label: label.clone(),
-            color: class_color(index),
+        let images = indexed_images(&paths.raw)?;
+        let labels = demo_class_labels();
+        let classes: Vec<_> = labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| storage::StoredClass {
+                id: index as u32,
+                label: label.clone(),
+                color: class_color(index),
+            })
+            .collect();
+        let manifest = project_fs::ProjectManifest {
+            id: source.key.clone(),
+            name: source.name.clone(),
+            source_dataset_key: "local-demo".to_string(),
+            format: source.format.clone(),
+            root_path: paths.root.to_string_lossy().to_string(),
+            created_at: now_unix_string(),
+            class_count: classes.len() as u32,
+            image_count: images.len() as u32,
+        };
+
+        project_fs::write_manifest(&manifest)?;
+        storage::initialize_project_database(&paths.sqlite)?;
+        storage::upsert_project_index(&paths.sqlite, &manifest, &images, &classes)?;
+
+        Ok(domain::DatasetProject {
+            id: manifest.id,
+            name: manifest.name,
+            description: "新建 Demo 数据集".to_string(),
+            annotation_types: annotation_types_for_format(&source.format),
+            image_count: images.len() as u32,
+            annotated_percent: if images.is_empty() { 0 } else { 100 },
+            review_count: 0,
+            issue_count: 0,
+            class_count: classes.len() as u16,
+            tag_group_count: 3,
+            status: "已导入".to_string(),
+            tags: vec![
+                "source: demo".to_string(),
+                format!("format: {}", source.format),
+                "split: train".to_string(),
+            ],
         })
-        .collect();
-    let manifest = project_fs::ProjectManifest {
-        id: source.key.clone(),
-        name: source.name.clone(),
-        source_dataset_key: "local-demo".to_string(),
-        format: source.format.clone(),
-        root_path: paths.root.to_string_lossy().to_string(),
-        created_at: now_unix_string(),
-        class_count: classes.len() as u32,
-        image_count: images.len() as u32,
-    };
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+    result
+}
 
-    project_fs::write_manifest(&manifest)?;
-    storage::initialize_project_database(&paths.sqlite)?;
-    storage::upsert_project_index(&paths.sqlite, &manifest, &images, &classes)?;
-
-    Ok(domain::DatasetProject {
-        id: manifest.id,
-        name: manifest.name,
-        description: "新建 Demo 数据集".to_string(),
-        annotation_types: annotation_types_for_format(&source.format),
-        image_count: images.len() as u32,
-        annotated_percent: if images.is_empty() { 0 } else { 100 },
-        review_count: 0,
-        issue_count: 0,
-        class_count: classes.len() as u16,
-        tag_group_count: 3,
-        status: "已导入".to_string(),
-        tags: vec![
-            "source: demo".to_string(),
-            format!("format: {}", source.format),
-            "split: train".to_string(),
-        ],
-    })
+/// Claim a fresh workspace project directory before any demo files are
+/// written.  `create_dir` is intentionally used instead of `create_dir_all`:
+/// concurrent requests and Chinese-name slug collisions must never reuse or
+/// overwrite an existing dataset directory.
+fn reserve_workspace_project(
+    name: &str,
+    demo_template: &str,
+) -> Result<(String, project_fs::ProjectPaths), String> {
+    project_fs::ensure_workspace_dirs()?;
+    let initial = project_id_from_name(name, demo_template);
+    let base = project_id_from_name(&initial, "dataset");
+    for attempt in 0..64 {
+        let candidate = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{}-{}", base, Uuid::new_v4().to_string().replace('-', ""))
+        };
+        let workspace_root = project_fs::workspace_project_paths(&candidate).root;
+        // `project_paths` intentionally falls back to test data.  Avoid
+        // claiming an ID that already exists there as well, otherwise the
+        // workspace copy would shadow an existing test dataset.
+        if project_fs::test_project_paths(&candidate).root.exists() {
+            continue;
+        }
+        match fs::create_dir(&workspace_root) {
+            Ok(()) => {
+                return project_fs::ensure_workspace_project_dirs(&candidate)
+                    .map(|paths| (candidate, paths))
+                    .map_err(|error| {
+                        let _ = fs::remove_dir_all(&workspace_root);
+                        error
+                    });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "reserve dataset project directory {}: {error}",
+                    workspace_root.display()
+                ));
+            }
+        }
+    }
+    Err("could not allocate a unique dataset project id".to_string())
 }
 
 pub fn import_images_into_project(
@@ -1969,6 +2033,55 @@ mod tests {
     }
 
     #[test]
+    fn chinese_dataset_slug_collisions_allocate_unique_projects_without_overwrite() {
+        let suffix = Uuid::new_v4().to_string();
+        let day_name = format!("版本验收 {suffix} 白天");
+        let night_name = format!("版本验收 {suffix} 夜间");
+
+        let first = create_dataset_project(&day_name, "yolo-detect", "demo-bbox").unwrap();
+        let first_paths = project_fs::project_paths(&first.id);
+        let first_image_path = first_paths
+            .raw
+            .join("images")
+            .join("train")
+            .join("demo_001.png");
+        let first_label_path = first_paths
+            .raw
+            .join("labels")
+            .join("train")
+            .join("demo_001.txt");
+        let first_image = fs::read(&first_image_path).unwrap();
+        let first_label = fs::read(&first_label_path).unwrap();
+
+        let second = create_dataset_project(&night_name, "yolo-detect", "demo-bbox").unwrap();
+        assert_ne!(first.id, second.id);
+        assert_ne!(
+            project_fs::project_paths(&first.id).root,
+            project_fs::project_paths(&second.id).root
+        );
+        assert_eq!(first.name, day_name);
+        assert_eq!(second.name, night_name);
+        assert_eq!(fs::read(&first_image_path).unwrap(), first_image);
+        assert_eq!(fs::read(&first_label_path).unwrap(), first_label);
+
+        // An exact display-name duplicate also gets a new project instead of
+        // reopening and overwriting the first project's source files.
+        let duplicate = create_dataset_project(&day_name, "yolo-detect", "demo-bbox").unwrap();
+        assert_ne!(duplicate.id, first.id);
+        assert_ne!(duplicate.id, second.id);
+        assert!(project_fs::project_paths(&duplicate.id)
+            .raw
+            .join("labels")
+            .join("train")
+            .join("demo_001.txt")
+            .is_file());
+
+        let _ = fs::remove_dir_all(first_paths.root);
+        let _ = fs::remove_dir_all(project_fs::project_paths(&second.id).root);
+        let _ = fs::remove_dir_all(project_fs::project_paths(&duplicate.id).root);
+    }
+
+    #[test]
     fn creates_demo_classification_dataset_project_with_class_directories() {
         let project_id = project_id_from_name("Classification Unit", "demo-classification");
         let _ = fs::remove_dir_all(project_fs::project_paths(&project_id).root);
@@ -2264,20 +2377,45 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(serde_json::to_value(&result).unwrap()["sourceSync"], "native-only");
+        assert_eq!(
+            serde_json::to_value(&result).unwrap()["sourceSync"],
+            "native-only"
+        );
         assert_eq!(fs::read_to_string(&label_path).unwrap(), original_label);
-        assert_eq!(repository.image_annotation_state(&project.id, "images_train_sample").objects[0].id, "poly-1");
+        assert_eq!(
+            repository
+                .image_annotation_state(&project.id, "images_train_sample")
+                .objects[0]
+                .id,
+            "poly-1"
+        );
 
         let mut bbox = domain::AnnotationObject::bbox(
-            "bbox-with-metadata".to_string(), 0, "region".to_string(),
-            domain::BBox { x: 10.0, y: 10.0, width: 20.0, height: 20.0 },
+            "bbox-with-metadata".to_string(),
+            0,
+            "region".to_string(),
+            domain::BBox {
+                x: 10.0,
+                y: 10.0,
+                width: 20.0,
+                height: 20.0,
+            },
         );
-        bbox.attributes.insert("difficult".to_string(), serde_json::json!(true));
-        let metadata_result = repository.save_image_annotations_with_revision(
-            &project.id, "images_train_sample", Some(result.revision), vec![bbox],
-        ).unwrap();
+        bbox.attributes
+            .insert("difficult".to_string(), serde_json::json!(true));
+        let metadata_result = repository
+            .save_image_annotations_with_revision(
+                &project.id,
+                "images_train_sample",
+                Some(result.revision),
+                vec![bbox],
+            )
+            .unwrap();
         assert_eq!(metadata_result.source_sync, "native-only");
-        assert!(metadata_result.source_sync_message.unwrap().contains("difficult"));
+        assert!(metadata_result
+            .source_sync_message
+            .unwrap()
+            .contains("difficult"));
         assert_eq!(fs::read_to_string(&label_path).unwrap(), original_label);
 
         let _ = fs::remove_dir_all(paths.root);
@@ -2286,54 +2424,108 @@ mod tests {
 
     #[test]
     fn external_labelme_import_and_export_preserve_native_shapes() {
-        let project = create_dataset_project("External Format Unit", "yolo-detect", "demo-bbox").unwrap();
+        let project =
+            create_dataset_project("External Format Unit", "yolo-detect", "demo-bbox").unwrap();
         let paths = project_fs::project_paths(&project.id);
         let repository = domain::SampleRepository::new();
-        let image_id = storage::read_images(&paths.sqlite, None).unwrap()[0].id.clone();
+        let image_id = storage::read_images(&paths.sqlite, None).unwrap()[0]
+            .id
+            .clone();
         let image_path = repository.image_path(&project.id, &image_id).unwrap();
         let classes = storage::read_classes(&paths.sqlite).unwrap();
-        let object = domain::AnnotationObject::polygon("poly-ext".into(), classes[0].id, classes[0].label.clone(), vec![
-            domain::Point { x: 10.0, y: 10.0 }, domain::Point { x: 30.0, y: 10.0 },
-            domain::Point { x: 20.0, y: 30.0 },
-        ]);
-        let source = crate::importers::labelme::write_labelme(&image_path, 640, 420, &[object], true).unwrap();
+        let object = domain::AnnotationObject::polygon(
+            "poly-ext".into(),
+            classes[0].id,
+            classes[0].label.clone(),
+            vec![
+                domain::Point { x: 10.0, y: 10.0 },
+                domain::Point { x: 30.0, y: 10.0 },
+                domain::Point { x: 20.0, y: 30.0 },
+            ],
+        );
+        let source =
+            crate::importers::labelme::write_labelme(&image_path, 640, 420, &[object], true)
+                .unwrap();
         let source_path = paths.imports.join("external.json");
         fs::write(&source_path, source).unwrap();
-        let imported = repository.load_external_annotations(&project.id, &image_id, &source_path.to_string_lossy()).unwrap();
+        let imported = repository
+            .load_external_annotations(&project.id, &image_id, &source_path.to_string_lossy())
+            .unwrap();
         assert!(imported.verified);
         assert_eq!(imported.objects[0].object_type, "polygon");
-        let saved = repository.save_image_annotations_with_revision(&project.id, &image_id, None, imported.objects).unwrap();
+        let saved = repository
+            .save_image_annotations_with_revision(&project.id, &image_id, None, imported.objects)
+            .unwrap();
         assert_eq!(saved.source_sync, "native-only");
         let output_path = paths.exports.join("roundtrip.json");
-        repository.export_annotation_file(&project.id, &image_id, "labelme", Some(output_path.to_string_lossy().to_string())).unwrap();
-        assert!(fs::read_to_string(&output_path).unwrap().contains("polygon"));
-        assert!(repository.export_annotation_file(&project.id, &image_id, "yolo", Some(paths.exports.join("lossy.txt").to_string_lossy().to_string())).is_err());
+        repository
+            .export_annotation_file(
+                &project.id,
+                &image_id,
+                "labelme",
+                Some(output_path.to_string_lossy().to_string()),
+            )
+            .unwrap();
+        assert!(fs::read_to_string(&output_path)
+            .unwrap()
+            .contains("polygon"));
+        assert!(repository
+            .export_annotation_file(
+                &project.id,
+                &image_id,
+                "yolo",
+                Some(
+                    paths
+                        .exports
+                        .join("lossy.txt")
+                        .to_string_lossy()
+                        .to_string()
+                )
+            )
+            .is_err());
         assert!(!paths.exports.join("lossy.txt").exists());
-        let mut mismatched: serde_json::Value = serde_json::from_str(&fs::read_to_string(&source_path).unwrap()).unwrap();
+        let mut mismatched: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&source_path).unwrap()).unwrap();
         mismatched["imageWidth"] = serde_json::json!(10);
         fs::write(&source_path, mismatched.to_string()).unwrap();
-        assert!(repository.load_external_annotations(&project.id, &image_id, &source_path.to_string_lossy())
-            .unwrap_err().contains("dimensions"));
+        assert!(repository
+            .load_external_annotations(&project.id, &image_id, &source_path.to_string_lossy())
+            .unwrap_err()
+            .contains("dimensions"));
         let _ = fs::remove_dir_all(paths.root);
     }
 
     #[test]
     fn verification_remains_independent_of_review_status() {
-        let project = create_dataset_project("Verification State Unit", "yolo-detect", "demo-bbox").unwrap();
+        let project =
+            create_dataset_project("Verification State Unit", "yolo-detect", "demo-bbox").unwrap();
         let paths = project_fs::project_paths(&project.id);
         let repository = domain::SampleRepository::new();
-        let image_id = storage::read_images(&paths.sqlite, None).unwrap()[0].id.clone();
-        repository.set_image_verified(&project.id, &image_id, true).unwrap();
-        repository.submit_image_annotations(&project.id, &image_id).unwrap();
+        let image_id = storage::read_images(&paths.sqlite, None).unwrap()[0]
+            .id
+            .clone();
+        repository
+            .set_image_verified(&project.id, &image_id, true)
+            .unwrap();
+        repository
+            .submit_image_annotations(&project.id, &image_id)
+            .unwrap();
         let state = repository.image_annotation_state(&project.id, &image_id);
         assert!(state.verified);
         assert_eq!(state.status, "待质检");
-        let snapshot = repository.create_dataset_snapshot(&project.id, "verified-snapshot").unwrap();
-        let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(
-            paths.snapshots.join(&snapshot.id).join("manifest.json"),
-        ).unwrap()).unwrap();
-        let image = manifest["annotations"].as_array().unwrap().iter()
-            .find(|item| item["imageId"] == image_id).unwrap();
+        let snapshot = repository
+            .create_dataset_snapshot(&project.id, "verified-snapshot")
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(paths.snapshots.join(&snapshot.id).join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let image = manifest["annotations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["imageId"] == image_id)
+            .unwrap();
         assert_eq!(image["verified"], true);
         let _ = fs::remove_dir_all(paths.root);
     }

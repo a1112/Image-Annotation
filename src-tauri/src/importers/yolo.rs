@@ -24,12 +24,16 @@ pub fn parse_yolo_bbox_line(
 
     let class_id = parse_class_id(values[0])?;
     if values[1..].iter().any(|value| !(0.0..=1.0).contains(value))
-        || values[3] <= 0.0 || values[4] <= 0.0
+        || values[3] <= 0.0
+        || values[4] <= 0.0
         || values[1] - values[3] / 2.0 < -1e-6
         || values[2] - values[4] / 2.0 < -1e-6
         || values[1] + values[3] / 2.0 > 1.0 + 1e-6
-        || values[2] + values[4] / 2.0 > 1.0 + 1e-6 {
-        return Err("YOLO bbox coordinates must describe a positive box inside the image".to_string());
+        || values[2] + values[4] / 2.0 > 1.0 + 1e-6
+    {
+        return Err(
+            "YOLO bbox coordinates must describe a positive box inside the image".to_string(),
+        );
     }
     let width = values[3] * image_width as f64;
     let height = values[4] * image_height as f64;
@@ -124,9 +128,10 @@ pub fn annotations_to_yolo_lines(
                 object.id, object.object_type
             ));
         }
-        let bbox = object.bbox.as_ref().ok_or_else(|| {
-            format!("bbox annotation '{}' has no bbox", object.id)
-        })?;
+        let bbox = object
+            .bbox
+            .as_ref()
+            .ok_or_else(|| format!("bbox annotation '{}' has no bbox", object.id))?;
         let width = bbox.width.max(1.0).min(image_width as f64);
         let height = bbox.height.max(1.0).min(image_height as f64);
         let center_x = (bbox.x + width / 2.0).clamp(0.0, image_width as f64);
@@ -160,9 +165,10 @@ pub fn annotations_to_yolo_polygon_lines(
                 object.id, object.object_type
             ));
         }
-        let polygon = object.polygon.as_ref().ok_or_else(|| {
-            format!("polygon annotation '{}' has no points", object.id)
-        })?;
+        let polygon = object
+            .polygon
+            .as_ref()
+            .ok_or_else(|| format!("polygon annotation '{}' has no points", object.id))?;
         if polygon.len() < 3 {
             return Err(format!(
                 "polygon annotation '{}' must contain at least 3 points",
@@ -192,7 +198,9 @@ fn parse_f64_values(line: &str) -> Result<Vec<f64>, String> {
 
 fn parse_class_id(value: f64) -> Result<u32, String> {
     if !value.is_finite() || value < 0.0 || value > u32::MAX as f64 || value.fract() != 0.0 {
-        return Err(format!("YOLO class id must be a non-negative integer: {value}"));
+        return Err(format!(
+            "YOLO class id must be a non-negative integer: {value}"
+        ));
     }
     Ok(value as u32)
 }
@@ -217,7 +225,11 @@ mod tests {
             "poly-1".to_string(),
             0,
             "region".to_string(),
-            vec![Point { x: 1.0, y: 1.0 }, Point { x: 5.0, y: 1.0 }, Point { x: 1.0, y: 5.0 }],
+            vec![
+                Point { x: 1.0, y: 1.0 },
+                Point { x: 5.0, y: 1.0 },
+                Point { x: 1.0, y: 5.0 },
+            ],
         )];
         let error = annotations_to_yolo_lines(&objects, 16, 16).unwrap_err();
         assert!(error.contains("poly-1"), "{error}");
@@ -229,7 +241,12 @@ mod tests {
             "box-1".to_string(),
             0,
             "object".to_string(),
-            BBox { x: 1.0, y: 1.0, width: 4.0, height: 4.0 },
+            BBox {
+                x: 1.0,
+                y: 1.0,
+                width: 4.0,
+                height: 4.0,
+            },
         )];
         let error = annotations_to_yolo_polygon_lines(&objects, 16, 16).unwrap_err();
         assert!(error.contains("box-1"), "{error}");

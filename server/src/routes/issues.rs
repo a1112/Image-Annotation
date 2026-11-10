@@ -96,7 +96,7 @@ pub async fn create(
     Path(project_id): Path<Uuid>,
     Json(input): Json<CreateIssue>,
 ) -> Result<Json<Value>, ApiError> {
-    require_project_permission(&state, user.id, project_id, ProjectPermission::Review).await?;
+    require_project_permission(&state, user.id, project_id, ProjectPermission::IssueWrite).await?;
     validate_severity(&input.severity)?;
     if input.title.trim().is_empty() {
         return Err(ApiError::bad_request("issue title is required"));
@@ -146,10 +146,25 @@ pub async fn create(
     .bind(user.id)
     .execute(&mut *tx)
     .await?;
-    write_change(&mut tx, project_id, "issue", &id.to_string(), "create", 1, payload.clone())
-        .await?;
-    write_audit(&mut tx, project_id, user.id, "issue.create", "issue", &id.to_string())
-        .await?;
+    write_change(
+        &mut tx,
+        project_id,
+        "issue",
+        &id.to_string(),
+        "create",
+        1,
+        payload.clone(),
+    )
+    .await?;
+    write_audit(
+        &mut tx,
+        project_id,
+        user.id,
+        "issue.create",
+        "issue",
+        &id.to_string(),
+    )
+    .await?;
     tx.commit().await?;
     Ok(Json(payload))
 }
@@ -257,8 +272,15 @@ pub async fn update(
     .await?
     .ok_or_else(|| ApiError::conflict("ISSUE_REVISION_CONFLICT", "issue changed", Value::Null))?;
     let after = issue_json(&row);
-    write_issue_event(&mut tx, issue_id, "updated", Some(before), Some(after.clone()), user.id)
-        .await?;
+    write_issue_event(
+        &mut tx,
+        issue_id,
+        "updated",
+        Some(before),
+        Some(after.clone()),
+        user.id,
+    )
+    .await?;
     write_change(
         &mut tx,
         project_id,
@@ -269,8 +291,15 @@ pub async fn update(
         after.clone(),
     )
     .await?;
-    write_audit(&mut tx, project_id, user.id, "issue.update", "issue", &issue_id.to_string())
-        .await?;
+    write_audit(
+        &mut tx,
+        project_id,
+        user.id,
+        "issue.update",
+        "issue",
+        &issue_id.to_string(),
+    )
+    .await?;
     tx.commit().await?;
     Ok(Json(after))
 }
@@ -360,7 +389,7 @@ pub async fn comment(
     }
     let issue = find_issue(&state, issue_id).await?;
     let project_id: Uuid = issue.get("project_id");
-    require_project_permission(&state, user.id, project_id, ProjectPermission::View).await?;
+    require_project_permission(&state, user.id, project_id, ProjectPermission::IssueWrite).await?;
     let comment_id = Uuid::new_v4();
     let mut tx = state.pool.begin().await?;
     let row = sqlx::query(

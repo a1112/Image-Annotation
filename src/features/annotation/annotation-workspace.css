@@ -1,0 +1,52 @@
+.annotation-page.annotation-page { background: #e9ecf0; font-size: 12px; grid-template-columns: 44px minmax(0, 1fr) 268px; }
+.annotation-page .tool-rail { width: 44px; gap: 5px; padding: 7px 5px; background: #e7eaee; border-right: 1px solid #d0d5dc; }
+.annotation-page .tool-rail button { width: 32px; height: 32px; border-radius: 4px; }
+.annotation-page .tool-rail button svg { width: 18px; height: 18px; }
+.annotation-page .tool-rail select { max-width: 36px; font-size: 10px; border-radius: 3px; }
+.annotation-page .annotation-toolbar {
+  position: relative; z-index: 5; display: flex; flex-wrap: nowrap; align-items: center;
+  min-height: 42px; padding: 5px 8px; gap: 8px; border-bottom: 1px solid #cfd5dc; background: #fafbfc;
+}
+.annotation-page .annotation-toolbar-context { display: flex; flex: 1; align-items: center; gap: 6px; min-width: 0; }
+.annotation-page .annotation-toolbar-context h1 { min-width: 0; margin: 0; font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.annotation-page .annotation-toolbar-context button { display: grid; place-items: center; flex: 0 0 25px; width: 25px; padding: 0; }
+.annotation-page .annotation-state-tag, .annotation-page .dirty-state { flex: 0 0 auto; padding: 2px 5px; border-radius: 3px; font-size: 10px; line-height: 1.4; white-space: nowrap; }
+.annotation-page .annotation-state-tag { border: 1px solid #dce1e8; background: #edf1f5; color: #647181; }
+.annotation-page .dirty-state { border: 1px solid #ead8b7; background: #faf1e3; color: #9a6c25; }
+.annotation-page .annotation-actions { display: flex; flex: 0 0 auto; align-items: center; flex-wrap: nowrap; gap: 4px; }
+.annotation-page .annotation-actions .mobile-inspector-toggle { display: none; }
+.annotation-page .annotation-actions button { display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-height: 27px; padding: 0 7px; border-radius: 4px; border-color: #d1d7df; box-shadow: none; font-size: 11px; white-space: nowrap; }
+.annotation-page .annotation-actions button.primary { color: #fff; background: #285fa8; border-color: #285fa8; }
+.annotation-page .annotation-actions > button:has(> svg:only-child) { width: 27px; padding: 0; }
+.annotation-page .annotation-save-feedback { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: #557360; }
+.annotation-page .annotation-window-controls { display: inline-flex; gap: 2px; padding-left: 4px; margin-left: 3px; border-left: 1px solid #d9dfe6; }
+.annotation-page .annotation-window-controls button { width: 26px; min-width: 26px; padding: 0; border: 0; background: transparent; }
+.annotation-page .annotation-more-actions { position: relative; }
+.annotation-page .annotation-more-actions summary { display: grid; place-items: center; width: 27px; height: 27px; list-style: none; border: 1px solid #d1d7df; border-radius: 4px; background: #fff; color: #495667; cursor: pointer; }
+.annotation-page .annotation-more-actions summary::-webkit-details-marker { display: none; }
+.annotation-page .annotation-more-actions[open] summary { background: #e6edf5; }
+.annotation-page .annotation-more-menu { position: absolute; top: calc(100% + 5px); right: 0; z-index: 30; display: grid; gap: 4px; min-width: 170px; padding: 6px; border: 1px solid #c8cfd9; border-radius: 4px; background: #fff; box-shadow: 0 4px 12px #26354824; }
+.annotation-page .annotation-more-menu button { justify-content: flex-start; width: 100%; border-color: transparent; background: transparent; }
+.annotation-page .annotation-more-menu button:hover { background: #edf2f8; }
+.annotation-page .annotation-more-menu .inline-toggle { display: flex; align-items: center; gap: 6px; min-height: 27px; padding: 0 6px; font-size: 11px; }
+.annotation-page .inspector { padding: 10px; background: #f9fafc; border-left: 1px solid #d0d6de; }
+.annotation-page .inspector h2 { margin: 0 0 7px; font-size: 12px; }
+.annotation-page .inspector h3 { font-size: 11px; }
+.annotation-page .inspector button, .annotation-page .inspector input, .annotation-page .inspector select { min-height: 26px; border-radius: 3px; font-size: 11px; box-shadow: none; }
+.annotation-page .inspector dt, .annotation-page .inspector dd, .annotation-page .inspector label { font-size: 11px; }
+.annotation-page .object-list button { border-radius: 3px; }
+.annotation-page .canvas-controls { gap: 4px; padding: 5px; border-radius: 4px; }
+.annotation-page .canvas-controls button { min-height: 25px; padding: 0 6px; border-radius: 3px; font-size: 11px; }
+@media (max-width: 1000px) {
+  .annotation-page .annotation-state-tag { display: none; }
+  .annotation-page .annotation-save-feedback { max-width: 70px; }
+}
+@media (max-width: 760px) {
+  .annotation-page.annotation-page { grid-template-columns: 40px minmax(0, 1fr); }
+  .annotation-page .tool-rail { width: 40px; padding-inline: 3px; }
+  .annotation-page .annotation-toolbar { flex-wrap: wrap; gap: 4px; padding: 5px; }
+  .annotation-page .annotation-toolbar-context { flex-basis: 100%; }
+  .annotation-page .annotation-actions { width: 100%; }
+  .annotation-page .annotation-actions .mobile-inspector-toggle { display: inline-flex; }
+  .annotation-page .annotation-actions > .annotation-save-feedback { display: none; }
+}

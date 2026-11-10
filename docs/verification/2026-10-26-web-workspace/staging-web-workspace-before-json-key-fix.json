@@ -1,0 +1,205 @@
+{
+  "schema": "web-workspace-verification/v1",
+  "baseUrl": "http://127.0.0.1:26445",
+  "passed": false,
+  "checks": [
+    {
+      "name": "downloaded image 4ecb6640-cc4b-41d2-b088-38b5927be874 has its original bytes",
+      "passed": true
+    },
+    {
+      "name": "downloaded image 4ecb6640-cc4b-41d2-b088-38b5927be874 has a verified sha256",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label initial-0-0",
+      "passed": true
+    },
+    {
+      "name": "stale browser annotation write is rejected",
+      "passed": true,
+      "status": 409,
+      "code": "IMAGE_REVISION_MISMATCH"
+    },
+    {
+      "name": "rejected stale write preserves the saved label and revision",
+      "passed": true
+    },
+    {
+      "name": "downloaded image ec461829-3ff1-4bc5-80b0-a3231188e123 has its original bytes",
+      "passed": true
+    },
+    {
+      "name": "downloaded image ec461829-3ff1-4bc5-80b0-a3231188e123 has a verified sha256",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label initial-0-1",
+      "passed": true
+    },
+    {
+      "name": "downloaded image 0ad694c9-421d-44d9-bdc1-a9a23cacfee4 has its original bytes",
+      "passed": true
+    },
+    {
+      "name": "downloaded image 0ad694c9-421d-44d9-bdc1-a9a23cacfee4 has a verified sha256",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label initial-1-0",
+      "passed": true
+    },
+    {
+      "name": "downloaded image 154d08f6-d324-4748-a56f-98d9a9f85857 has its original bytes",
+      "passed": true
+    },
+    {
+      "name": "downloaded image 154d08f6-d324-4748-a56f-98d9a9f85857 has a verified sha256",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label initial-1-1",
+      "passed": true
+    },
+    {
+      "name": "main working tree reports uploaded/annotated changes",
+      "passed": true
+    },
+    {
+      "name": "initial commit has immutable image/annotation hash references",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label feature-label",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label main-label",
+      "passed": true
+    },
+    {
+      "name": "independent branch changes have no merge conflict",
+      "passed": true
+    },
+    {
+      "name": "clean merge records a second parent",
+      "passed": true
+    },
+    {
+      "name": "clean merge retains both real annotation labels",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label conflict-theirs",
+      "passed": true
+    },
+    {
+      "name": "annotation persists label conflict-ours",
+      "passed": true
+    },
+    {
+      "name": "three-way merge exposes a real conflicting entry",
+      "passed": true
+    }
+  ],
+  "projectId": "7e096cbc-c055-4ecb-99e9-942d324a6ade",
+  "datasetIds": [
+    "7e096cbc-c055-4ecb-99e9-942d324a6ade::77087c6e-34d2-4f7e-bf79-c673cda46ae6",
+    "7e096cbc-c055-4ecb-99e9-942d324a6ade::49e66167-9faf-438a-af75-de3d8d8df3c8"
+  ],
+  "images": [
+    {
+      "datasetId": "7e096cbc-c055-4ecb-99e9-942d324a6ade::77087c6e-34d2-4f7e-bf79-c673cda46ae6",
+      "imageId": "4ecb6640-cc4b-41d2-b088-38b5927be874",
+      "fileName": "web-0-0-1a69bcd9d4.png",
+      "sourceHash": "203046ca8967fd27df2423eb712d456ff71c085250d0730ebe6b4d3197f1d0d5",
+      "sourceByteSize": 378,
+      "dimensions": [
+        12,
+        9
+      ],
+      "initialLabel": "initial-0-0",
+      "download": {
+        "route": "web-content",
+        "byteSize": 378,
+        "sha256": "203046ca8967fd27df2423eb712d456ff71c085250d0730ebe6b4d3197f1d0d5",
+        "dimensions": [
+          12,
+          9
+        ]
+      }
+    },
+    {
+      "datasetId": "7e096cbc-c055-4ecb-99e9-942d324a6ade::77087c6e-34d2-4f7e-bf79-c673cda46ae6",
+      "imageId": "ec461829-3ff1-4bc5-80b0-a3231188e123",
+      "fileName": "web-0-1-1a69bcd9d4.png",
+      "sourceHash": "e4aafee7890e50adad54b513675eda93bc771f56eb111c9baf047541dffc5048",
+      "sourceByteSize": 410,
+      "dimensions": [
+        12,
+        10
+      ],
+      "initialLabel": "initial-0-1",
+      "download": {
+        "route": "web-content",
+        "byteSize": 410,
+        "sha256": "e4aafee7890e50adad54b513675eda93bc771f56eb111c9baf047541dffc5048",
+        "dimensions": [
+          12,
+          10
+        ]
+      }
+    },
+    {
+      "datasetId": "7e096cbc-c055-4ecb-99e9-942d324a6ade::49e66167-9faf-438a-af75-de3d8d8df3c8",
+      "imageId": "0ad694c9-421d-44d9-bdc1-a9a23cacfee4",
+      "fileName": "web-1-0-1a69bcd9d4.png",
+      "sourceHash": "4c4b980bea58bdb7cc0f99d559a889db96f56592d9092580ab8b358fadf9c2c1",
+      "sourceByteSize": 399,
+      "dimensions": [
+        13,
+        9
+      ],
+      "initialLabel": "initial-1-0",
+      "download": {
+        "route": "web-content",
+        "byteSize": 399,
+        "sha256": "4c4b980bea58bdb7cc0f99d559a889db96f56592d9092580ab8b358fadf9c2c1",
+        "dimensions": [
+          13,
+          9
+        ]
+      }
+    },
+    {
+      "datasetId": "7e096cbc-c055-4ecb-99e9-942d324a6ade::49e66167-9faf-438a-af75-de3d8d8df3c8",
+      "imageId": "154d08f6-d324-4748-a56f-98d9a9f85857",
+      "fileName": "web-1-1-1a69bcd9d4.png",
+      "sourceHash": "f8b09c442b6a7a09efe1ed48e0b5d427e62053516587b4dbb826b30c6af01485",
+      "sourceByteSize": 432,
+      "dimensions": [
+        13,
+        10
+      ],
+      "initialLabel": "initial-1-1",
+      "download": {
+        "route": "web-content",
+        "byteSize": 432,
+        "sha256": "f8b09c442b6a7a09efe1ed48e0b5d427e62053516587b4dbb826b30c6af01485",
+        "dimensions": [
+          13,
+          10
+        ]
+      }
+    }
+  ],
+  "initialCommitId": "a62c9db9-bb1e-4e05-bd3e-b5d598051e47",
+  "featureCommitId": "67ee1d38-33a4-4786-a82e-86419573ac4a",
+  "mainChangeCommitId": "eb0961c7-0894-4199-9b57-e599f50b4e92",
+  "mergeCommitId": "734f8ae9-be0c-4d2d-9667-b02f42eb285c",
+  "failure": {
+    "message": "web command failed",
+    "status": 500,
+    "code": "DATABASE_ERROR"
+  }
+}

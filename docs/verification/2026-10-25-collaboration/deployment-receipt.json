@@ -1,0 +1,12 @@
+{
+  "time": "2026-10-25T06:17:09.787812+00:00",
+  "service": "serverall-image-annotation.service",
+  "pid": 3679629,
+  "releaseDirectory": "/home/ubuntu/projects/.deployment/releases/image-annotation/20261025-collaboration-0fbf08e250f1",
+  "sourceSha256": "0fbf08e250f16c109ba694a924a9985ba1c21a430734e0c3850d1921d1b117bf",
+  "binarySha256": "52774e4aaefbf3ddf22f4f11d7eb345285e1b8b4ecf7a842121b9af6cfb59251",
+  "publicBaseUrl": "https://175.178.16.90/image-annotation",
+  "stagingChecks": 34,
+  "backupDirectory": "/home/ubuntu/projects/.deployment/image-annotation-collaboration-20261025/backup",
+  "administratorCredentialsStored": true
+}

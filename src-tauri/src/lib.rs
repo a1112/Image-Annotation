@@ -1,13 +1,17 @@
-pub mod annotations;
 pub mod ai;
+pub mod annotations;
 pub mod asset_cache;
 pub mod bridge;
+mod commands;
 pub mod credentials;
+pub mod data_project_sync;
+pub mod data_project_versioning;
+pub mod data_projects;
 pub mod datasets;
 pub mod diagnostics;
 pub mod domain;
-pub mod hybrid;
 pub mod http_backend;
+pub mod hybrid;
 pub mod importers;
 mod platform;
 pub mod project_fs;
@@ -17,6 +21,18 @@ pub mod storage;
 pub mod sync_engine;
 pub mod windows;
 
+// The iOS cdylib target links the Rust facade separately from the static
+// `libapp.a` consumed by Xcode.  Tauri's SwiftRs archive is normally carried
+// through its rlib metadata, but rustc does not propagate that native link
+// item while producing this intermediate cdylib.  Keep an explicit anchor so
+// both device and simulator Rust builds link the Swift bridge archive before
+// Xcode links the final app.
+#[cfg(target_os = "ios")]
+#[link(name = "Tauri", kind = "static")]
+unsafe extern "C" {
+    fn retain_object(object: *const std::ffi::c_void);
+}
+
 use datasets::{BuiltinDataset, DataSourceAnalysis, DownloadJob};
 use domain::{
     AnnotationObject, AnnotationSaveResult, AnnotationState, AnnotationTask, AnnotationVersion,
@@ -25,7 +41,10 @@ use domain::{
 };
 use platform::NativeBackdropStatus;
 use serde::Serialize;
-use std::sync::Mutex;
+use std::{
+    sync::{Mutex, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
+};
 #[cfg(not(mobile))]
 use tauri::{
     image::Image,
@@ -76,6 +95,899 @@ struct WindowState {
 type NativeBackdropState = Mutex<NativeBackdropStatus>;
 type RepositoryState = Mutex<SampleRepository>;
 type BackendTaskState = Mutex<Vec<BackendTask>>;
+
+async fn data_project_worker<T, F>(app: AppHandle, operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = app.state::<RepositoryState>();
+        let _guard = repository.lock().map_err(|error| error.to_string())?;
+        operation()
+    })
+    .await
+    .map_err(|error| format!("data project worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn list_data_projects(app: AppHandle) -> Result<Vec<data_projects::DataProject>, String> {
+    data_project_worker(app, data_projects::list_data_projects).await
+}
+
+#[tauri::command]
+async fn create_data_project(
+    app: AppHandle,
+    name: String,
+    description: String,
+) -> Result<data_projects::DataProject, String> {
+    data_project_worker(app, move || {
+        data_projects::create_data_project(&name, &description)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn assign_dataset_to_data_project(
+    app: AppHandle,
+    data_project_id: Option<String>,
+    dataset_id: String,
+) -> Result<(), String> {
+    data_project_worker(app, move || {
+        data_projects::assign_dataset_to_data_project(data_project_id.as_deref(), &dataset_id)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn get_data_project_working_tree(
+    app: AppHandle,
+    data_project_id: String,
+) -> Result<data_projects::DataProjectWorkingTree, String> {
+    data_project_worker(app, move || {
+        data_project_versioning::get_data_project_versioned_working_tree(&data_project_id)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn commit_data_project(
+    app: AppHandle,
+    data_project_id: String,
+    message: String,
+) -> Result<data_projects::DataProjectCommit, String> {
+    data_project_worker(app, move || {
+        data_projects::commit_data_project(&data_project_id, &message)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn list_data_project_commits(
+    app: AppHandle,
+    data_project_id: String,
+) -> Result<Vec<data_projects::DataProjectCommit>, String> {
+    data_project_worker(app, move || {
+        data_projects::list_data_project_commits(&data_project_id)
+    })
+    .await
+}
+
+// Restore operations may replace the branch working tree. An independently
+// opened annotator can hold unsaved canvas edits that are absent from SQLite.
+pub(crate) fn ensure_data_project_annotators_closed(
+    app: &AppHandle,
+    data_project_id: &str,
+) -> Result<(), String> {
+    let project = data_projects::list_data_projects()?
+        .into_iter()
+        .find(|project| project.id == data_project_id)
+        .ok_or_else(|| "数据项目不存在或当前账号无权访问".to_string())?;
+    for dataset_id in project.dataset_ids {
+        if app
+            .get_webview_window(&format!("annotation-{dataset_id}"))
+            .is_some()
+        {
+            return Err(
+                "请先保存并关闭该数据项目的独立标注窗口，再切换、合并或还原版本".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_data_project_branches(
+    app: AppHandle,
+    data_project_id: String,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_versioning::list_data_project_branches(
+            &data_project_id,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn create_data_project_branch(
+    app: AppHandle,
+    data_project_id: String,
+    name: String,
+    from_commit_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_versioning::create_data_project_branch(
+            &data_project_id,
+            &name,
+            from_commit_id.as_deref(),
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn switch_data_project_branch(
+    app: AppHandle,
+    data_project_id: String,
+    branch: String,
+) -> Result<serde_json::Value, String> {
+    ensure_data_project_annotators_closed(&app, &data_project_id)?;
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_versioning::switch_data_project_branch(
+            &data_project_id,
+            &branch,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn delete_data_project_branch(
+    app: AppHandle,
+    data_project_id: String,
+    branch: String,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_versioning::delete_data_project_branch(
+            &data_project_id,
+            &branch,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn data_project_checkout_status(
+    app: AppHandle,
+    data_project_id: String,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_versioning::data_project_checkout_status(
+            &data_project_id,
+            None,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn get_data_project_dataset_groups(
+    app: AppHandle,
+    data_project_id: String,
+    branch: Option<String>,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_versioning::get_data_project_dataset_groups(
+            &data_project_id,
+            branch.as_deref(),
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_data_project_dataset_groups(
+    app: AppHandle,
+    data_project_id: String,
+    branch: Option<String>,
+    expected_revision: i64,
+    groups: Vec<data_project_versioning::DataProjectDatasetGroup>,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_versioning::set_data_project_dataset_groups(
+            &data_project_id,
+            branch.as_deref(),
+            expected_revision,
+            groups,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn list_data_project_datasets(
+    app: AppHandle,
+    data_project_id: String,
+) -> Result<Vec<DatasetProject>, String> {
+    data_project_worker(app, move || {
+        data_projects::list_data_project_datasets(&data_project_id)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn list_data_project_version_commits(
+    app: AppHandle,
+    data_project_id: String,
+    branch: Option<String>,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_versioning::list_data_project_version_commits(
+            &data_project_id,
+            branch.as_deref(),
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn commit_data_project_branch(
+    app: AppHandle,
+    data_project_id: String,
+    branch: String,
+    message: String,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_versioning::commit_data_project_branch(
+            &data_project_id,
+            &branch,
+            &message,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn preview_data_project_merge(
+    app: AppHandle,
+    data_project_id: String,
+    ours_branch: String,
+    theirs_branch: String,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_versioning::preview_data_project_merge(
+            &data_project_id,
+            &ours_branch,
+            &theirs_branch,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn merge_data_project_branches(
+    app: AppHandle,
+    data_project_id: String,
+    ours_branch: String,
+    theirs_branch: String,
+    message: String,
+) -> Result<serde_json::Value, String> {
+    ensure_data_project_annotators_closed(&app, &data_project_id)?;
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_versioning::merge_data_project_branches(
+            &data_project_id,
+            &ours_branch,
+            &theirs_branch,
+            &message,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn resolve_data_project_merge(
+    app: AppHandle,
+    data_project_id: String,
+    session_id: String,
+    conflict_key: String,
+    resolution: String,
+) -> Result<serde_json::Value, String> {
+    ensure_data_project_annotators_closed(&app, &data_project_id)?;
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_versioning::resolve_data_project_merge(
+            &data_project_id,
+            &session_id,
+            &conflict_key,
+            &resolution,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn revert_data_project_commit(
+    app: AppHandle,
+    data_project_id: String,
+    branch: String,
+    commit_id: String,
+    message: String,
+) -> Result<serde_json::Value, String> {
+    ensure_data_project_annotators_closed(&app, &data_project_id)?;
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_versioning::revert_data_project_commit(
+            &data_project_id,
+            &branch,
+            &commit_id,
+            &message,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn list_remote_data_projects(app: AppHandle) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_sync::list_remote_data_projects()?)
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn create_remote_data_project(
+    app: AppHandle,
+    name: String,
+    description: String,
+    organization_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_sync::create_remote_data_project(
+            &name,
+            &description,
+            organization_id.as_deref(),
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn connect_remote_data_project(
+    app: AppHandle,
+    data_project_id: String,
+    remote_project_id: String,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_sync::connect_remote_data_project(
+            &data_project_id,
+            &remote_project_id,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn get_data_project_sync_status(
+    app: AppHandle,
+    data_project_id: String,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_sync::get_data_project_sync_status(
+            &data_project_id,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn publish_data_project(
+    app: AppHandle,
+    data_project_id: String,
+) -> Result<serde_json::Value, String> {
+    ensure_data_project_annotators_closed(&app, &data_project_id)?;
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_sync::publish_data_project(&data_project_id)?)
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn sync_data_project(
+    app: AppHandle,
+    data_project_id: String,
+) -> Result<serde_json::Value, String> {
+    ensure_data_project_annotators_closed(&app, &data_project_id)?;
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_sync::sync_data_project(&data_project_id)?)
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn clone_remote_data_project(
+    app: AppHandle,
+    remote_project_id: String,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_sync::clone_remote_data_project(
+            &remote_project_id,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn list_data_project_cloud_members(
+    app: AppHandle,
+    data_project_id: String,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_sync::list_data_project_cloud_members(
+            &data_project_id,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn upsert_data_project_cloud_member(
+    app: AppHandle,
+    data_project_id: String,
+    user_id: String,
+    role: String,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_sync::upsert_data_project_cloud_member(
+            &data_project_id,
+            &user_id,
+            &role,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn remove_data_project_cloud_member(
+    app: AppHandle,
+    data_project_id: String,
+    user_id: String,
+) -> Result<serde_json::Value, String> {
+    data_project_worker(app, move || {
+        serde_json::to_value(data_project_sync::remove_data_project_cloud_member(
+            &data_project_id,
+            &user_id,
+        )?)
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfflineStatus {
+    online: bool,
+    queued_operations: u64,
+    conflict_count: u64,
+    cached_assets: u64,
+    last_sync_at: Option<String>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OfflineRuntimeState {
+    // This starts false deliberately.  A stored access token is not proof
+    // that the server is reachable; only a completed sync may mark it online.
+    online: bool,
+    last_sync_at: Option<String>,
+    last_error: Option<String>,
+}
+
+static OFFLINE_RUNTIME_STATE: OnceLock<Mutex<OfflineRuntimeState>> = OnceLock::new();
+
+fn offline_runtime_state() -> &'static Mutex<OfflineRuntimeState> {
+    OFFLINE_RUNTIME_STATE.get_or_init(|| Mutex::new(OfflineRuntimeState::default()))
+}
+
+fn unix_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
+}
+
+fn update_offline_runtime(success: bool, error: Option<String>) {
+    if let Ok(mut state) = offline_runtime_state().lock() {
+        state.online = success;
+        state.last_error = error;
+        if success {
+            state.last_sync_at = Some(unix_timestamp());
+        }
+    }
+}
+
+fn offline_runtime_snapshot() -> OfflineRuntimeState {
+    offline_runtime_state()
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default()
+}
+
+#[cfg(any())]
+mod legacy_account_commands {
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RemoteSessionStatus {
+        authenticated: bool,
+        server_url: Option<String>,
+        account_id: Option<String>,
+        device_id: String,
+        access_expires_at: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RemoteLoginResponse {
+        #[serde(alias = "access_token")]
+        access_token: String,
+        #[serde(alias = "refresh_token")]
+        refresh_token: String,
+        #[serde(
+            default,
+            alias = "expiresAt",
+            alias = "expires_at",
+            alias = "expiresAtUnix",
+            alias = "expires_at_unix"
+        )]
+        access_expires_at: Option<Value>,
+        #[serde(default)]
+        user: Option<Value>,
+        #[serde(default)]
+        account_id: Option<String>,
+    }
+
+    impl RemoteLoginResponse {
+        fn access_expiry(&self) -> Option<i64> {
+            let value = self.access_expires_at.as_ref()?;
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+                .or_else(|| {
+                    value.as_str().and_then(|value| {
+                        value.parse::<i64>().ok().or_else(|| {
+                            DateTime::parse_from_rfc3339(value)
+                                .ok()
+                                .map(|date| date.timestamp())
+                        })
+                    })
+                })
+        }
+    }
+
+    fn json_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a Value> {
+        names.iter().find_map(|name| value.get(*name))
+    }
+
+    fn remote_url(server_url: &str, path: &str) -> Result<String, String> {
+        let server_url = server_url.trim_end_matches('/');
+        if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
+            return Err("server URL must use http or https".to_string());
+        }
+        let path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        Ok(format!("{server_url}{path}"))
+    }
+
+    fn remote_http_request(
+        method: &str,
+        url: &str,
+        token: Option<&str>,
+        body: Option<Value>,
+    ) -> Result<(u16, Value), String> {
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(45))
+            .build()
+            .map_err(|error| format!("failed to create remote client: {error}"))?;
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|error| format!("invalid HTTP method: {error}"))?;
+        let mut request = client.request(method, url);
+        if let Some(token) = token.filter(|value| !value.trim().is_empty()) {
+            request = request.bearer_auth(token.trim());
+        }
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request
+            .send()
+            .map_err(|error| format!("remote request failed: {error}"))?;
+        let status = response.status().as_u16();
+        let payload = response.json::<Value>().unwrap_or_else(|_| json!({}));
+        Ok((status, payload))
+    }
+
+    fn session_summary(
+        session: Option<credentials::SessionCredentials>,
+    ) -> Result<RemoteSessionStatus, String> {
+        let device_id = credentials::try_device_id()?;
+        Ok(match session {
+            Some(session) => RemoteSessionStatus {
+                authenticated: !session.access_token.is_empty(),
+                server_url: Some(session.server_url),
+                account_id: Some(session.account_id),
+                device_id,
+                access_expires_at: session.access_expires_at,
+            },
+            None => RemoteSessionStatus {
+                authenticated: false,
+                server_url: None,
+                account_id: None,
+                device_id,
+                access_expires_at: None,
+            },
+        })
+    }
+
+    #[tauri::command]
+    async fn auth_login(
+        server_url: String,
+        email: String,
+        password: String,
+        device_name: Option<String>,
+    ) -> Result<RemoteSessionStatus, String> {
+        tauri::async_runtime::spawn_blocking(move || {
+        let url = remote_url(&server_url, "/api/v1/auth/login")?;
+        let device_id = credentials::try_device_id()?;
+        let body = json!({
+            "email": email,
+            "password": password,
+            "deviceId": device_id,
+            "platform": if cfg!(target_os = "android") { "android" } else if cfg!(target_os = "ios") { "ios" } else { "desktop" },
+            "deviceName": device_name.unwrap_or_else(|| "Image Annotation".to_string())
+        });
+        let (status, payload) = remote_http_request("POST", &url, None, Some(body))?;
+        if !(200..300).contains(&status) {
+            return Err(format!("login failed ({status}): {}", payload));
+        }
+        let response: RemoteLoginResponse = serde_json::from_value(payload.clone())
+            .map_err(|error| format!("login response is invalid: {error}"))?;
+        let account_id = response
+            .account_id
+            .or_else(|| response.user.as_ref().and_then(|user| json_field(user, &["id", "userId"]).and_then(Value::as_str).map(ToString::to_string)))
+            .or_else(|| {
+                let (me_status, me_payload) =
+                    remote_http_request("GET", &remote_url(&server_url, "/api/v1/auth/me").ok()?, Some(&response.access_token), None).ok()?;
+                if !(200..300).contains(&me_status) {
+                    return None;
+                }
+                json_field(&me_payload, &["id", "accountId", "userId"])
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .ok_or_else(|| "login response does not include account id (and /auth/me did not resolve it)".to_string())?;
+        let session = credentials::SessionCredentials {
+            server_url: server_url.trim_end_matches('/').to_string(),
+            account_id: account_id.clone(),
+            access_token: response.access_token,
+            refresh_token: response.refresh_token,
+            device_id,
+            access_expires_at: response.access_expiry(),
+        };
+        credentials::store_session(&account_id, &session)?;
+        credentials::set_active_scope(&account_id)?;
+        session_summary(Some(session))
+    })
+    .await
+    .map_err(|error| format!("login worker failed: {error}"))?
+    }
+
+    #[tauri::command]
+    async fn auth_refresh() -> Result<RemoteSessionStatus, String> {
+        tauri::async_runtime::spawn_blocking(|| {
+            let Some(current) = credentials::current_session()? else {
+                return Err("no authenticated session".to_string());
+            };
+            if current.refresh_token.is_empty() {
+                return Err("refresh token is unavailable".to_string());
+            }
+            let url = remote_url(&current.server_url, "/api/v1/auth/refresh")?;
+            let (status, payload) = remote_http_request(
+                "POST",
+                &url,
+                None,
+                Some(
+                    json!({ "refreshToken": current.refresh_token, "deviceId": current.device_id }),
+                ),
+            )?;
+            if !(200..300).contains(&status) {
+                return Err(format!("session refresh failed ({status}): {}", payload));
+            }
+            let response: RemoteLoginResponse = serde_json::from_value(payload)
+                .map_err(|error| format!("refresh response is invalid: {error}"))?;
+            let session = credentials::SessionCredentials {
+                access_token: response.access_token,
+                refresh_token: response.refresh_token,
+                access_expires_at: response.access_expiry(),
+                ..current.clone()
+            };
+            credentials::store_session(&session.account_id, &session)?;
+            session_summary(Some(session))
+        })
+        .await
+        .map_err(|error| format!("refresh worker failed: {error}"))?
+    }
+
+    #[tauri::command]
+    async fn auth_logout() -> Result<(), String> {
+        tauri::async_runtime::spawn_blocking(|| {
+            let Some(current) = credentials::current_session()? else {
+                return Ok(());
+            };
+            let url = remote_url(&current.server_url, "/api/v1/auth/logout")?;
+            let _ = remote_http_request("POST", &url, Some(&current.access_token), None);
+            credentials::delete_session(&current.account_id)
+        })
+        .await
+        .map_err(|error| format!("logout worker failed: {error}"))?
+    }
+
+    #[tauri::command]
+    fn auth_status() -> Result<RemoteSessionStatus, String> {
+        session_summary(credentials::current_session()?)
+    }
+
+    #[tauri::command]
+    async fn remote_request(
+        method: String,
+        path: String,
+        body: Option<Value>,
+    ) -> Result<Value, String> {
+        tauri::async_runtime::spawn_blocking(move || {
+            let current = credentials::refreshed_session()?
+                .ok_or_else(|| "no authenticated session".to_string())?;
+            let url = remote_url(&current.server_url, &path)?;
+            let (status, payload) =
+                remote_http_request(&method, &url, Some(&current.access_token), body)?;
+            if !(200..300).contains(&status) {
+                return Err(format!("remote request failed ({status}): {}", payload));
+            }
+            Ok(payload)
+        })
+        .await
+        .map_err(|error| format!("remote request worker failed: {error}"))?
+    }
+
+    fn scoped_local_project_id(
+        server_url: &str,
+        account_id: &str,
+        remote_project_id: &str,
+    ) -> String {
+        let scope = format!(
+            "{}\n{}\n{}",
+            server_url.trim_end_matches('/'),
+            account_id,
+            remote_project_id
+        );
+        format!("remote-{:x}", Sha256::digest(scope.as_bytes()))
+    }
+
+    fn validate_remote_project_id(project_id: &str) -> Result<(), String> {
+        if project_id.trim().is_empty()
+            || project_id.contains('/')
+            || project_id.contains('\\')
+            || project_id.contains('?')
+            || project_id.contains('#')
+        {
+            return Err("remote project ID is invalid".to_string());
+        }
+        Ok(())
+    }
+
+    #[tauri::command]
+    async fn remote_project_open(
+        server_url: String,
+        remote_project_id: String,
+        mode: Option<String>,
+        cache_policy: Option<String>,
+    ) -> Result<Value, String> {
+        tauri::async_runtime::spawn_blocking(move || {
+        let current = credentials::refreshed_session()?
+            .ok_or_else(|| "no authenticated session".to_string())?;
+        let server_url = server_url.trim_end_matches('/').to_string();
+        if server_url != current.server_url.trim_end_matches('/') {
+            return Err("project server does not match the active account session".to_string());
+        }
+        validate_remote_project_id(&remote_project_id)?;
+        let bootstrap_url = remote_url(
+            &server_url,
+            &format!("/api/v1/projects/{remote_project_id}/sync-bootstrap"),
+        )?;
+        let (status, payload) =
+            remote_http_request("GET", &bootstrap_url, Some(&current.access_token), None)?;
+        if !(200..300).contains(&status) {
+            return Err(format!("project bootstrap failed ({status}): {}", payload));
+        }
+        let project = payload.get("project").cloned().unwrap_or_else(|| json!({}));
+        let local_id = scoped_local_project_id(&server_url, &current.account_id, &remote_project_id);
+        let name = project
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("Remote project")
+            .to_string();
+        let paths = project_fs::ensure_workspace_project_dirs(&local_id)?;
+        let manifest = project_fs::ProjectManifest {
+            id: local_id.clone(),
+            name,
+            source_dataset_key: format!(
+                "remote:{}:{}:{}",
+                server_url, current.account_id, remote_project_id
+            ),
+            format: "remote".to_string(),
+            root_path: paths.root.to_string_lossy().to_string(),
+            created_at: format!(
+                "{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or_default()
+            ),
+            class_count: 0,
+            image_count: payload
+                .get("assets")
+                .and_then(Value::as_array)
+                .map(|items| items.len() as u32)
+                .unwrap_or(0),
+        };
+        project_fs::write_manifest_to_path(&manifest, &paths.manifest)?;
+        storage::initialize_project_database(&paths.sqlite)?;
+        // configure_remote_project updates the existing project row. Upsert
+        // the manifest first so a remote bootstrap cannot leave a config-only
+        // local database that the list/sync paths cannot discover.
+        storage::upsert_project_index(&paths.sqlite, &manifest, &[], &[])?;
+        let mut connection =
+            rusqlite::Connection::open(&paths.sqlite).map_err(|error| error.to_string())?;
+        hybrid::configure_remote_project(
+            &mut connection,
+            &local_id,
+            &server_url,
+            &remote_project_id,
+            &current.device_id,
+            mode.as_deref().unwrap_or("cloud_linked"),
+            cache_policy.as_deref().unwrap_or("on_demand"),
+            true,
+        )?;
+        let sync = sync_engine::sync_project(&paths.sqlite, &local_id, None)?;
+        Ok(json!({ "projectId": local_id.clone(), "localProjectId": local_id, "remoteProjectId": remote_project_id, "serverUrl": server_url, "accountId": current.account_id, "sync": sync }))
+    })
+    .await
+    .map_err(|error| format!("project open worker failed: {error}"))?
+    }
+}
 
 #[cfg(not(mobile))]
 #[tauri::command]
@@ -145,7 +1057,68 @@ fn list_dataset_projects(
     repository: State<'_, RepositoryState>,
 ) -> Result<Vec<DatasetProject>, String> {
     let repository = repository.lock().map_err(|err| err.to_string())?;
-    Ok(repository.dataset_projects())
+    let mut projects = repository.dataset_projects();
+    let session = credentials::current_session()?;
+    projects.retain(|project| {
+        let paths = project_fs::project_paths(&project.id);
+        if storage::initialize_project_database(&paths.sqlite).is_err() {
+            return false;
+        }
+        let connection = match rusqlite::Connection::open(&paths.sqlite) {
+            Ok(connection) => connection,
+            Err(_) => return true,
+        };
+        let deleted_at = connection
+            .query_row(
+                "SELECT deleted_at FROM projects WHERE id = ?1",
+                [&project.id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        if deleted_at.is_some() {
+            return false;
+        }
+        let remote = connection
+            .query_row(
+                "SELECT server_url, remote_project_id, account_id FROM remote_project_configs WHERE project_id = ?1",
+                [&project.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .ok();
+        let Some((remote_server, remote_project_id, owner_account_id)) = remote else {
+            return true;
+        };
+        let Some(session) = session.as_ref() else {
+            return false;
+        };
+        if remote_server.trim_end_matches('/') != session.server_url.trim_end_matches('/') {
+            return false;
+        }
+        if owner_account_id
+            .as_deref()
+            .is_some_and(|owner| owner != session.account_id)
+        {
+            return false;
+        }
+        let source_key = project_fs::read_manifest(&project.id)
+            .map(|manifest| manifest.source_dataset_key)
+            .unwrap_or_default();
+        !source_key.starts_with("remote:")
+            || project.id
+                == commands::account::scoped_local_project_id(
+                    &session.server_url,
+                    &session.account_id,
+                    &remote_project_id,
+                )
+    });
+    Ok(projects)
 }
 
 #[tauri::command]
@@ -166,6 +1139,15 @@ fn get_backend_design() -> BackendDesign {
 
 #[tauri::command]
 fn backend_health() -> serde_json::Value {
+    #[cfg(mobile)]
+    {
+        return serde_json::json!({
+            "status": "mobile",
+            "transport": "remote",
+            "message": "移动端使用远程协作服务"
+        });
+    }
+    #[cfg(not(mobile))]
     http_backend::desktop_health_payload()
 }
 
@@ -633,7 +1615,8 @@ async fn run_ai_annotation(
         ai::prepare(&repository, &project_id, &image_id)?
     };
     tauri::async_runtime::spawn_blocking(move || ai::run(context, options))
-        .await.map_err(|err| err.to_string())?
+        .await
+        .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -720,6 +1703,232 @@ fn get_project_sync_summary(
     repository.project_sync_summary(&project_id)
 }
 
+fn project_matches_active_scope(
+    project_id: &str,
+    session: Option<&credentials::SessionCredentials>,
+) -> Result<bool, String> {
+    let paths = project_fs::project_paths(project_id);
+    if !paths.manifest.exists() || !paths.sqlite.exists() {
+        return Ok(false);
+    }
+    storage::initialize_project_database(&paths.sqlite)?;
+    let connection =
+        rusqlite::Connection::open(&paths.sqlite).map_err(|error| error.to_string())?;
+    let deleted = connection
+        .query_row(
+            "SELECT deleted_at FROM projects WHERE id = ?1",
+            [project_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    if deleted.is_some() {
+        return Ok(false);
+    }
+    let remote = connection
+        .query_row(
+            "SELECT server_url, remote_project_id, account_id FROM remote_project_configs WHERE project_id = ?1",
+            [project_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .ok();
+    let Some((server_url, remote_project_id, owner_account_id)) = remote else {
+        // Local-only projects have no account scope and remain visible to all
+        // sessions on this installation.
+        return Ok(true);
+    };
+    let Some(session) = session else {
+        return Ok(false);
+    };
+    if owner_account_id
+        .as_deref()
+        .is_some_and(|owner| owner != session.account_id)
+    {
+        return Ok(false);
+    }
+    let Some(manifest) = project_fs::read_manifest(project_id) else {
+        return Ok(false);
+    };
+    // Mobile remote-projects use an explicit account-scoped source key and a
+    // hash-derived local id. Older desktop projects can have a remote config
+    // while retaining their historical local id/source key; keep those
+    // projects visible and let their legacy project credential authorize sync.
+    if !manifest.source_dataset_key.starts_with("remote:") {
+        return Ok(server_url.trim_end_matches('/') == session.server_url.trim_end_matches('/'));
+    }
+    let expected_source = format!(
+        "remote:{}:{}:{}",
+        server_url.trim_end_matches('/'),
+        session.account_id,
+        remote_project_id
+    );
+    Ok(
+        server_url.trim_end_matches('/') == session.server_url.trim_end_matches('/')
+            && project_id
+                == commands::account::scoped_local_project_id(
+                    &session.server_url,
+                    &session.account_id,
+                    &remote_project_id,
+                )
+            && manifest.source_dataset_key == expected_source,
+    )
+}
+
+fn active_scope_project_ids(project_id: Option<&str>) -> Result<Vec<String>, String> {
+    let session = credentials::current_session()?;
+    let mut project_ids = Vec::new();
+    for manifest in project_fs::list_project_manifests() {
+        if project_id.is_some_and(|requested| requested != manifest.id) {
+            continue;
+        }
+        if project_matches_active_scope(&manifest.id, session.as_ref())? {
+            project_ids.push(manifest.id);
+        }
+    }
+    if let Some(requested) = project_id {
+        if !project_ids.iter().any(|item| item == requested) {
+            return Err("项目不存在，已删除，或不属于当前账号范围".to_string());
+        }
+    }
+    Ok(project_ids)
+}
+
+fn project_has_remote_config(project_id: &str) -> Result<bool, String> {
+    let paths = project_fs::project_paths(project_id);
+    if !paths.sqlite.exists() {
+        return Ok(false);
+    }
+    let connection =
+        rusqlite::Connection::open(&paths.sqlite).map_err(|error| error.to_string())?;
+    let remote: Option<i64> = connection
+        .query_row(
+            "SELECT 1 FROM remote_project_configs WHERE project_id = ?1 LIMIT 1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .ok();
+    Ok(remote.is_some())
+}
+
+fn latest_timestamp(current: &mut Option<String>, candidate: Option<String>) {
+    let Some(candidate) = candidate.filter(|value| !value.trim().is_empty()) else {
+        return;
+    };
+    if current
+        .as_ref()
+        .map(|value| candidate > *value)
+        .unwrap_or(true)
+    {
+        *current = Some(candidate);
+    }
+}
+
+fn collect_offline_status(
+    project_ids: &[String],
+    authenticated: bool,
+) -> Result<OfflineStatus, String> {
+    let runtime = offline_runtime_snapshot();
+    let mut queued_operations = 0_u64;
+    let mut conflict_count = 0_u64;
+    let mut cached_assets = 0_u64;
+    let mut last_sync_at = runtime.last_sync_at.clone();
+    let mut last_error = runtime.last_error.clone();
+
+    for project_id in project_ids {
+        let paths = project_fs::project_paths(project_id);
+        if !paths.sqlite.exists() {
+            continue;
+        }
+        let connection =
+            rusqlite::Connection::open(&paths.sqlite).map_err(|error| error.to_string())?;
+        let summary = hybrid::sync_summary(&connection, project_id)?;
+        queued_operations = queued_operations
+            .saturating_add(u64::from(summary.pending_operations))
+            .saturating_add(u64::from(summary.failed_operations));
+        conflict_count = conflict_count.saturating_add(u64::from(summary.conflict_count));
+        cached_assets =
+            cached_assets.saturating_add(asset_cache::summary(&connection)?.entry_count);
+        latest_timestamp(&mut last_sync_at, summary.last_pulled_at);
+        latest_timestamp(&mut last_sync_at, summary.last_pushed_at);
+
+        let database_error = connection
+            .query_row(
+                "SELECT error_message FROM sync_outbox WHERE status IN ('failed', 'rejected', 'conflict') AND error_message IS NOT NULL AND error_message != '' ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        if database_error.is_some() && last_error.is_none() {
+            last_error = database_error;
+        }
+    }
+
+    Ok(OfflineStatus {
+        // Never infer reachability from the existence of credentials.  The
+        // runtime flag is set only after a completed sync and is reset after a
+        // network/auth failure; logging out also forces this to false.
+        online: authenticated && runtime.online,
+        queued_operations,
+        conflict_count,
+        cached_assets,
+        last_sync_at,
+        last_error,
+    })
+}
+
+#[tauri::command]
+async fn offline_status(project_id: Option<String>) -> Result<OfflineStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = credentials::current_session()?;
+        let project_ids = active_scope_project_ids(project_id.as_deref())?;
+        collect_offline_status(&project_ids, session.is_some())
+    })
+    .await
+    .map_err(|error| format!("offline status worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn flush_offline_queue(project_id: Option<String>) -> Result<OfflineStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Resolve the scope before touching the network.  This prevents a
+        // stale project from one account from ever reusing the current
+        // account's bearer token.
+        let session = credentials::refreshed_session()?;
+        let project_ids = active_scope_project_ids(project_id.as_deref())?;
+        let mut first_error = None;
+        let mut attempted = 0_u32;
+
+        for id in &project_ids {
+            if !project_has_remote_config(id)? {
+                continue;
+            }
+            attempted += 1;
+            let paths = project_fs::project_paths(id);
+            if let Err(error) = sync_engine::sync_project(&paths.sqlite, id, None) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+
+        if let Some(error) = first_error {
+            update_offline_runtime(false, Some(error));
+        } else if attempted > 0 {
+            update_offline_runtime(true, None);
+        }
+
+        collect_offline_status(&project_ids, session.is_some())
+    })
+    .await
+    .map_err(|error| format!("offline sync worker failed: {error}"))?
+}
+
 #[tauri::command]
 fn configure_remote_project(
     project_id: String,
@@ -743,20 +1952,35 @@ fn configure_remote_project(
         &mode,
         &cache_policy,
         auto_sync,
-    )
+    )?;
+    if let Some(session) = credentials::current_session()? {
+        if session.server_url.trim_end_matches('/') == server_url.trim_end_matches('/') {
+            connection
+                .execute(
+                    "UPDATE remote_project_configs SET account_id = ?2 WHERE project_id = ?1",
+                    rusqlite::params![project_id, session.account_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    hybrid::remote_project_config(&connection, &project_id)?
+        .ok_or_else(|| "remote project configuration was not persisted".to_string())
 }
 
 #[tauri::command]
-fn sync_project(
+async fn sync_project(
     project_id: String,
     access_token: Option<String>,
 ) -> Result<sync_engine::SyncRunResult, String> {
-    let paths = project_fs::project_paths(&project_id);
-    sync_engine::sync_project(&paths.sqlite, &project_id, access_token.as_deref())
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths = project_fs::project_paths(&project_id);
+        sync_engine::sync_project(&paths.sqlite, &project_id, access_token.as_deref())
+    })
+    .await
+    .map_err(|error| format!("sync worker failed: {error}"))?
 }
 
-#[tauri::command]
-fn cache_remote_asset(
+fn cache_remote_asset_inner(
     project_id: String,
     image_id: String,
     access_token: Option<String>,
@@ -766,9 +1990,7 @@ fn cache_remote_asset(
     storage::initialize_project_database(&paths.sqlite)?;
     let connection =
         rusqlite::Connection::open(&paths.sqlite).map_err(|error| error.to_string())?;
-    if let Some(record) =
-        asset_cache::touch(&connection, &image_id, pinned.unwrap_or(false))?
-    {
+    if let Some(record) = asset_cache::touch(&connection, &image_id, pinned.unwrap_or(false))? {
         return Ok(record);
     }
     let server_url = connection
@@ -808,9 +2030,21 @@ fn cache_remote_asset(
 }
 
 #[tauri::command]
-fn get_asset_cache_summary(
+async fn cache_remote_asset(
     project_id: String,
-) -> Result<asset_cache::AssetCacheSummary, String> {
+    image_id: String,
+    access_token: Option<String>,
+    pinned: Option<bool>,
+) -> Result<asset_cache::AssetCacheRecord, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        cache_remote_asset_inner(project_id, image_id, access_token, pinned)
+    })
+    .await
+    .map_err(|error| format!("asset cache worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn get_asset_cache_summary(project_id: String) -> Result<asset_cache::AssetCacheSummary, String> {
     let paths = project_fs::project_paths(&project_id);
     storage::initialize_project_database(&paths.sqlite)?;
     let connection =
@@ -819,9 +2053,7 @@ fn get_asset_cache_summary(
 }
 
 #[tauri::command]
-fn get_hybrid_diagnostics(
-    project_id: String,
-) -> Result<diagnostics::HybridDiagnostics, String> {
+fn get_hybrid_diagnostics(project_id: String) -> Result<diagnostics::HybridDiagnostics, String> {
     let paths = project_fs::project_paths(&project_id);
     storage::initialize_project_database(&paths.sqlite)?;
     diagnostics::collect(&paths.sqlite, &project_id)
@@ -971,7 +2203,7 @@ fn remove_remote_project_member(project_id: String, user_id: String) -> Result<(
 }
 
 #[tauri::command]
-fn publish_project(
+async fn publish_project(
     project_id: String,
     server_url: String,
     device_id: String,
@@ -979,17 +2211,21 @@ fn publish_project(
     cache_policy: String,
     access_token: Option<String>,
 ) -> Result<publisher::PublishResult, String> {
-    let paths = project_fs::project_paths(&project_id);
-    storage::initialize_project_database(&paths.sqlite)?;
-    publisher::publish(
-        &paths,
-        &project_id,
-        &server_url,
-        &device_id,
-        &mode,
-        &cache_policy,
-        access_token.as_deref(),
-    )
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths = project_fs::project_paths(&project_id);
+        storage::initialize_project_database(&paths.sqlite)?;
+        publisher::publish(
+            &paths,
+            &project_id,
+            &server_url,
+            &device_id,
+            &mode,
+            &cache_policy,
+            access_token.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| format!("publish worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1018,9 +2254,10 @@ fn create_annotation_task(
     repository: State<'_, RepositoryState>,
     project_id: String,
     name: String,
+    image_ids: Option<Vec<String>>,
 ) -> Result<AnnotationTask, String> {
     let repository = repository.lock().map_err(|err| err.to_string())?;
-    repository.create_annotation_task(&project_id, &name)
+    repository.create_annotation_task_for_images(&project_id, &name, image_ids.as_deref())
 }
 
 #[tauri::command]
@@ -1040,28 +2277,6 @@ fn list_task_items(
 ) -> Result<Vec<TaskItem>, String> {
     let repository = repository.lock().map_err(|err| err.to_string())?;
     repository.task_items(&project_id, &task_id)
-}
-
-#[tauri::command]
-fn claim_task_item(
-    repository: State<'_, RepositoryState>,
-    project_id: String,
-    task_id: String,
-    image_id: String,
-) -> Result<(), String> {
-    let repository = repository.lock().map_err(|err| err.to_string())?;
-    repository.claim_task_item(&project_id, &task_id, &image_id)
-}
-
-#[tauri::command]
-fn release_task_item(
-    repository: State<'_, RepositoryState>,
-    project_id: String,
-    task_id: String,
-    image_id: String,
-) -> Result<(), String> {
-    let repository = repository.lock().map_err(|err| err.to_string())?;
-    repository.release_task_item(&project_id, &task_id, &image_id)
 }
 
 #[tauri::command]
@@ -1135,7 +2350,7 @@ fn list_exports(
 }
 
 #[tauri::command]
-fn get_file_asset_path(
+async fn get_file_asset_path(
     repository: State<'_, RepositoryState>,
     project_id: String,
     image_id: String,
@@ -1147,12 +2362,13 @@ fn get_file_asset_path(
     if let Some(path) = local_path {
         return Ok(path.to_string_lossy().to_string());
     }
-    cache_remote_asset(
-        project_id.clone(),
-        image_id.clone(),
-        None,
-        Some(false),
-    )
+    let cache_project_id = project_id.clone();
+    let cache_image_id = image_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        cache_remote_asset_inner(cache_project_id, cache_image_id, None, Some(false))
+    })
+    .await
+    .map_err(|error| format!("asset cache worker failed: {error}"))?
     .map(|record| record.local_path)
     .map_err(|error| format!("image unavailable: {project_id}/{image_id}: {error}"))
 }
@@ -1242,12 +2458,14 @@ async fn open_backend_task_tray(app: AppHandle) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut app = tauri::Builder::default().plugin(project_window_chrome::init())
+    let mut app = tauri::Builder::default()
+        .plugin(project_window_chrome::init())
         .plugin(project_resource_monitor::init())
         .manage(NativeBackdropState::new(NativeBackdropStatus::pending()))
         .manage(RepositoryState::new(SampleRepository::new()))
         .manage(BackendTaskState::new(Vec::new()))
         .plugin(tauri_plugin_notification::init())
+        .plugin(commands::hosting_files::init())
         .plugin(tauri_plugin_opener::init());
 
     #[cfg(not(mobile))]
@@ -1275,7 +2493,7 @@ pub fn run() {
                 }
             })
             .invoke_handler(tauri::generate_handler![
-            project_resource_monitor::project_resource_snapshot,
+                project_resource_monitor::project_resource_snapshot,
                 start_drag_window,
                 minimize_window,
                 toggle_maximize_window,
@@ -1285,6 +2503,36 @@ pub fn run() {
                 window_state,
                 backend_health,
                 list_dataset_projects,
+                list_data_projects,
+                create_data_project,
+                assign_dataset_to_data_project,
+                get_data_project_working_tree,
+                commit_data_project,
+                list_data_project_commits,
+                list_data_project_branches,
+                create_data_project_branch,
+                switch_data_project_branch,
+                delete_data_project_branch,
+                data_project_checkout_status,
+                get_data_project_dataset_groups,
+                set_data_project_dataset_groups,
+                list_data_project_datasets,
+                list_data_project_version_commits,
+                commit_data_project_branch,
+                preview_data_project_merge,
+                merge_data_project_branches,
+                resolve_data_project_merge,
+                revert_data_project_commit,
+                list_remote_data_projects,
+                create_remote_data_project,
+                connect_remote_data_project,
+                get_data_project_sync_status,
+                publish_data_project,
+                sync_data_project,
+                clone_remote_data_project,
+                list_data_project_cloud_members,
+                upsert_data_project_cloud_member,
+                remove_data_project_cloud_member,
                 get_project_detail,
                 get_backend_design,
                 list_builtin_datasets,
@@ -1320,6 +2568,8 @@ pub fn run() {
                 get_project_sync_summary,
                 configure_remote_project,
                 sync_project,
+                offline_status,
+                flush_offline_queue,
                 cache_remote_asset,
                 get_asset_cache_summary,
                 cleanup_asset_cache,
@@ -1343,8 +2593,8 @@ pub fn run() {
                 create_annotation_task,
                 list_tasks,
                 list_task_items,
-                claim_task_item,
-                release_task_item,
+                commands::collaboration::claim_task_item,
+                commands::collaboration::release_task_item,
                 review_task_item,
                 list_review_queue,
                 create_dataset_snapshot,
@@ -1358,9 +2608,22 @@ pub fn run() {
                 get_backend_task,
                 clear_completed_backend_tasks,
                 retry_backend_task,
-                open_backend_task_tray
+                open_backend_task_tray,
+                commands::account::auth_login,
+                commands::account::auth_refresh,
+                commands::account::auth_logout,
+                commands::account::auth_status,
+                commands::account::remote_request,
+                commands::hosting::hosting_upload_archive,
+                commands::hosting::hosting_download_export,
+                commands::hosting_files::hosting_open_export,
+                commands::account::remote_project_open,
+                commands::invitations::auth_accept_invitation
             ])
             .setup(|app| {
+                if let Ok(root) = app.path().app_data_dir() {
+                    let _ = project_fs::configure_storage_roots(root);
+                }
                 sync_engine::start_auto_sync();
                 if let Err(error) = http_backend::start_background_backend(app.handle().clone()) {
                     eprintln!("local http backend failed to start: {error}");
@@ -1394,32 +2657,48 @@ pub fn run() {
             window_state,
             backend_health,
             list_dataset_projects,
+            list_data_projects,
+            create_data_project,
+            assign_dataset_to_data_project,
+            get_data_project_working_tree,
+            commit_data_project,
+            list_data_project_commits,
+            list_data_project_branches,
+            create_data_project_branch,
+            switch_data_project_branch,
+            delete_data_project_branch,
+            data_project_checkout_status,
+            get_data_project_dataset_groups,
+            set_data_project_dataset_groups,
+            list_data_project_datasets,
+            list_data_project_version_commits,
+            commit_data_project_branch,
+            preview_data_project_merge,
+            merge_data_project_branches,
+            resolve_data_project_merge,
+            revert_data_project_commit,
+            list_remote_data_projects,
+            create_remote_data_project,
+            connect_remote_data_project,
+            get_data_project_sync_status,
+            publish_data_project,
+            sync_data_project,
+            clone_remote_data_project,
+            list_data_project_cloud_members,
+            upsert_data_project_cloud_member,
+            remove_data_project_cloud_member,
             get_project_detail,
             get_backend_design,
             list_builtin_datasets,
-            download_test_dataset,
             create_dataset_project,
             create_project,
-            import_images,
-            import_yolo_dataset,
-            pick_data_source,
-            analyze_data_source,
-            import_files,
-            open_local_dataset,
-            rescan_project_assets,
-            generate_thumbnails,
-            get_dataset_download_job,
             list_project_images,
+            get_file_asset_path,
             get_image_annotations,
             get_image_annotation_state,
             save_image_annotations,
             submit_image_annotations,
             set_image_verified,
-            load_external_annotations,
-            export_annotation_file,
-            run_ai_annotation,
-            cancel_ai_annotation,
-            get_ai_job_status,
             list_issues,
             create_issue,
             transition_issue,
@@ -1428,6 +2707,8 @@ pub fn run() {
             get_project_sync_summary,
             configure_remote_project,
             sync_project,
+            offline_status,
+            flush_offline_queue,
             cache_remote_asset,
             get_asset_cache_summary,
             cleanup_asset_cache,
@@ -1451,23 +2732,27 @@ pub fn run() {
             create_annotation_task,
             list_tasks,
             list_task_items,
-            claim_task_item,
-            release_task_item,
+            commands::collaboration::claim_task_item,
+            commands::collaboration::release_task_item,
             review_task_item,
             list_review_queue,
-            create_dataset_snapshot,
-            upgrade_dataset_snapshot_bridge,
-            list_snapshots,
-            export_dataset,
-            list_exports,
-            get_file_asset_path,
-            open_annotation_window,
-            list_backend_tasks,
-            get_backend_task,
-            clear_completed_backend_tasks,
-            retry_backend_task,
-            open_backend_task_tray
+            commands::account::auth_login,
+            commands::account::auth_refresh,
+            commands::account::auth_logout,
+            commands::account::auth_status,
+            commands::account::remote_request,
+            commands::hosting::hosting_upload_archive,
+            commands::hosting::hosting_download_export,
+            commands::hosting_files::hosting_open_export,
+            commands::account::remote_project_open,
+            commands::invitations::auth_accept_invitation
         ]);
+        app = app.setup(|app| {
+            if let Ok(root) = app.path().app_data_dir() {
+                let _ = project_fs::configure_storage_roots(root);
+            }
+            Ok(())
+        });
     }
 
     app.run(tauri::generate_context!())

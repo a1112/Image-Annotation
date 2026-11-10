@@ -1,0 +1,61 @@
+{
+  "kind": "production-web-static-deployment",
+  "recordedAt": "2026-10-27T03:25:32Z",
+  "host": "tencent-175-178-16-90",
+  "unit": "serverall-image-annotation.service",
+  "service": {
+    "pidBefore": 972302,
+    "pidAfter": 1358762,
+    "activeState": "active",
+    "healthUrl": "http://127.0.0.1:16423/health",
+    "healthResponse": {
+      "service": "image-annotation-server",
+      "status": "ok",
+      "version": "0.1.0"
+    }
+  },
+  "binary": {
+    "path": "/home/ubuntu/projects/.deployment/releases/image-annotation/20261026-web-c14883804196/image-annotation-server",
+    "sha256Before": "39dfc9a152ab8268c12bb6f549d1d42b0030a8953a418f2692394f5311f9557b",
+    "sha256After": "39dfc9a152ab8268c12bb6f549d1d42b0030a8953a418f2692394f5311f9557b"
+  },
+  "static": {
+    "source": "dist-web",
+    "target": "/home/ubuntu/projects/.deployment/releases/image-annotation-web-static/20261027T032532Z-11494-6fac444f9b4e",
+    "manifest": "/home/ubuntu/projects/.deployment/releases/image-annotation-web-static/.manifests/20261027T032532Z-11494-6fac444f9b4e.manifest",
+    "manifestSha256": "6fac444f9b4e4fbcb9cffe4349fddfd720e10419893e8ab5291d5bb115448012",
+    "files": {
+      "index.html": "9b3069a423960fb1e28d2834e0f1d61938488b95d36dc1ff1e20df1513e6a33d",
+      "assets/index-BF9fMwgI.js": "d234f3e932128cc6bb790d2994c6fc4e9374fa8e28998543701f176a32da9895",
+      "assets/index-BvC8MhLp.css": "4c5cec2dbffc9426b8c3018ad6dc0456c2fd6d217859187333fb2c901fcf75cb"
+    }
+  },
+  "dropIns": {
+    "protected95": "/etc/systemd/system/serverall-image-annotation.service.d/95-codex-web-accepted-20261027.conf",
+    "protected95Sha256Before": "b45e52cc017ddb6fd58f2dcc64bd4b9599d00cb70c15a0d2dec65b6b9456bb39",
+    "protected95Sha256After": "b45e52cc017ddb6fd58f2dcc64bd4b9599d00cb70c15a0d2dec65b6b9456bb39",
+    "current96": "/etc/systemd/system/serverall-image-annotation.service.d/96-codex-web-static.conf",
+    "current96Content": "[Service]\nEnvironment=WEB_DIST_DIR=/home/ubuntu/projects/.deployment/releases/image-annotation-web-static/20261027T032532Z-11494-6fac444f9b4e",
+    "previous96": "absent; rollback removes current96 and restores protected95",
+    "historyDirectory": "/etc/systemd/system/serverall-image-annotation.service.d/.codex-web-static-history"
+  },
+  "activeTaskGuard": {
+    "tables": ["dataset_jobs", "image_transform_tasks"],
+    "statuses": ["queued", "running", "active", "in_progress"],
+    "beforeRestart": "zero",
+    "recheckedBeforeRestart": "zero",
+    "queryMode": "read-only PostgreSQL"
+  },
+  "rollback": {
+    "command": "ssh tencent-175-178-16-90 'stamp=$(date -u +%Y%m%dT%H%M%SZ)-manual; history=/etc/systemd/system/serverall-image-annotation.service.d/.codex-web-static-history; sudo -n mkdir -p \"$history\"; sudo -n mv /etc/systemd/system/serverall-image-annotation.service.d/96-codex-web-static.conf \"$history/$stamp.rolled-back.conf\"; sudo -n systemctl daemon-reload; sudo -n systemctl restart serverall-image-annotation.service; curl -fsS --max-time 15 http://127.0.0.1:16423/health'",
+    "meaning": "move 96 into the protected history directory, then let the unchanged 95 drop-in select the retained previous static tree",
+    "executed": false,
+    "previousStaticFrom95": "/home/ubuntu/projects/.deployment/releases/image-annotation/20261026-web-c14883804196/web",
+    "oldStaticRetained": true,
+    "databaseChanged": false
+  },
+  "preflightRejectedUpload": {
+    "incoming": "/home/ubuntu/projects/.deployment/releases/image-annotation-web-static/.incoming-20261027T032451Z-10785-6fac444f9b4e",
+    "reason": "AppleDouble metadata was rejected by the manifest check before any drop-in or restart"
+  }
+}

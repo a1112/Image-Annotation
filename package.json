@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev-with-backend.mjs",
-    "build": "tsc && vite build",
+    "build": "tsc && vite build --mode desktop",
+    "build:web": "tsc && vite build --mode web --outDir dist-web --base ./",
     "preview": "vite preview",
     "test": "vitest run && npm run test:chrome",
     "test:watch": "vitest",

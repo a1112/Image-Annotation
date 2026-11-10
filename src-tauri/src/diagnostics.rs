@@ -162,7 +162,9 @@ fn count(connection: &Connection, sql: &str, project_id: &str) -> u64 {
 
 fn optional_text(connection: &Connection, sql: &str, project_id: &str) -> Option<String> {
     connection
-        .query_row(sql, params![project_id], |row| row.get::<_, Option<String>>(0))
+        .query_row(sql, params![project_id], |row| {
+            row.get::<_, Option<String>>(0)
+        })
         .optional()
         .ok()
         .flatten()

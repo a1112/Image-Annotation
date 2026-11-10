@@ -62,8 +62,8 @@ services:
 
   api:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: server/Dockerfile
     restart: unless-stopped
     depends_on:
       postgres:
@@ -76,6 +76,7 @@ services:
       APP_HOST: 0.0.0.0
       APP_PORT: 8080
       SERVER_ADDR: 0.0.0.0:8080
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://127.0.0.1:16423}
       DATABASE_URL: postgres://${POSTGRES_USER:-image_annotation}:${POSTGRES_PASSWORD:-image_annotation_dev}@postgres:5432/${POSTGRES_DB:-image_annotation}
       JWT_SECRET: ${JWT_SECRET:-replace-this-development-secret}
       S3_ENDPOINT: http://minio:9000

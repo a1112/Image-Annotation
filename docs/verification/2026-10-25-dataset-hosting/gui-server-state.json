@@ -1,0 +1,40 @@
+{
+  "checkedAt": "2026-10-25T16:39:43.358198+00:00",
+  "datasetId": "2a63c59a-90e9-4d61-af84-1aceb1f85177",
+  "name": "桌面手机托管验收 2026-10-26",
+  "datasetRevision": 5,
+  "itemCount": 3,
+  "totalBytes": 57490,
+  "versionId": "73ae80e6-844c-4d2d-bdbe-0627a823a091",
+  "versionName": "v1-桌面发布",
+  "manifestHash": "1066b847b5e9109966433740edf2c5f058235d79ed576022569b54efbdcf8e1b",
+  "objectCounts": [
+    {
+      "fileName": "images/train/demo_003.png",
+      "count": 2
+    },
+    {
+      "fileName": "images/train/demo_001.png",
+      "count": 5
+    },
+    {
+      "fileName": "images/train/demo_002.png",
+      "count": 2
+    }
+  ],
+  "memberRoles": [
+    {
+      "userId": "6f3fdc3a-24fa-42f2-9b25-5864b51e06fe",
+      "role": "owner"
+    },
+    {
+      "userId": "b4a4d115-3a11-4e7f-abd0-911c87cdc0e8",
+      "role": "viewer"
+    },
+    {
+      "userId": "2daed63e-2c6e-4bf2-93d1-c34a133826ea",
+      "role": "viewer"
+    }
+  ],
+  "jobs": []
+}

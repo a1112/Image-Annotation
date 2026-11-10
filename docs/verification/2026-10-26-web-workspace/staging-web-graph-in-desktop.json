@@ -1,0 +1,23 @@
+{
+  "passed": true,
+  "remoteProjectId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c",
+  "localProjectId": "data-project-34520935-00e9-4f3c-a331-3ace962e2861",
+  "checks": [
+    {
+      "name": "actual native Rust clone imports both web-created datasets",
+      "passed": true
+    },
+    {
+      "name": "all four web image bytes and saved labels survive native materialization",
+      "passed": true
+    },
+    {
+      "name": "web merge second parents and restore history survive native clone",
+      "passed": true
+    },
+    {
+      "name": "native clone of web graph has a clean worktree",
+      "passed": true
+    }
+  ]
+}

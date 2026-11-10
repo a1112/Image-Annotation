@@ -46,19 +46,21 @@ pub async fn get(
     .bind(image_id)
     .fetch_optional(&state.pool)
     .await?;
-    Ok(Json(row.map(|row| annotation_json(&row)).unwrap_or_else(|| {
-        json!({
-            "id": null,
-            "projectId": project_id,
-            "imageId": image_id,
-            "revision": 0,
-            "schemaVersionId": null,
-            "objects": [],
-            "status": "draft",
-            "updatedBy": null,
-            "updatedAt": null
-        })
-    })))
+    Ok(Json(row.map(|row| annotation_json(&row)).unwrap_or_else(
+        || {
+            json!({
+                "id": null,
+                "projectId": project_id,
+                "imageId": image_id,
+                "revision": 0,
+                "schemaVersionId": null,
+                "objects": [],
+                "status": "draft",
+                "updatedBy": null,
+                "updatedAt": null
+            })
+        },
+    )))
 }
 
 pub async fn put(
@@ -80,31 +82,71 @@ pub async fn put(
     let operation_id = input
         .operation_id
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    if let Some(row) = sqlx::query(
-        "SELECT result_json FROM processed_operations WHERE operation_id = $1 AND project_id = $2",
+    let mut tx = state.pool.begin().await?;
+    let reserved = sqlx::query(
+        "INSERT INTO processed_operations (operation_id, project_id, result_json, state, claimed_at) VALUES ($1, $2, '{}', 'processing', now()) ON CONFLICT(operation_id) DO NOTHING RETURNING operation_id",
     )
     .bind(&operation_id)
     .bind(project_id)
-    .fetch_optional(&state.pool)
-    .await?
-    {
-        return Ok(Json(row.get("result_json")));
+    .fetch_optional(&mut *tx)
+    .await?;
+    if reserved.is_none() {
+        let existing = sqlx::query(
+            "SELECT project_id, state, result_json FROM processed_operations WHERE operation_id = $1",
+        )
+        .bind(&operation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| ApiError::internal_message("operation reservation disappeared"))?;
+        if existing.get::<Uuid, _>("project_id") != project_id {
+            return Err(ApiError::conflict(
+                "OPERATION_ID_REUSED",
+                "operationId belongs to another project",
+                Value::Null,
+            ));
+        }
+        if existing.get::<String, _>("state") == "completed" {
+            let stored: Value = existing.get("result_json");
+            return Ok(Json(stored.get("remotePayload").cloned().unwrap_or(stored)));
+        }
+        return Err(ApiError::conflict(
+            "OPERATION_IN_PROGRESS",
+            "operationId is already being applied",
+            Value::Null,
+        ));
     }
-
-    let mut tx = state.pool.begin().await?;
     let current = sqlx::query(
-        "SELECT id, revision, object_json FROM annotations WHERE project_id = $1 AND image_id = $2 AND deleted_at IS NULL FOR UPDATE",
+        "SELECT id, image_id, revision, object_json, status FROM annotations WHERE project_id = $1 AND image_id = $2 AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(project_id)
     .bind(image_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let current_revision = current.as_ref().map(|row| row.get("revision")).unwrap_or(0_i64);
+    let current_revision = current
+        .as_ref()
+        .map(|row| row.get("revision"))
+        .unwrap_or(0_i64);
     if expected_revision.unwrap_or(0) != current_revision {
         let remote = current
             .as_ref()
-            .map(|row| row.get::<Value, _>("object_json"))
-            .unwrap_or_else(|| json!([]));
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "imageId": row.get::<Uuid, _>("image_id"),
+                    "revision": row.get::<i64, _>("revision"),
+                    "objects": row.get::<Value, _>("object_json"),
+                    "status": row.get::<String, _>("status")
+                })
+            })
+            .unwrap_or_else(|| {
+                json!({
+                    "id": null,
+                    "imageId": image_id,
+                    "revision": 0,
+                    "objects": [],
+                    "status": "draft"
+                })
+            });
         return Err(ApiError::conflict(
             "ANNOTATION_REVISION_CONFLICT",
             "annotation revision has changed",
@@ -193,7 +235,7 @@ pub async fn put(
     )
     .await?;
     sqlx::query(
-        "INSERT INTO processed_operations (operation_id, project_id, result_json) VALUES ($1, $2, $3)",
+        "UPDATE processed_operations SET result_json = $3, state = 'completed', completed_at = now(), processed_at = now() WHERE operation_id = $1 AND project_id = $2",
     )
     .bind(operation_id)
     .bind(project_id)
@@ -247,7 +289,7 @@ pub async fn submit(
     require_project_permission(&state, user.id, project_id, ProjectPermission::Annotate).await?;
     let mut tx = state.pool.begin().await?;
     let row = sqlx::query(
-        "UPDATE annotations SET status = 'submitted', revision = revision + 1, updated_by = $3, updated_at = now() WHERE project_id = $1 AND image_id = $2 AND deleted_at IS NULL RETURNING id, revision",
+        "UPDATE annotations SET status = 'submitted', revision = revision + 1, updated_by = $3, updated_at = now() WHERE project_id = $1 AND image_id = $2 AND deleted_at IS NULL RETURNING id, image_id, revision, object_json, status",
     )
     .bind(project_id)
     .bind(image_id)
@@ -272,7 +314,13 @@ pub async fn submit(
         &annotation_id.to_string(),
         "submit",
         revision,
-        json!({ "imageId": image_id, "status": "submitted" }),
+        json!({
+            "id": annotation_id,
+            "imageId": image_id,
+            "revision": revision,
+            "objects": row.get::<Value, _>("object_json"),
+            "status": row.get::<String, _>("status")
+        }),
     )
     .await?;
     write_audit(
@@ -285,7 +333,13 @@ pub async fn submit(
     )
     .await?;
     tx.commit().await?;
-    Ok(Json(json!({ "imageId": image_id, "revision": revision, "status": "submitted" })))
+    Ok(Json(json!({
+        "id": annotation_id,
+        "imageId": image_id,
+        "revision": revision,
+        "objects": row.get::<Value, _>("object_json"),
+        "status": row.get::<String, _>("status")
+    })))
 }
 
 pub async fn acquire_lease(
@@ -380,7 +434,9 @@ fn validate_objects(objects: &Value) -> Result<(), ApiError> {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| ApiError::bad_request("every annotation object requires a stable id"))?;
         if !ids.insert(id) {
-            return Err(ApiError::bad_request("annotation object IDs must be unique"));
+            return Err(ApiError::bad_request(
+                "annotation object IDs must be unique",
+            ));
         }
     }
     Ok(())

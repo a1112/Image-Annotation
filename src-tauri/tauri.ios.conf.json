@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "iOS": {
+      "developmentTeam": "VKFR723PW9",
+      "infoPlist": "Info.ios.plist",
+      "minimumSystemVersion": "15.0"
+    }
+  }
+}

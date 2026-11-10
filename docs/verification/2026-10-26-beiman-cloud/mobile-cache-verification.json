@@ -1,0 +1,157 @@
+{
+  "schemaVersion": 1,
+  "checkedAt": "2026-10-26T09:06:37Z",
+  "scope": "Read-only simulator cache verification after iPhone annotation and iPad review",
+  "server": "https://175.178.16.90/image-annotation",
+  "remoteProjectId": "d4885d04-1212-4c5c-8753-e5c015a43f32",
+  "serverAudit": {
+    "report": "server-audit-final.json",
+    "passed": true,
+    "sourceImageCount": 6036,
+    "remoteAssetCount": 6036,
+    "remoteAnnotationCount": 6036,
+    "sourceObjectCount": 13960,
+    "remoteObjectCount": 13960,
+    "dimensionMismatches": 0,
+    "contentMismatches": 0,
+    "immutableVersionItemCount": 6036,
+    "immutableManifestHashMatches": true,
+    "sample": {
+      "clientKey": "JPEGImages_120__2__00001",
+      "status": "approved",
+      "revision": 4,
+      "objectCount": 2,
+      "changedOnlySample": true
+    },
+    "collaboration": {
+      "taskId": "6adf50e0-2a65-4976-a7c5-ae168789f6f6",
+      "taskStatus": "unassigned",
+      "taskItemStatus": "approved",
+      "taskItemAssigneeId": "b4a4d115-3a11-4e7f-abd0-911c87cdc0e8",
+      "reviewerId": "2daed63e-2c6e-4bf2-93d1-c34a133826ea",
+      "reviewDecision": "approved",
+      "reviewAnnotationRevision": 3
+    },
+    "sampleOriginalDownloads": {
+      "count": 3,
+      "allMatchSourceBytes": true
+    }
+  },
+  "devices": {
+    "iphoneAnnotator": {
+      "simulatorId": "782FB55D-8079-4478-80AA-7EE3F4571087",
+      "accountId": "b4a4d115-3a11-4e7f-abd0-911c87cdc0e8",
+      "deviceId": "d1814ea6-6779-4bc3-8432-165811c375ea",
+      "projectPath": "/Users/a1-6/Library/Developer/CoreSimulator/Devices/782FB55D-8079-4478-80AA-7EE3F4571087/data/Containers/Data/Application/0BAEF0BE-B35C-441C-9CB5-7256B9507ADA/Library/Application Support/com.imageannotation.desktop/workspaces/default/projects/remote-b6d76d7b2443e0934660e315fce9f53ac5031c80d60949e353b9baa199204ba8",
+      "databasePath": "/Users/a1-6/Library/Developer/CoreSimulator/Devices/782FB55D-8079-4478-80AA-7EE3F4571087/data/Containers/Data/Application/0BAEF0BE-B35C-441C-9CB5-7256B9507ADA/Library/Application Support/com.imageannotation.desktop/workspaces/default/projects/remote-b6d76d7b2443e0934660e315fce9f53ac5031c80d60949e353b9baa199204ba8/project.sqlite",
+      "counts": {
+        "images": 6036,
+        "annotations": 6036,
+        "classes": 4,
+        "assetCacheRows": 12
+      },
+      "sync": {
+        "imageRowsSynced": 6036,
+        "annotationRowsSynced": 6036,
+        "outboxRows": 2,
+        "outboxStatuses": {
+          "synced": 2
+        },
+        "outboxLastErrors": [],
+        "imageSyncErrorRows": 0,
+        "annotationSyncErrorRows": 0
+      },
+      "sample": {
+        "fileName": "JPEGImages/120 (2)_00001.jpg",
+        "imageStatus": "通过",
+        "qaStatus": "通过",
+        "annotationRevision": "server-4",
+        "serverRevision": 4,
+        "syncStatus": "synced",
+        "dirty": 0,
+        "firstBBox": {
+          "x": 285.1,
+          "y": 2.0,
+          "width": 50.0,
+          "height": 542.0
+        },
+        "secondBBox": {
+          "x": 280.0,
+          "y": 545.0,
+          "width": 56.0,
+          "height": 471.0
+        },
+        "cachedOriginal": {
+          "bytes": 109620,
+          "sha256": "9c67b0ddf0b25ea243dc4a2f0d1c7098eea89f0470ea3eef7343d7cf184d2cdc",
+          "matchesDeclaredHash": true,
+          "path": "/Users/a1-6/Library/Developer/CoreSimulator/Devices/782FB55D-8079-4478-80AA-7EE3F4571087/data/Containers/Data/Application/0BAEF0BE-B35C-441C-9CB5-7256B9507ADA/Library/Application Support/com.imageannotation.desktop/workspaces/default/projects/remote-b6d76d7b2443e0934660e315fce9f53ac5031c80d60949e353b9baa199204ba8/cache/assets/9c/9c67b0ddf0b25ea243dc4a2f0d1c7098eea89f0470ea3eef7343d7cf184d2cdc.jpg"
+        }
+      }
+    },
+    "ipadReviewer": {
+      "simulatorId": "5927DF91-C3B3-44B6-A110-1A5EBD05B064",
+      "accountId": "2daed63e-2c6e-4bf2-93d1-c34a133826ea",
+      "deviceId": "4e8b9843-5618-440d-98dd-590730d558fd",
+      "projectPath": "/Users/a1-6/Library/Developer/CoreSimulator/Devices/5927DF91-C3B3-44B6-A110-1A5EBD05B064/data/Containers/Data/Application/9C125BCD-6178-4D5B-B8DF-22FCD14F5595/Library/Application Support/com.imageannotation.desktop/workspaces/default/projects/remote-9917c59868a301a0d1578ea64cce0c49dccabfab4baa5f2faba6cabac9cd3f68",
+      "databasePath": "/Users/a1-6/Library/Developer/CoreSimulator/Devices/5927DF91-C3B3-44B6-A110-1A5EBD05B064/data/Containers/Data/Application/9C125BCD-6178-4D5B-B8DF-22FCD14F5595/Library/Application Support/com.imageannotation.desktop/workspaces/default/projects/remote-9917c59868a301a0d1578ea64cce0c49dccabfab4baa5f2faba6cabac9cd3f68/project.sqlite",
+      "counts": {
+        "images": 6036,
+        "annotations": 6036,
+        "classes": 4,
+        "assetCacheRows": 12
+      },
+      "sync": {
+        "imageRowsSynced": 6035,
+        "annotationRowsSynced": 6036,
+        "outboxRows": 1,
+        "outboxStatuses": {
+          "synced": 1
+        },
+        "outboxLastErrors": [],
+        "imagePendingOrDirtyRows": 1,
+        "imageSyncErrorRows": 0,
+        "annotationSyncErrorRows": 0
+      },
+      "sample": {
+        "fileName": "JPEGImages/120 (2)_00001.jpg",
+        "imageStatus": "通过",
+        "qaStatus": "通过",
+        "annotationRevision": "server-4",
+        "serverRevision": 4,
+        "syncStatus": "pending",
+        "dirty": 1,
+        "firstBBox": {
+          "x": 285.1,
+          "y": 2.0,
+          "width": 50.0,
+          "height": 542.0
+        },
+        "secondBBox": {
+          "x": 280.0,
+          "y": 545.0,
+          "width": 56.0,
+          "height": 471.0
+        },
+        "cachedOriginal": {
+          "bytes": 109620,
+          "sha256": "9c67b0ddf0b25ea243dc4a2f0d1c7098eea89f0470ea3eef7343d7cf184d2cdc",
+          "matchesDeclaredHash": true,
+          "path": "/Users/a1-6/Library/Developer/CoreSimulator/Devices/5927DF91-C3B3-44B6-A110-1A5EBD05B064/data/Containers/Data/Application/9C125BCD-6178-4D5B-B8DF-22FCD14F5595/Library/Application Support/com.imageannotation.desktop/workspaces/default/projects/remote-9917c59868a301a0d1578ea64cce0c49dccabfab4baa5f2faba6cabac9cd3f68/cache/assets/9c/9c67b0ddf0b25ea243dc4a2f0d1c7098eea89f0470ea3eef7343d7cf184d2cdc.jpg"
+        }
+      }
+    }
+  },
+  "notes": [
+    "The server task row remains unassigned while its sample task item is approved; the task item and QA review are the authoritative collaboration result in this audit.",
+    "The iPad review outbox row is synced and has no error, but the local sample image row remains pending/dirty after the transient offline indicator; this is retained as a follow-up sync-state observation.",
+    "No credentials, bearer tokens, ticket URLs, or private annotation payloads are included."
+  ],
+  "readOnly": true,
+  "databaseWrites": false,
+  "simulatorApiCalls": false,
+  "auditApiReads": true,
+  "cloudWrites": [
+    "final audit authentication device session only"
+  ]
+}

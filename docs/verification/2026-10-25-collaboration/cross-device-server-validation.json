@@ -1,0 +1,49 @@
+{
+  "checkedAt": "2026-10-25T10:51:13Z",
+  "baseUrl": "https://175.178.16.90/image-annotation",
+  "projectId": "d2355506-c746-4bfe-b144-0ddd25f7e142",
+  "taskId": "5419a070-941d-4ddd-bf5a-4d7ad2e6dc0f",
+  "image": {
+    "id": "d536b812-c5bf-4ed4-aa5c-64e9e46d3eb6",
+    "clientKey": "images_train_demo_001",
+    "status": "approved",
+    "revision": 5
+  },
+  "annotation": {
+    "id": "33d83d73-2ace-4803-8a95-9ff900b46ec7",
+    "status": "approved",
+    "revision": 6,
+    "objectCount": 5,
+    "objectIds": [
+      "ann-0",
+      "ann-1",
+      "ann-1792913194363-1",
+      "ann-1792921077301-1",
+      "ann-1792924427931-1"
+    ]
+  },
+  "qaReviews": [
+    {
+      "id": "0d621e72-119a-4a17-80e2-46756539e53d",
+      "imageId": "d536b812-c5bf-4ed4-aa5c-64e9e46d3eb6",
+      "annotationRevision": 5,
+      "decision": "approved",
+      "note": "",
+      "reviewerId": "2daed63e-2c6e-4bf2-93d1-c34a133826ea",
+      "operationId": "op-e0382591-ad9e-46c7-b162-2cce62864115",
+      "createdAt": "2026-10-25T10:45:00.690502Z"
+    }
+  ],
+  "taskItem": {
+    "id": "f87fcfd0-f4be-4a3e-9da0-37b2c2e5819f",
+    "taskId": "5419a070-941d-4ddd-bf5a-4d7ad2e6dc0f",
+    "imageId": "d536b812-c5bf-4ed4-aa5c-64e9e46d3eb6",
+    "status": "approved",
+    "revision": 3,
+    "assigneeId": "b4a4d115-3a11-4e7f-abd0-911c87cdc0e8",
+    "claimedAt": "2026-10-25T08:13:01.354823Z",
+    "updatedAt": "2026-10-25T10:45:00.690502Z"
+  },
+  "bootstrapCursor": "141",
+  "passed": true
+}

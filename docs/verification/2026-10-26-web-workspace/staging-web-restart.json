@@ -1,0 +1,74 @@
+{
+  "schema": "web-workspace-verification/v1",
+  "baseUrl": "http://127.0.0.1:26445",
+  "passed": true,
+  "checks": [
+    {
+      "name": "post-restart project working tree is readable and clean",
+      "passed": true
+    },
+    {
+      "name": "post-restart graph retains the saved restore commit",
+      "passed": true
+    },
+    {
+      "name": "post-restart image b0756bca-200d-4b87-9c5e-39ad8a722b92 bytes and label resume",
+      "passed": true
+    },
+    {
+      "name": "post-restart image 3bd26a2f-0172-4fd5-bb9e-714aaecb46ba bytes and label resume",
+      "passed": true
+    },
+    {
+      "name": "post-restart image 124ea67d-f12c-4842-abba-12313362d49f bytes and label resume",
+      "passed": true
+    },
+    {
+      "name": "post-restart image 331da228-2f9a-4781-9477-85d5312f5d32 bytes and label resume",
+      "passed": true
+    },
+    {
+      "name": "post-restart report verifies all image fixtures",
+      "passed": true
+    },
+    {
+      "name": "expired/logged-out web cookie receives 401",
+      "passed": true,
+      "status": 401
+    }
+  ],
+  "projectId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c",
+  "resumeInput": {
+    "projectId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c"
+  },
+  "resumeAfterRestart": {
+    "projectId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c",
+    "verifiedImages": [
+      {
+        "datasetId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c::52e7a9e0-9275-4601-a66d-b9d51c351e7c",
+        "imageId": "b0756bca-200d-4b87-9c5e-39ad8a722b92",
+        "sha256": "203046ca8967fd27df2423eb712d456ff71c085250d0730ebe6b4d3197f1d0d5",
+        "route": "web-content"
+      },
+      {
+        "datasetId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c::52e7a9e0-9275-4601-a66d-b9d51c351e7c",
+        "imageId": "3bd26a2f-0172-4fd5-bb9e-714aaecb46ba",
+        "sha256": "e4aafee7890e50adad54b513675eda93bc771f56eb111c9baf047541dffc5048",
+        "route": "web-content"
+      },
+      {
+        "datasetId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c::1983bb86-35a7-4984-8232-61f6a500dcbb",
+        "imageId": "124ea67d-f12c-4842-abba-12313362d49f",
+        "sha256": "4c4b980bea58bdb7cc0f99d559a889db96f56592d9092580ab8b358fadf9c2c1",
+        "route": "web-content"
+      },
+      {
+        "datasetId": "e0f96fc3-4ea3-49bb-bfaf-0da9816a9d7c::1983bb86-35a7-4984-8232-61f6a500dcbb",
+        "imageId": "331da228-2f9a-4781-9477-85d5312f5d32",
+        "sha256": "f8b09c442b6a7a09efe1ed48e0b5d427e62053516587b4dbb826b30c6af01485",
+        "route": "web-content"
+      }
+    ],
+    "headCommitId": "7501bc78-70e5-4f41-9ac5-05b6c181c574"
+  }
+}

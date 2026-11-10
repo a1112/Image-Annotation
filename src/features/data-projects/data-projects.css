@@ -1,0 +1,2621 @@
+.data-projects-page {
+  padding: 22px 24px 42px;
+}
+
+.data-projects-history-row > .data-projects-version-detail {
+  grid-column: 1 / -1;
+  min-width: 0;
+  font-size: 12px;
+  color: #475569;
+}
+
+.data-projects-version-detail summary {
+  cursor: pointer;
+  padding: 6px 0;
+}
+
+.data-projects-version-files {
+  display: grid;
+  gap: 8px;
+  max-height: 280px;
+  overflow: auto;
+}
+
+.data-projects-version-files > div {
+  display: flex;
+  gap: 6px 14px;
+  flex-wrap: wrap;
+  padding: 8px;
+  background: #f8fafc;
+  overflow-wrap: anywhere;
+}
+
+.data-projects-heading {
+  align-items: flex-start;
+}
+
+.data-projects-heading h1 {
+  font-size: 25px;
+}
+
+.data-projects-heading p {
+  max-width: 760px;
+  line-height: 1.55;
+}
+
+.data-projects-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.data-projects-actions button {
+  white-space: nowrap;
+}
+
+.data-projects-create {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  margin: 0 0 16px;
+  padding: 14px;
+  border: 1px solid #bfdbfe;
+  border-radius: 9px;
+  background: #f8fbff;
+}
+
+.data-projects-create label {
+  display: grid;
+  gap: 5px;
+  min-width: 240px;
+  flex: 1;
+}
+
+.data-projects-create label span {
+  color: #475569;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.data-projects-create input,
+.data-projects-commit-box input {
+  min-width: 0;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #1f2937;
+}
+
+.data-projects-create > div:last-child,
+.data-projects-commit-box {
+  display: flex;
+  gap: 7px;
+}
+
+.data-projects-create button,
+.data-projects-commit-box button,
+.data-projects-unassigned-row button,
+.data-projects-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 0 10px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.data-projects-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 9px 12px;
+  border: 1px solid #fecaca;
+  border-radius: 7px;
+  background: #fff7f7;
+  color: #b42318;
+  font-size: 13px;
+}
+
+.data-projects-error button {
+  display: inline-flex;
+  border: 0;
+  background: transparent;
+  color: inherit;
+}
+
+.data-projects-layout {
+  display: grid;
+  grid-template-columns: 245px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.data-projects-list,
+.data-projects-detail,
+.data-projects-section {
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+.data-projects-list {
+  position: sticky;
+  top: 0;
+  overflow: hidden;
+}
+
+.data-projects-list-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 14px 10px;
+  border-bottom: 1px solid #eef2f7;
+}
+
+.data-projects-list-heading span,
+.data-projects-section-title > strong {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.data-project-row {
+  display: flex;
+  width: 100%;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 7px;
+  padding: 12px 13px;
+  border: 0;
+  border-bottom: 1px solid #f1f5f9;
+  border-radius: 0;
+  background: #ffffff;
+  text-align: left;
+}
+
+.data-project-row:hover,
+.data-project-row.active {
+  background: #f3f7ff;
+}
+
+.data-project-row.active {
+  box-shadow: inset 3px 0 0 #1769e0;
+}
+
+.data-project-row > span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.data-project-row strong,
+.data-project-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-project-row strong {
+  color: #1e293b;
+  font-size: 13px;
+}
+
+.data-project-row small,
+.data-project-row em {
+  color: #64748b;
+  font-size: 11px;
+  font-style: normal;
+}
+
+.data-project-row em {
+  flex: none;
+}
+
+.data-projects-list-empty,
+.data-projects-empty,
+.data-projects-section-empty {
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.data-projects-list-empty {
+  padding: 15px;
+}
+
+.data-projects-detail {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border: 0;
+  background: transparent;
+}
+
+.data-projects-detail-title {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.data-projects-detail-title h2 {
+  margin: 0;
+  color: #111827;
+  font-size: 21px;
+}
+
+.data-projects-detail-title p {
+  margin: 5px 0 0;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.data-projects-project-settings {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.data-projects-project-settings > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 7px 10px;
+  cursor: pointer;
+  list-style: none;
+  color: #334155;
+  font-size: 12px;
+  user-select: none;
+}
+
+.data-projects-project-settings > summary::-webkit-details-marker,
+.data-projects-disclosure-summary::-webkit-details-marker {
+  display: none;
+}
+
+.data-projects-project-settings > summary::after {
+  margin-left: auto;
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-right: 1px solid #64748b;
+  border-bottom: 1px solid #64748b;
+  transform: rotate(45deg) translateY(-2px);
+  transition: transform 120ms ease;
+}
+
+.data-projects-project-settings[open] > summary::after {
+  transform: rotate(225deg) translate(-1px, -1px);
+}
+
+.data-projects-project-settings > summary > span {
+  flex: none;
+  font-weight: 650;
+}
+
+.data-projects-project-settings > summary > small {
+  min-width: 0;
+  overflow: hidden;
+  color: #64748b;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-projects-project-settings-body {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 10px 10px;
+  border-top: 1px solid #eef2f7;
+}
+
+.data-projects-project-settings-body p {
+  min-width: 0;
+  margin: 0;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.data-projects-project-settings-body button,
+.data-projects-version-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 29px;
+  padding: 0 9px;
+  border: 1px solid #cbd7e4;
+  border-radius: 6px;
+  background: #fff;
+  color: #1769e0;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.data-projects-detail-actions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.data-projects-detail-actions > button {
+  min-height: 29px;
+  padding: 0 9px;
+  border: 1px solid #cbd7e4;
+  border-radius: 6px;
+  background: #fff;
+  color: #1769e0;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.data-projects-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px;
+  border: 1px solid #dbeafe;
+  border-radius: 5px;
+  background: #eff6ff;
+  color: #2563eb;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.data-projects-status-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(90px, 1fr));
+  gap: 8px;
+}
+
+.data-projects-status-card {
+  display: grid;
+  gap: 7px;
+  min-height: 74px;
+  padding: 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.data-projects-status-card span {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.data-projects-assign {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  width: calc(100% - 20px);
+  min-height: 32px;
+  margin: 0 10px 10px;
+  border-color: #bfdbfe;
+  border-radius: 6px;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 11px;
+}
+
+.data-projects-assign:hover {
+  border-color: #93c5fd;
+  background: #dbeafe;
+}
+
+.data-projects-assign-hint {
+  display: block;
+  margin: -2px 10px 10px;
+  color: #64748b;
+  font-size: 11px;
+  text-align: center;
+}
+
+.data-projects-status-card strong {
+  color: #1e293b;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.data-projects-status-card.raw { border-top: 3px solid #94a3b8; }
+.data-projects-status-card.in-progress { border-top: 3px solid #3b82f6; }
+.data-projects-status-card.pending { border-top: 3px solid #f59e0b; }
+.data-projects-status-card.approved { border-top: 3px solid #16a34a; }
+.data-projects-status-card.rejected { border-top: 3px solid #dc2626; }
+.data-projects-status-card.total { border-top: 3px solid #334155; background: #f8fafc; }
+
+.data-projects-status-inline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  min-height: 34px;
+  padding: 6px 2px;
+  border-top: 1px solid #eef2f7;
+  border-bottom: 1px solid #eef2f7;
+}
+
+.data-projects-status-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  color: #64748b;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.data-projects-status-item strong {
+  color: #334155;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.data-projects-status-item.raw strong { color: #64748b; }
+.data-projects-status-item.in-progress strong { color: #2563eb; }
+.data-projects-status-item.pending strong { color: #b45309; }
+.data-projects-status-item.approved strong { color: #15803d; }
+.data-projects-status-item.rejected strong { color: #b91c1c; }
+.data-projects-status-item.total {
+  padding-left: 12px;
+  border-left: 1px solid #e2e8f0;
+  color: #475569;
+}
+.data-projects-status-item.total strong { color: #1e293b; }
+
+.data-projects-section {
+  overflow: hidden;
+}
+
+.data-projects-collapsible-section > summary {
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.data-projects-collapsible-section > summary:focus-visible,
+.data-projects-project-settings > summary:focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: -2px;
+}
+
+.data-projects-disclosure-summary {
+  min-height: 55px;
+}
+
+.data-projects-summary-meta {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  gap: 8px;
+  margin-top: 0;
+  color: #64748b;
+}
+
+.data-projects-section-title > .data-projects-summary-meta {
+  display: inline-flex;
+  margin-top: 0;
+}
+
+.data-projects-summary-meta svg {
+  transition: transform 120ms ease;
+}
+
+.data-projects-collapsible-section[open] > .data-projects-disclosure-summary .data-projects-summary-meta svg {
+  transform: rotate(180deg);
+}
+
+.data-projects-collapsible-content,
+.data-projects-history-body {
+  min-width: 0;
+}
+
+.data-projects-version-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 10px 14px 0;
+}
+
+.data-projects-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid #eef2f7;
+}
+
+.data-projects-section-title h3 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: #1e293b;
+  font-size: 14px;
+}
+
+.data-projects-section-title span {
+  display: block;
+  margin-top: 4px;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.data-projects-section-empty {
+  padding: 18px 16px;
+}
+
+.data-projects-page .data-projects-dataset-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
+  padding: 14px;
+}
+
+.data-projects-dataset-item {
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  min-width: 0;
+}
+
+.data-projects-dataset-item .dataset-card {
+  flex: 1;
+  min-width: 0;
+  height: auto;
+}
+
+.data-projects-page .card-footer,
+.data-projects-page .card-footer > div {
+  flex-wrap: wrap;
+}
+
+.data-projects-section-title > strong {
+  white-space: nowrap;
+}
+
+.data-projects-remove {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  border-color: #fecaca;
+  background: rgba(255, 255, 255, 0.93);
+  color: #b42318;
+  font-size: 11px;
+}
+
+.data-projects-unassigned {
+  display: grid;
+}
+
+.data-projects-unassigned-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.data-projects-unassigned-row:last-child {
+  border-bottom: 0;
+}
+
+.data-projects-unassigned-row > span {
+  display: grid;
+  grid-template-columns: auto minmax(0, max-content);
+  align-items: center;
+  gap: 4px 7px;
+  min-width: 0;
+}
+
+.data-projects-unassigned-row > span > svg {
+  grid-row: span 2;
+  color: #64748b;
+}
+
+.data-projects-unassigned-row strong,
+.data-projects-unassigned-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-projects-unassigned-row strong {
+  color: #334155;
+  font-size: 13px;
+}
+
+.data-projects-unassigned-row small {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.data-projects-commit-box {
+  padding: 12px 14px 0;
+}
+
+.data-projects-commit-box input {
+  flex: 1;
+}
+
+.data-projects-changes {
+  display: grid;
+  gap: 0;
+  margin: 12px 14px 14px;
+  border: 1px solid #eef2f7;
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.data-projects-change {
+  display: grid;
+  grid-template-columns: 115px minmax(0, 1fr) minmax(0, 1.5fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 7px 10px;
+  border-bottom: 1px solid #f1f5f9;
+  color: #475569;
+  font-size: 12px;
+}
+
+.data-projects-change:last-child {
+  border-bottom: 0;
+}
+
+.data-projects-change-kind {
+  color: #2563eb;
+  font-weight: 600;
+}
+
+.data-projects-change small {
+  overflow: hidden;
+  color: #64748b;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-projects-history {
+  display: grid;
+}
+
+.data-projects-history-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 11px 16px;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.data-projects-history-row > svg {
+  color: #2563eb;
+}
+
+.data-projects-history-row > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.data-projects-history-row strong {
+  overflow: hidden;
+  color: #334155;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-projects-history-row small {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.data-projects-history-row code {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.data-projects-empty {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  padding: 42px 24px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+.data-projects-empty h2,
+.data-projects-empty p {
+  margin: 0;
+}
+
+.data-projects-empty h2 {
+  color: #1e293b;
+  font-size: 17px;
+}
+
+.data-projects-empty p {
+  max-width: 620px;
+}
+
+@media (max-width: 1120px) {
+  .data-projects-layout {
+    grid-template-columns: 205px minmax(0, 1fr);
+  }
+
+  .data-projects-status-grid {
+    grid-template-columns: repeat(3, minmax(100px, 1fr));
+  }
+}
+
+@media (max-width: 860px) {
+  .data-projects-page {
+    padding: 16px;
+  }
+
+  .data-projects-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .data-projects-list {
+    position: static;
+  }
+
+  .data-projects-list-heading {
+    padding-bottom: 8px;
+  }
+
+  .data-project-row {
+    display: inline-flex;
+    width: auto;
+    min-width: 180px;
+    border: 1px solid #eef2f7;
+    border-radius: 6px;
+    margin: 8px 0 8px 8px;
+  }
+
+  .data-projects-list {
+    white-space: nowrap;
+    overflow-x: auto;
+  }
+
+  .data-projects-list-empty {
+    white-space: normal;
+  }
+
+  .data-projects-create {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .data-projects-create > div:last-child {
+    justify-content: flex-end;
+  }
+}
+
+@media (max-width: 620px) {
+  .data-projects-page .data-projects-create label {
+    min-width: 0;
+  }
+  .data-projects-status-grid {
+    grid-template-columns: repeat(2, minmax(100px, 1fr));
+  }
+
+  .data-projects-detail-title {
+    display: grid;
+  }
+
+  .data-projects-project-settings-body {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .data-projects-change {
+    grid-template-columns: 1fr;
+    gap: 3px;
+  }
+
+  .data-projects-commit-box {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+
+/* Scoped project dataset grouping board. Pointer handlers are intentionally
+ * used by the component instead of native drag/drop so Tauri never receives
+ * an OS file-drop event while a dataset is being reorganised. */
+.data-projects-groups-board {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid #e2e8f0;
+  border-radius: 9px;
+  background: #fff;
+}
+
+.data-projects-groups-toolbar,
+.data-projects-groups-actions,
+.data-projects-group-column-heading,
+.data-projects-group-header,
+.data-projects-group-footer,
+.data-projects-group-member,
+.data-projects-group-move-menu {
+  display: flex;
+  align-items: center;
+}
+
+.data-projects-groups-toolbar {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.data-projects-groups-toolbar h3 {
+  margin: 0;
+  color: #1e293b;
+  font-size: 14px;
+}
+
+.data-projects-groups-toolbar p {
+  margin: 4px 0 0;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.data-projects-groups-actions {
+  flex: none;
+  gap: 6px;
+}
+
+.data-projects-groups-actions button,
+.data-projects-group-dataset-actions button,
+.data-projects-group-footer button,
+.data-projects-group-list-empty button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid #cbd7e4;
+  border-radius: 6px;
+  background: #fff;
+  color: #1769e0;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.data-projects-groups-actions button:disabled,
+.data-projects-group-dataset-actions button:disabled,
+.data-projects-group-footer button:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+.data-projects-group-columns {
+  display: grid;
+  grid-template-columns: minmax(220px, .8fr) minmax(320px, 1.2fr);
+  gap: 10px;
+  min-width: 0;
+}
+
+.data-projects-group-column,
+.data-projects-group-card,
+.data-projects-group-list-empty {
+  min-width: 0;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.data-projects-group-column-heading {
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 10px;
+  border-bottom: 1px solid #e2e8f0;
+  color: #334155;
+  font-size: 12px;
+}
+
+.data-projects-group-column-heading span,
+.data-projects-group-header > span {
+  color: #64748b;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.data-projects-group-dataset {
+  display: grid;
+  gap: 4px;
+  margin: 8px;
+  cursor: grab;
+}
+
+.data-projects-group-dataset:active,
+.data-projects-group-card.is-dragging,
+.data-projects-group-dataset.is-dragging {
+  cursor: grabbing;
+  opacity: .62;
+}
+
+.data-projects-group-dataset .dataset-card--compact {
+  background: #fff;
+}
+
+.data-projects-group-dataset-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.data-projects-group-dataset-actions button {
+  min-height: 25px;
+  padding-inline: 7px;
+  border-color: transparent;
+  background: transparent;
+}
+
+.data-projects-group-empty {
+  margin: 10px;
+  padding: 14px 10px;
+  color: #64748b;
+  font-size: 11px;
+  text-align: center;
+}
+
+.data-projects-group-list {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.data-projects-group-card {
+  overflow: hidden;
+  cursor: grab;
+}
+
+.data-projects-groups-board.is-readonly .data-projects-group-card,
+.data-projects-groups-board.is-readonly .data-projects-group-dataset {
+  cursor: default;
+}
+
+.data-projects-group-header {
+  gap: 6px;
+  min-width: 0;
+  padding: 9px 10px;
+  border-bottom: 1px solid #e2e8f0;
+  background: #fff;
+}
+
+.data-projects-group-header > svg {
+  flex: none;
+  color: #94a3b8;
+}
+
+.data-projects-group-header strong,
+.data-projects-group-header input {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: #1e293b;
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-projects-group-header input {
+  height: 27px;
+  padding: 0 6px;
+  border: 1px solid #93c5fd;
+  border-radius: 5px;
+  background: #fff;
+  font-weight: 500;
+}
+
+.data-projects-group-header > button {
+  display: inline-flex;
+  flex: none;
+  min-height: 25px;
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: #64748b;
+}
+
+.data-projects-group-members {
+  display: grid;
+  gap: 5px;
+  min-height: 40px;
+  padding: 8px;
+  background: #f8fafc;
+}
+
+.data-projects-group-member {
+  gap: 6px;
+  min-width: 0;
+  min-height: 30px;
+  padding: 4px 6px;
+  border: 1px solid #e2e8f0;
+  border-radius: 5px;
+  background: #fff;
+  color: #64748b;
+  font-size: 10px;
+}
+
+.data-projects-group-member-grip {
+  display: inline-flex;
+  flex: none;
+  color: #94a3b8;
+}
+
+.data-projects-group-member-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: #334155;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-projects-group-member button {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+  min-height: 24px;
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: #b42318;
+  font-size: 10px;
+}
+
+.data-projects-group-footer {
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 8px;
+  border-top: 1px solid #e2e8f0;
+  background: #fff;
+}
+
+.data-projects-group-move-menu {
+  gap: 4px;
+  min-width: 0;
+  color: #64748b;
+  font-size: 10px;
+}
+
+.data-projects-group-move-menu select {
+  min-width: 0;
+  max-width: 130px;
+  height: 27px;
+  padding: 0 4px;
+  border: 1px solid #cbd7e4;
+  border-radius: 5px;
+  background: #fff;
+  color: #334155;
+  font-size: 10px;
+}
+
+.data-projects-group-list-empty {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: 24px 12px;
+  color: #64748b;
+  font-size: 12px;
+  text-align: center;
+}
+
+.data-projects-group-list-empty p {
+  margin: 0;
+}
+
+@media (max-width: 780px) {
+  .data-projects-group-columns {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 480px) {
+  .data-projects-groups-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .data-projects-groups-actions {
+    width: 100%;
+  }
+
+  .data-projects-groups-actions button {
+    flex: 1;
+  }
+}
+
+/* Controlled Web/native project shell.  The route selects one section so
+ * advanced version and collaboration requests do not load on the data home. */
+.data-projects-overview-page,
+.data-projects-workspace-page {
+  display: grid;
+  gap: 16px;
+}
+
+.data-projects-kicker {
+  color: #1769e0;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .12em;
+}
+
+.data-projects-overview-header,
+.data-projects-workspace-topbar,
+.data-projects-workspace-heading,
+.data-projects-overview-section-heading,
+.data-projects-cloud-status-heading,
+.data-projects-settings-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.data-projects-overview-header h1,
+.data-projects-workspace-topbar h1,
+.data-projects-workspace-heading h2 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 2px 0 0;
+  color: #111827;
+}
+
+.data-projects-overview-header h1,
+.data-projects-workspace-topbar h1 {
+  font-size: 24px;
+}
+
+.data-projects-overview-header p,
+.data-projects-workspace-heading p {
+  margin: 4px 0 0;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.data-projects-overview-actions,
+.data-projects-workspace-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.data-projects-overview-actions button,
+.data-projects-workspace-actions button,
+.data-projects-overview-section-heading > button,
+.data-projects-workspace-topbar > button,
+.data-projects-settings-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 31px;
+  padding: 0 10px;
+  border: 1px solid #cbd7e4;
+  border-radius: 6px;
+  background: #fff;
+  color: #1769e0;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.data-projects-overview-actions button.primary,
+.data-projects-workspace-actions button.primary,
+.data-projects-settings-actions button.primary {
+  border-color: #1769e0;
+  background: #1769e0;
+  color: #fff;
+}
+
+.data-projects-create {
+  flex-wrap: wrap;
+}
+
+.data-projects-overview-section {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid #e2e8f0;
+  border-radius: 9px;
+  background: #fff;
+}
+
+.data-projects-overview-section-heading h2 {
+  margin: 0;
+  color: #1e293b;
+  font-size: 15px;
+}
+
+.data-projects-overview-section-heading span {
+  display: block;
+  margin-top: 3px;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.data-projects-project-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px;
+}
+
+.data-projects-project-card {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 13px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+  cursor: pointer;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.data-projects-project-card:hover,
+.data-projects-project-card:focus-visible {
+  border-color: #93b4e8;
+  box-shadow: 0 2px 8px rgba(23, 105, 224, .1);
+  outline: none;
+}
+
+.data-projects-project-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.data-projects-project-card h3 {
+  overflow: hidden;
+  margin: 0;
+  color: #1e293b;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-projects-project-card p {
+  margin: 4px 0 0;
+  overflow: hidden;
+  color: #64748b;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-projects-project-card-heading > span,
+.data-projects-project-card-meta {
+  color: #64748b;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.data-projects-project-card-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.data-projects-project-filters {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.data-projects-project-filters label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 150px;
+  height: 29px;
+  padding: 0 7px;
+  border: 1px solid #cbd7e4;
+  border-radius: 5px;
+  background: #fff;
+  color: #64748b;
+}
+
+.data-projects-project-filters input,
+.data-projects-project-filters select {
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #334155;
+  font-size: 11px;
+}
+
+.data-projects-project-filters input {
+  width: 100%;
+}
+
+.data-projects-project-filters select {
+  height: 29px;
+  padding: 0 5px;
+  border: 1px solid #cbd7e4;
+  border-radius: 5px;
+}
+
+.data-projects-project-card > button {
+  min-height: 30px;
+  border-color: #1769e0;
+  border-radius: 6px;
+  background: #1769e0;
+  color: #fff;
+  font-size: 11px;
+}
+
+.data-projects-overview-empty {
+  padding: 16px 10px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.data-projects-dataset-drawer {
+  position: fixed;
+  z-index: 50;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(520px, 100vw);
+  padding: 18px;
+  overflow: auto;
+  border-left: 1px solid #dbe3ee;
+  background: #fff;
+  box-shadow: -12px 0 32px rgba(15, 23, 42, .16);
+}
+
+.data-projects-dataset-drawer-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #eef2f7;
+}
+
+.data-projects-dataset-drawer-header > div {
+  display: grid;
+  gap: 3px;
+}
+
+.data-projects-dataset-drawer-header strong {
+  color: #1e293b;
+  font-size: 15px;
+}
+
+.data-projects-dataset-drawer-header span {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.data-projects-dataset-drawer-header > button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 29px;
+  height: 29px;
+  border: 1px solid #cbd7e4;
+  border-radius: 5px;
+  background: #fff;
+  color: #475569;
+}
+
+.data-projects-drawer-list {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  padding-top: 12px;
+}
+
+.data-projects-drawer-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.data-projects-drawer-item > button {
+  min-height: 29px;
+  padding: 0 9px;
+  border: 1px solid #1769e0;
+  border-radius: 5px;
+  background: #1769e0;
+  color: #fff;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.data-projects-drawer-empty {
+  align-self: start;
+  padding: 18px 4px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.data-projects-unassigned-compact-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+  gap: 8px;
+}
+
+.data-projects-workspace-topbar {
+  align-items: flex-end;
+  flex-wrap: wrap;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.data-projects-workspace-topbar > button {
+  margin-right: 0;
+}
+
+.data-projects-workspace-topbar > div {
+  flex: 1;
+  min-width: 0;
+}
+
+.data-projects-workspace-topbar h1 {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 21px;
+}
+
+.data-projects-workspace-topbar nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  align-items: center;
+}
+
+.data-projects-workspace-topbar nav button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 30px;
+  padding: 0 8px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.data-projects-workspace-topbar nav button.active {
+  border-bottom-color: #1769e0;
+  color: #1769e0;
+  font-weight: 650;
+}
+
+.data-projects-workspace-id {
+  margin-right: 4px;
+  color: #64748b;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.data-projects-workspace-section {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.data-projects-data-section > .data-projects-section,
+.data-projects-version-panel,
+.data-projects-cloud-status-panel,
+.data-projects-settings-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 9px;
+  background: #fff;
+}
+
+.data-projects-light-dataset-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+  gap: 8px;
+  padding: 12px;
+}
+
+.data-projects-light-dataset-grid .dataset-card--compact {
+  height: auto;
+}
+
+.data-projects-version-panel,
+.data-projects-cloud-status-panel,
+.data-projects-settings-card {
+  overflow: hidden;
+}
+
+.data-projects-version-panel > .data-projects-section-title,
+.data-projects-cloud-status-panel > .data-projects-section-title {
+  padding: 11px 14px;
+}
+
+.data-projects-versions-section .data-projects-commit-box {
+  padding: 12px 14px 0;
+}
+
+.data-projects-versions-section .data-projects-changes {
+  margin-bottom: 12px;
+}
+
+.data-projects-merge-controls,
+.data-projects-merge-preview,
+.data-projects-branch-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 11px 14px;
+}
+
+.data-projects-merge-controls label,
+.data-projects-branch-toolbar label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.data-projects-merge-controls select,
+.data-projects-branch-toolbar select,
+.data-projects-branch-toolbar input,
+.data-projects-merge-preview > input {
+  min-height: 30px;
+  min-width: 0;
+  padding: 0 7px;
+  border: 1px solid #cbd7e4;
+  border-radius: 5px;
+  background: #fff;
+  color: #334155;
+  font-size: 11px;
+}
+
+.data-projects-branch-toolbar input {
+  width: 150px;
+}
+
+.data-projects-merge-controls button,
+.data-projects-branch-toolbar button,
+.data-projects-merge-preview > button,
+.data-projects-revert-box button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 30px;
+  padding: 0 8px;
+  border: 1px solid #cbd7e4;
+  border-radius: 5px;
+  background: #fff;
+  color: #1769e0;
+  font-size: 11px;
+}
+
+.data-projects-branch-list {
+  display: grid;
+  border-top: 1px solid #eef2f7;
+}
+
+.data-projects-branch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 14px;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.data-projects-branch-row > span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.data-projects-branch-row strong {
+  color: #334155;
+  font-size: 12px;
+}
+
+.data-projects-branch-row em {
+  color: #1769e0;
+  font-size: 10px;
+  font-style: normal;
+}
+
+.data-projects-branch-row small {
+  color: #64748b;
+  font-size: 10px;
+}
+
+.data-projects-merge-preview {
+  display: grid;
+  justify-items: stretch;
+  border-top: 1px solid #eef2f7;
+}
+
+.data-projects-merge-preview > p {
+  margin: 0;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.data-projects-conflict {
+  display: grid;
+  gap: 7px;
+  padding: 9px;
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+  background: #fffbeb;
+}
+
+.data-projects-conflict > strong {
+  overflow-wrap: anywhere;
+  color: #713f12;
+  font-size: 11px;
+}
+
+.data-projects-conflict-values {
+  display: grid;
+  gap: 5px;
+}
+
+.data-projects-conflict-values label {
+  display: flex;
+  gap: 6px;
+  color: #475569;
+  font-size: 11px;
+}
+
+.data-projects-history-row {
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+}
+
+.data-projects-revert-box {
+  display: flex;
+  grid-column: 1 / -1;
+  gap: 6px;
+  padding-top: 6px;
+}
+
+.data-projects-revert-box input {
+  min-width: 0;
+  flex: 1;
+  min-height: 29px;
+  padding: 0 7px;
+  border: 1px solid #cbd7e4;
+  border-radius: 5px;
+}
+
+.data-projects-cloud-status-panel {
+  padding-bottom: 12px;
+}
+
+.data-projects-cloud-status-heading {
+  padding: 13px 14px 3px;
+}
+
+.data-projects-cloud-status-heading > div {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #334155;
+}
+
+.data-projects-cloud-status-heading strong {
+  font-size: 13px;
+}
+
+.data-projects-cloud-status-heading > span {
+  color: #64748b;
+  font-size: 10px;
+}
+
+.data-projects-cloud-status-panel > dl,
+.data-projects-settings-card > dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 8px 14px;
+}
+
+.data-projects-cloud-status-panel dt,
+.data-projects-settings-card dt {
+  color: #64748b;
+  font-size: 10px;
+}
+
+.data-projects-cloud-status-panel dd,
+.data-projects-settings-card dd {
+  margin: 2px 0 0;
+  overflow: hidden;
+  color: #334155;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-projects-cloud-actions,
+.data-projects-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 14px;
+}
+
+.data-projects-cloud-actions button {
+  min-height: 29px;
+  padding: 0 8px;
+  border: 1px solid #cbd7e4;
+  border-radius: 5px;
+  background: #fff;
+  color: #1769e0;
+  font-size: 11px;
+}
+
+.data-projects-cloud-message {
+  margin: 5px 14px 0;
+  color: #137143;
+  font-size: 11px;
+}
+
+.data-projects-remote-list,
+.data-projects-member-list {
+  display: grid;
+  gap: 0;
+}
+
+.data-projects-remote-row,
+.data-projects-member-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 14px;
+  border-top: 1px solid #f1f5f9;
+}
+
+.data-projects-remote-row > span,
+.data-projects-member-row > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.data-projects-remote-row strong,
+.data-projects-member-row strong {
+  overflow: hidden;
+  color: #334155;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-projects-remote-row small,
+.data-projects-member-row small {
+  color: #64748b;
+  font-size: 10px;
+}
+
+.data-projects-remote-row button,
+.data-projects-member-row button,
+.data-projects-member-form button {
+  flex: none;
+  min-height: 27px;
+  padding: 0 7px;
+  border: 1px solid #cbd7e4;
+  border-radius: 5px;
+  background: #fff;
+  color: #1769e0;
+  font-size: 10px;
+}
+
+.data-projects-remote-actions {
+  display: inline-flex;
+  flex: none;
+  gap: 5px;
+}
+
+.data-projects-member-row em {
+  flex: none;
+  color: #64748b;
+  font-size: 10px;
+  font-style: normal;
+}
+
+.data-projects-member-form {
+  display: flex;
+  gap: 6px;
+  padding: 10px 14px 0;
+}
+
+.data-projects-member-form input,
+.data-projects-member-form select {
+  min-width: 0;
+  min-height: 29px;
+  padding: 0 7px;
+  border: 1px solid #cbd7e4;
+  border-radius: 5px;
+  background: #fff;
+  color: #334155;
+  font-size: 10px;
+}
+
+.data-projects-member-form input {
+  flex: 1;
+}
+
+.data-projects-settings-card {
+  padding: 14px 0;
+}
+
+.data-projects-settings-actions {
+  padding-top: 10px;
+  border-top: 1px solid #eef2f7;
+}
+
+@media (max-width: 700px) {
+  .data-projects-overview-header,
+  .data-projects-workspace-heading,
+  .data-projects-cloud-status-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .data-projects-overview-actions,
+  .data-projects-workspace-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .data-projects-overview-section-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .data-projects-project-filters {
+    width: 100%;
+  }
+
+  .data-projects-project-filters label {
+    flex: 1;
+  }
+
+  .data-projects-workspace-topbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .data-projects-workspace-topbar > button {
+    margin-right: 0;
+  }
+
+  .data-projects-workspace-topbar nav {
+    width: 100%;
+    overflow-x: auto;
+  }
+
+  .data-projects-cloud-status-panel > dl,
+  .data-projects-settings-card > dl {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 480px) {
+  .data-projects-dataset-drawer {
+    width: 100vw;
+    padding: 14px;
+  }
+
+  .data-projects-drawer-item {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .data-projects-merge-controls,
+  .data-projects-branch-toolbar,
+  .data-projects-member-form,
+  .data-projects-revert-box {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .data-projects-branch-toolbar input {
+    width: auto;
+  }
+}
+
+/* Project-level branch, merge, history recovery, and cloud controls. */
+.data-projects-remove {
+  position: static;
+  width: calc(100% - 20px);
+  margin: 0 10px 10px;
+  background: #fff7f7;
+}
+
+.data-projects-section-action,
+.data-projects-cloud-title-actions,
+.data-projects-cloud-actions,
+.data-projects-branch-toolbar,
+.data-projects-create-branch,
+.data-projects-merge-controls,
+.data-projects-merge-confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.data-projects-section-action {
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #fff;
+  color: #334155;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.data-projects-feature-error {
+  margin: 10px 14px 0;
+  padding: 8px 10px;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  background: #fff7f7;
+  color: #b42318;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.data-projects-branches-body,
+.data-projects-cloud-body {
+  display: grid;
+  gap: 12px;
+  padding: 12px 14px 14px;
+}
+
+.data-projects-branch-toolbar {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.data-projects-branch-toolbar > label,
+.data-projects-merge-controls > label {
+  display: grid;
+  gap: 4px;
+  min-width: 180px;
+}
+
+.data-projects-branch-toolbar label span,
+.data-projects-merge-controls label span {
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.data-projects-branch-toolbar select,
+.data-projects-merge-controls select,
+.data-projects-create-branch input,
+.data-projects-merge-confirm input,
+.data-projects-revert-box input {
+  min-width: 0;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #fff;
+  color: #1e293b;
+}
+
+.data-projects-branch-toolbar > label select {
+  min-width: 220px;
+}
+
+.data-projects-branch-list {
+  display: grid;
+  flex: 1;
+  gap: 6px;
+  min-width: min(100%, 280px);
+}
+
+.data-projects-branch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.data-projects-branch-row.active {
+  border-color: #93c5fd;
+  background: #eff6ff;
+}
+
+.data-projects-branch-row > span {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+}
+
+.data-projects-branch-row strong {
+  color: #1e293b;
+  font-size: 12px;
+}
+
+.data-projects-branch-row em {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #dbeafe;
+  color: #1d4ed8;
+  font-size: 10px;
+  font-style: normal;
+}
+
+.data-projects-branch-row small {
+  color: #64748b;
+  font-size: 10px;
+}
+
+.data-projects-branch-row button,
+.data-projects-create-branch button,
+.data-projects-merge-controls button,
+.data-projects-cloud-actions button,
+.data-projects-remote-row button,
+.data-projects-revert-button,
+.data-projects-revert-box button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 30px;
+  padding: 0 9px;
+  border-radius: 6px;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.data-projects-branch-row button {
+  border-color: #fecaca;
+  background: #fff7f7;
+  color: #b42318;
+}
+
+.data-projects-create-branch {
+  align-items: stretch;
+}
+
+.data-projects-create-branch input {
+  flex: 1;
+  max-width: 260px;
+}
+
+.data-projects-merge-box {
+  display: grid;
+  gap: 10px;
+  padding: 11px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.data-projects-merge-heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #334155;
+  font-size: 12px;
+}
+
+.data-projects-merge-controls {
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.data-projects-merge-preview {
+  display: grid;
+  gap: 9px;
+}
+
+.data-projects-merge-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  color: #475569;
+  font-size: 11px;
+}
+
+.data-projects-conflicts {
+  display: grid;
+  gap: 8px;
+}
+
+.data-projects-conflict {
+  display: grid;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid #fed7aa;
+  border-radius: 7px;
+  background: #fffaf5;
+}
+
+.data-projects-conflict-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.data-projects-conflict-title strong {
+  overflow-wrap: anywhere;
+  color: #334155;
+  font-size: 12px;
+}
+
+.data-projects-conflict-title small {
+  color: #9a3412;
+  font-size: 10px;
+}
+
+.data-projects-conflict-values {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.data-projects-conflict-values label {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  min-width: 0;
+  padding: 7px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #fff;
+  color: #475569;
+  font-size: 11px;
+}
+
+.data-projects-conflict-values label:has(input:checked) {
+  border-color: #60a5fa;
+  background: #eff6ff;
+}
+
+.data-projects-conflict-values span {
+  display: grid;
+  gap: 3px;
+  overflow-wrap: anywhere;
+}
+
+.data-projects-conflict-values b {
+  color: #1e293b;
+}
+
+.data-projects-merge-clean {
+  margin: 0;
+  color: #166534;
+  font-size: 12px;
+}
+
+.data-projects-merge-session,
+.data-projects-cloud-last-error {
+  color: #b45309;
+  font-size: 11px;
+}
+
+.data-projects-merge-confirm {
+  align-items: stretch;
+  flex-wrap: wrap;
+}
+
+.data-projects-merge-confirm input {
+  flex: 1;
+  min-width: 180px;
+}
+
+.data-projects-merge-confirm small {
+  width: 100%;
+  color: #b45309;
+  font-size: 11px;
+}
+
+.data-projects-version-detail {
+  display: grid;
+  gap: 8px;
+}
+
+.data-projects-revert-button {
+  justify-self: start;
+  border-color: #cbd5e1;
+  background: #f8fafc;
+  color: #334155;
+}
+
+.data-projects-revert-box {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  padding: 9px;
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+  background: #fffbeb;
+}
+
+.data-projects-revert-box p {
+  flex-basis: 100%;
+  margin: 0;
+  color: #92400e;
+  font-size: 11px;
+}
+
+.data-projects-revert-box input {
+  flex: 1;
+  min-width: 180px;
+}
+
+.data-projects-cloud-title-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.data-projects-cloud-title-actions > strong {
+  color: #2563eb;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.data-projects-cloud-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #dbeafe;
+  border-radius: 7px;
+  background: #eff6ff;
+  color: #2563eb;
+}
+
+.data-projects-cloud-status > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.data-projects-cloud-status strong {
+  color: #1e3a8a;
+  font-size: 13px;
+}
+
+.data-projects-cloud-status span {
+  overflow-wrap: anywhere;
+  color: #475569;
+  font-size: 11px;
+}
+
+.data-projects-cloud-status dl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 13px;
+  margin: 0 0 0 auto;
+}
+
+.data-projects-cloud-status dl div {
+  display: grid;
+  gap: 2px;
+  min-width: 40px;
+}
+
+.data-projects-cloud-status dt {
+  color: #64748b;
+  font-size: 10px;
+}
+
+.data-projects-cloud-status dd {
+  margin: 0;
+  color: #1e293b;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.data-projects-cloud-actions {
+  flex-wrap: wrap;
+}
+
+.data-projects-cloud-actions small {
+  color: #b45309;
+  font-size: 11px;
+}
+
+.data-projects-cloud-message {
+  margin: 0;
+  color: #166534;
+  font-size: 12px;
+}
+
+.data-projects-remote-list {
+  display: grid;
+  gap: 6px;
+}
+
+.data-projects-remote-heading {
+  display: flex;
+  justify-content: space-between;
+  color: #475569;
+  font-size: 11px;
+}
+
+.data-projects-remote-heading span,
+.data-projects-remote-list > p {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.data-projects-remote-list > p {
+  margin: 0;
+}
+
+.data-projects-remote-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+}
+
+.data-projects-remote-row > span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.data-projects-remote-row strong,
+.data-projects-remote-row small {
+  overflow-wrap: anywhere;
+}
+
+.data-projects-remote-row strong {
+  color: #334155;
+  font-size: 12px;
+}
+
+.data-projects-remote-row small {
+  color: #64748b;
+  font-size: 10px;
+}
+
+.data-projects-members {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 7px;
+  background: #f8fafc;
+}
+
+.data-projects-members-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.data-projects-members-heading > div {
+  display: grid;
+  gap: 3px;
+}
+
+.data-projects-members-heading strong {
+  color: #334155;
+  font-size: 12px;
+}
+
+.data-projects-members-heading span,
+.data-projects-members-state,
+.data-projects-members-readonly {
+  margin: 0;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.data-projects-members-heading button,
+.data-projects-member-form button,
+.data-projects-member-row button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  padding: 5px 8px;
+  background: #fff;
+  color: #334155;
+  font-size: 11px;
+}
+
+.data-projects-member-list {
+  display: grid;
+  gap: 5px;
+}
+
+.data-projects-member-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid #e2e8f0;
+  border-radius: 5px;
+  background: #fff;
+}
+
+.data-projects-member-row > span {
+  display: grid;
+  flex: 1;
+  gap: 2px;
+  min-width: 0;
+}
+
+.data-projects-member-row strong,
+.data-projects-member-row small {
+  overflow-wrap: anywhere;
+}
+
+.data-projects-member-row strong {
+  color: #334155;
+  font-size: 11px;
+}
+
+.data-projects-member-row small {
+  color: #64748b;
+  font-size: 10px;
+}
+
+.data-projects-member-row em {
+  flex: none;
+  color: #475569;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.data-projects-member-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.data-projects-member-form input {
+  min-width: 180px;
+  flex: 1;
+}
+
+.data-projects-member-form select {
+  min-width: 132px;
+}
+
+@media (max-width: 620px) {
+  .data-projects-section-title {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .data-projects-branch-toolbar,
+  .data-projects-create-branch,
+  .data-projects-merge-controls,
+  .data-projects-merge-confirm,
+  .data-projects-cloud-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .data-projects-branch-toolbar > label,
+  .data-projects-branch-toolbar > label select,
+  .data-projects-merge-controls > label,
+  .data-projects-merge-controls > label select,
+  .data-projects-create-branch input,
+  .data-projects-merge-confirm input {
+    width: 100%;
+    max-width: none;
+  }
+
+  .data-projects-conflict-values {
+    grid-template-columns: 1fr;
+  }
+
+  .data-projects-cloud-status {
+    flex-wrap: wrap;
+  }
+
+  .data-projects-cloud-status dl {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .data-projects-remote-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .data-projects-members-heading,
+  .data-projects-member-form {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .data-projects-member-form input,
+  .data-projects-member-form select {
+    width: 100%;
+    min-width: 0;
+  }
+}
+
+/* A group is a lightweight card until the user opens its datasets. */
+.data-projects-group-columns { display: flex; flex-direction: column; gap: 12px; }
+.data-projects-group-list { order: 0; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); }
+.data-projects-ungrouped-column { order: 1; }
+.data-projects-ungrouped-cards,
+.data-projects-group-members { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); gap: 10px; align-items: start; }
+.data-projects-ungrouped-cards { padding: 8px; }
+.data-projects-group-dataset { margin: 0; }
+.data-projects-group-card.is-expanded { grid-column: 1 / -1; }
+.data-projects-group-member { display: grid; padding: 0; border: 0; background: transparent; }
+.data-projects-group-header > .data-projects-group-title { display: flex; flex: 1; justify-content: space-between; min-width: 0; color: #1e293b; font-size: 13px; font-weight: 650; text-align: left; }
+.data-projects-group-summary { padding: 10px 12px 4px; color: #64748b; font-size: 11px; }
+.data-projects-group-card > .progress-bar { margin: 6px 12px 12px; }
+.data-projects-group-member .card-footer button:not(.primary) { color: #475569; border: 1px solid #dce5ef; background: #fff; }
+.data-projects-group-member .card-footer button.primary { padding: 0 8px; color: #fff; background: #1769e0; border: 1px solid #1769e0; }
+.data-projects-groups-board [data-group-drop-kind] { user-select: none; touch-action: pan-y; }
+.data-projects-groups-board .is-drop-target { outline: 2px solid #1769e0; outline-offset: 2px; background: #eff6ff; }
+.data-projects-groups-board { position: relative; }
+.data-projects-drop-hint {
+  position: absolute;
+  z-index: 2;
+  top: 12px;
+  left: 90px;
+  right: 190px;
+  width: max-content;
+  max-width: calc(100% - 280px);
+  padding: 6px 10px;
+  border: 1px solid #bfdbfe;
+  border-radius: 6px;
+  color: #1769e0;
+  background: #eff6ff;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.dataset-card--compact::after { content: none; }
+.data-projects-group-picker { display: grid; gap: 9px; padding: 14px; border: 1px solid #bfdbfe; border-radius: 8px; background: #fff; }
+.data-projects-group-picker > label { display: flex; gap: 7px; align-items: center; font-size: 12px; }
+.data-projects-group-picker > div { display: flex; gap: 7px; }

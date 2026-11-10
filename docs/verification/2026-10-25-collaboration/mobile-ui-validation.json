@@ -1,0 +1,59 @@
+{
+  "scope": "GUI and simulator evidence; independent of API/native integration tests",
+  "projectId": "d2355506-c746-4bfe-b144-0ddd25f7e142",
+  "taskId": "5419a070-941d-4ddd-bf5a-4d7ad2e6dc0f",
+  "beforeFinalPackage": {
+    "iphonePasswordLogin": "passed using native Keychain",
+    "iphoneProjectOpen": "passed; 3 source annotations restored",
+    "iphoneTaskClaim": "passed through GUI; server item in_progress",
+    "iphoneOfflinePin": "passed via task button; native original cache pinned=1",
+    "ipadMobileShell": "confirmed after iPad runtime detection fix"
+  },
+  "pending": [],
+  "blocker": null,
+  "physicalDeviceScope": {
+    "android": "APK build only per user",
+    "ios": "unsigned IPA per user; signing and physical install deferred"
+  },
+  "finalPackage": {
+    "iphoneNativeLaunch": "passed",
+    "iphoneCredentialRestore": "passed; final annotator restored online",
+    "iphoneImageLoading": "passed; all 3 image previews displayed",
+    "iphoneCacheContent": "passed; all 3 original hashes verified",
+    "ipadMobileShell": "passed after runtime detection fix",
+    "sourceManifestSha256": "3d22fa4f4783f5ecc48c3f38bf462a34df1db012aa766db63fdeb0ef4ee4de6b",
+    "frontendDistManifestSha256": "03ab4d785c4d23738584bbb31b2ad84ee3369c98149feff5edc06d30a51e3e72"
+  },
+  "interactionChecks": {
+    "iphoneSinglePointerBBox": "passed; 3 -> 4 -> 5 objects across two sessions",
+    "iphoneUndoRedo": "passed",
+    "iphoneSaveSubmit": "passed; final 5 objects, submitted annotation revision 5",
+    "iphoneSync": "passed; Save then Submit drained automatically without settings/manual upload; native outbox empty and server revision 5",
+    "ipadPasswordLogin": "passed with native Keychain",
+    "ipadProjectAndAnnotationRead": "passed; viewed latest 5 boxes",
+    "ipadVersionedReview": "passed via review queue Approve; annotation approved revision 6, review targeted annotation revision 5",
+    "desktopObserveResult": "passed in native desktop GUI after switching image and back: 通过, 5 objects; native SQLite synced at server revision 6",
+    "iphoneInspectorDrawer": "passed; own 关闭对象属性 button closes overlay and restores approved five-box canvas",
+    "iphoneOrientation": "passed portrait -> landscape -> portrait; five objects retained",
+    "ipadLandscape": "passed; five approved objects and right-side inspector shown in split layout",
+    "iphoneOfflinePin": "passed in final app via GUI; task image pinned=1, other two originals pinned=0, all hashes verified"
+  },
+  "deferredAcceptance": [
+    "Android physical install and touch interaction (user chose APK build only)",
+    "iOS development signing and physical install (user chose unsigned IPA)",
+    "physical two-finger pinch; pointer geometry covered by tests",
+    "two-device network-disconnect GUI scenario; real-server/two-SQLite offline and restart integration passed"
+  ],
+  "evidence": [
+    "iphone-approved-final.png",
+    "iphone-inspector-open.png",
+    "iphone-landscape.png",
+    "iphone-offline-pin.png",
+    "ipad-review-five-boxes.png",
+    "ipad-approved.png",
+    "ipad-landscape-approved.png",
+    "desktop-approved-five-boxes.png",
+    "cross-device-server-validation.json"
+  ],
+  "packageSequence": "Automatic-save/submit and iPad approve GUI checks used the final shared core and scheduler build before adding the drawer own-close button. The final rebuilt artifacts were reinstalled, credential restoration/image loading/approved five-box display/drawer close/rotation/landscape inspector/offline pin were rechecked. Core code did not change between these builds."
+}

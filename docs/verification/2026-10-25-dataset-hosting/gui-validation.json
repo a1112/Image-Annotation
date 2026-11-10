@@ -1,0 +1,39 @@
+{
+  "scope": "actual desktop Tauri and native iOS Simulator hosting acceptance",
+  "datasetId": "2a63c59a-90e9-4d61-af84-1aceb1f85177",
+  "versionId": "73ae80e6-844c-4d2d-bdbe-0627a823a091",
+  "reusedProjectId": "15441235-ddaa-459c-9212-979333ef0560",
+  "desktopImportJobId": "f3c906da-a80e-4ece-b0d5-f5a1443bd9fe",
+  "desktopExportJobId": "f9fc65a2-7226-4360-b420-c4d053cbd902",
+  "mobileExportJobId": "6aca655b-0087-46d3-821d-3620d362942e",
+  "passed": [
+    "desktop create/capture/version",
+    "desktop native export and Finder reveal",
+    "desktop file-picker native import",
+    "iPhone hosted version discovery and reuse",
+    "iPhone final mobile annotation route and 5-object rendering",
+    "iPhone ZIP download, CRC and exact desktop hash match",
+    "iPad hosted version detail in landscape",
+    "simulator applications final 197-test frontend installed and launched",
+    "iPhone independent-project annotation save synchronized from revision 1 to 2; frozen source version unchanged",
+    "iPhone final export file name wraps and Files location fits within the mobile panel",
+    "iPad final version manifest wraps within a fully visible panel"
+  ],
+  "pendingDueToMacLock": [],
+  "deferredByUser": [
+    "Android physical device tests",
+    "iOS signing and physical install"
+  ],
+  "productionDeployment": true,
+  "stagingStopped": true,
+  "gitCommitted": false,
+  "gitPushed": false,
+  "finalMobileExportJobId": "e13813ee-8856-4ebd-87bc-c9d4a8e1d45b",
+  "screenshots": [
+    "iphone-reused-save-synced.png",
+    "iphone-export-final.png",
+    "ipad-version-manifest-final.png"
+  ],
+  "finalVisualAcceptance": "passed on native iOS Simulator iPhone and iPad",
+  "temporaryWakeAssertion": "stopped after final GUI capture"
+}

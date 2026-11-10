@@ -1,0 +1,56 @@
+{
+  "passed": true,
+  "finalizedAt": "2026-10-26T17:34:13.394314+00:00",
+  "webUrl": "https://175.178.16.90/image-annotation/app/",
+  "database": "server PostgreSQL",
+  "objects": "server S3",
+  "release": {
+    "sourceSha256": "c148838041966a6d9b5faa504f27dc87e30f662b08f5146e4d6a2c3f0d8a0588",
+    "binarySha256": "39dfc9a152ab8268c12bb6f549d1d42b0030a8953a418f2692394f5311f9557b",
+    "webSha256": "287cb59891edc9cdefe1326c4d13f92cc562333c74aa9e3bea747980afc69b4c",
+    "pid": 972302
+  },
+  "tests": {
+    "frontendVitest": 237,
+    "frontendChromeNative": 12,
+    "serverUnit": 29,
+    "postgresIntegration": 11,
+    "desktopNative": 143
+  },
+  "production": {
+    "webWorkspace": 34,
+    "imageTransforms": 43,
+    "nativeCloudCompatibility": 30,
+    "browserGui": 9,
+    "nativeDatasetCatalog": 3,
+    "originalObjectsRetained": 5774
+  },
+  "staging": {
+    "webRestart": 8,
+    "transformRestart": 3,
+    "nativeVirtualDatasetRoundTrip": 9,
+    "membershipAndBranchDeletion": 5,
+    "webGraphInDesktop": 4,
+    "desktopGraphInWeb": 4
+  },
+  "desktopAcceptance": "independent packaged app and DMG; see ../data-projects-20261026/final-validation.json",
+  "requiredReports": [
+    "production-web-workspace.json",
+    "production-image-transforms.json",
+    "production-native-cloud.json",
+    "production-browser.json",
+    "production-native-virtual-datasets.json",
+    "production-existing-object-integrity.json",
+    "staging-web-restart.json",
+    "staging-transform-restart.json",
+    "staging-native-virtual-datasets.json",
+    "staging-membership-and-delete.json",
+    "staging-web-graph-in-desktop.json",
+    "staging-desktop-graph-in-web.json"
+  ],
+  "notes": [
+    "Web project export is a server-generated manifest; source images and labels have authenticated individual download routes.",
+    "Desktop artifact is a local macOS arm64 ad-hoc signed build; code and embedded frontend match the isolated GUI acceptance app.",
+    "No Git commit or push was performed."
+  ]
+}

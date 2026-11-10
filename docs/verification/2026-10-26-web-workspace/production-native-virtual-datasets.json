@@ -1,0 +1,18 @@
+{
+  "passed": true,
+  "projectId": "4a8e2989-2935-4c00-bb4b-03daddac960d",
+  "checks": [
+    {
+      "name": "both existing desktop cloud datasets appear as openable web cards",
+      "passed": true
+    },
+    {
+      "name": "dataset names retain the original native manifests",
+      "passed": true
+    },
+    {
+      "name": "web listing preserves the accepted desktop HEAD and clean tree",
+      "passed": true
+    }
+  ]
+}

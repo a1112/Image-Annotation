@@ -1,4 +1,9 @@
 use super::{
+    datasets::{
+        consume_quota_tx, project_organization, project_organization_tx, release_quota_reservation,
+        reserve_quota_tx,
+    },
+    objects::{issue_ticket, verify_object_hash, TicketDirection},
     projects::{write_audit, write_change},
     ApiError,
 };
@@ -6,7 +11,6 @@ use crate::{
     auth::{require_project_permission, AuthUser, ProjectPermission},
     state::AppState,
 };
-use aws_sdk_s3::presigning::PresigningConfig;
 use axum::{
     extract::{Path, State},
     Json,
@@ -14,11 +18,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
-use std::time::Duration;
 use uuid::Uuid;
-
-const UPLOAD_EXPIRY_SECONDS: u64 = 900;
-const DOWNLOAD_EXPIRY_SECONDS: u64 = 300;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,9 +65,8 @@ pub async fn create_upload_session(
     validate_upload(&input)?;
 
     let attachment_id = Uuid::new_v4();
-    let object_key = format!(
-        "projects/{project_id}/issues/{issue_id}/attachments/{attachment_id}/original"
-    );
+    let object_key =
+        format!("projects/{project_id}/issues/{issue_id}/attachments/{attachment_id}/original");
     let mut tx = state.pool.begin().await?;
     sqlx::query(
         r#"
@@ -89,6 +88,17 @@ pub async fn create_upload_session(
     .bind(user.id)
     .execute(&mut *tx)
     .await?;
+    if let Some(organization_id) = project_organization_tx(&mut tx, project_id).await? {
+        reserve_quota_tx(
+            &mut tx,
+            organization_id,
+            "issue_attachment",
+            attachment_id,
+            input.byte_size,
+            0,
+        )
+        .await?;
+    }
     write_audit(
         &mut tx,
         project_id,
@@ -100,28 +110,32 @@ pub async fn create_upload_session(
     .await?;
     tx.commit().await?;
 
-    let presigned = state
-        .s3
-        .put_object()
-        .bucket(&state.config.s3_bucket)
-        .key(&object_key)
-        .content_type(&input.mime_type)
-        .metadata("sha256", &input.content_hash)
-        .presigned(
-            PresigningConfig::expires_in(Duration::from_secs(UPLOAD_EXPIRY_SECONDS))
-                .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        )
-        .await
-        .map_err(|error| {
-            ApiError::bad_request(format!("failed to create attachment upload URL: {error}"))
-        })?;
+    let mut ticket = issue_ticket(
+        &state,
+        &user,
+        project_id,
+        &object_key,
+        None,
+        Some(attachment_id),
+        "original",
+        TicketDirection::Put,
+        &input.file_name,
+        &input.mime_type,
+        Some(&input.content_hash),
+        Some(input.byte_size),
+    )
+    .await?;
+    ticket["contentHash"] = json!(input.content_hash);
     Ok(Json(json!({
         "attachmentId": attachment_id,
         "issueId": issue_id,
         "objectKey": object_key,
-        "uploadUrl": presigned.uri(),
+        "uploadUrl": ticket["url"].clone(),
+        "url": ticket["url"].clone(),
         "method": "PUT",
-        "expiresIn": UPLOAD_EXPIRY_SECONDS
+        "expiresIn": ticket["expiresIn"].clone(),
+        "expiresAt": ticket["expiresAt"].clone(),
+        "contentHash": ticket["contentHash"].clone()
     })))
 }
 
@@ -133,7 +147,7 @@ pub async fn complete_upload(
     let row = sqlx::query(
         r#"
         SELECT project_id, client_key, file_name, object_key, content_hash,
-            mime_type, byte_size
+            mime_type, byte_size, status, revision
         FROM issue_attachments
         WHERE id = $1 AND issue_id = $2 AND deleted_at IS NULL
         "#,
@@ -152,6 +166,15 @@ pub async fn complete_upload(
     let client_key: Option<String> = row.get("client_key");
     let file_name: String = row.get("file_name");
     let mime_type: String = row.get("mime_type");
+    let status: String = row.get("status");
+    if status == "ready" {
+        return Ok(Json(json!({
+            "attachmentId": attachment_id,
+            "status": "ready",
+            "revision": row.get::<i64, _>("revision")
+        })));
+    }
+    let organization_id = project_organization(&state.pool, project_id).await?;
     let head = state
         .s3
         .head_object()
@@ -161,18 +184,46 @@ pub async fn complete_upload(
         .await
         .map_err(|error| {
             ApiError::bad_request(format!("uploaded attachment was not found: {error}"))
-        })?;
+        });
+    let head = match head {
+        Ok(head) => head,
+        Err(error) => {
+            if let Some(organization_id) = organization_id {
+                let _ = release_quota_reservation(
+                    &state.pool,
+                    organization_id,
+                    "issue_attachment",
+                    attachment_id,
+                )
+                .await;
+            }
+            return Err(error);
+        }
+    };
     if head.content_length().unwrap_or_default() != expected_size {
+        if let Some(organization_id) = organization_id {
+            let _ = release_quota_reservation(
+                &state.pool,
+                organization_id,
+                "issue_attachment",
+                attachment_id,
+            )
+            .await;
+        }
         return Err(ApiError::bad_request("attachment size mismatch"));
     }
-    if head
-        .metadata()
-        .and_then(|metadata| metadata.get("sha256"))
-        .is_some_and(|hash| hash != &expected_hash)
+    if let Err(error) = verify_object_hash(&state, &object_key, &expected_hash, expected_size).await
     {
-        return Err(ApiError::bad_request(
-            "attachment checksum metadata mismatch",
-        ));
+        if let Some(organization_id) = organization_id {
+            let _ = release_quota_reservation(
+                &state.pool,
+                organization_id,
+                "issue_attachment",
+                attachment_id,
+            )
+            .await;
+        }
+        return Err(error);
     }
 
     let mut tx = state.pool.begin().await?;
@@ -189,6 +240,28 @@ pub async fn complete_upload(
     .fetch_one(&mut *tx)
     .await?;
     let revision: i64 = updated.get("revision");
+    if let Some(organization_id) = project_organization_tx(&mut tx, project_id).await? {
+        let reservation_active = reserve_quota_tx(
+            &mut tx,
+            organization_id,
+            "issue_attachment",
+            attachment_id,
+            expected_size,
+            0,
+        )
+        .await?;
+        if reservation_active {
+            consume_quota_tx(
+                &mut tx,
+                organization_id,
+                "issue_attachment",
+                attachment_id,
+                expected_size,
+                0,
+            )
+            .await?;
+        }
+    }
     let entity_key = client_key
         .clone()
         .unwrap_or_else(|| attachment_id.to_string());
@@ -251,28 +324,36 @@ pub async fn download_url(
     let project_id: Uuid = row.get("project_id");
     require_project_permission(&state, user.id, project_id, ProjectPermission::View).await?;
     let object_key: String = row.get("object_key");
-    let presigned = state
-        .s3
-        .get_object()
-        .bucket(&state.config.s3_bucket)
-        .key(object_key)
-        .presigned(
-            PresigningConfig::expires_in(Duration::from_secs(DOWNLOAD_EXPIRY_SECONDS))
-                .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        )
-        .await
-        .map_err(|error| {
-            ApiError::bad_request(format!("failed to create attachment download URL: {error}"))
-        })?;
+    let file_name: String = row.get("file_name");
+    let mime_type: String = row.get("mime_type");
+    let content_hash: String = row.get("content_hash");
+    let byte_size: i64 = row.get("byte_size");
+    let ticket = issue_ticket(
+        &state,
+        &user,
+        project_id,
+        &object_key,
+        None,
+        Some(attachment_id),
+        "original",
+        TicketDirection::Get,
+        &file_name,
+        &mime_type,
+        Some(&content_hash),
+        Some(byte_size),
+    )
+    .await?;
     Ok(Json(json!({
         "attachmentId": attachment_id,
         "issueId": row.get::<Uuid, _>("issue_id"),
-        "downloadUrl": presigned.uri(),
-        "fileName": row.get::<String, _>("file_name"),
-        "contentHash": row.get::<String, _>("content_hash"),
-        "mimeType": row.get::<String, _>("mime_type"),
-        "byteSize": row.get::<i64, _>("byte_size"),
-        "expiresIn": DOWNLOAD_EXPIRY_SECONDS
+        "downloadUrl": ticket["url"].clone(),
+        "url": ticket["url"].clone(),
+        "fileName": file_name,
+        "contentHash": content_hash,
+        "mimeType": mime_type,
+        "byteSize": byte_size,
+        "expiresIn": ticket["expiresIn"].clone(),
+        "expiresAt": ticket["expiresAt"].clone()
     })))
 }
 

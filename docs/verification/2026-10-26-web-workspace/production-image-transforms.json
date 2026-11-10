@@ -1,0 +1,194 @@
+{
+  "schema": "image-transform-verification/v1",
+  "baseUrl": "https://175.178.16.90/image-annotation",
+  "projectId": "a08323bf-4929-432d-807a-01738087b4f0",
+  "passed": true,
+  "checks": [
+    {
+      "name": "upload generated source image",
+      "passed": true,
+      "detail": "HTTP 200 code=None"
+    },
+    {
+      "name": "read original source image",
+      "passed": true
+    },
+    {
+      "name": "source bytes match before transforms",
+      "passed": true
+    },
+    {
+      "name": "enqueue jpeg",
+      "passed": true
+    },
+    {
+      "name": "complete jpeg",
+      "passed": true,
+      "detail": "None"
+    },
+    {
+      "name": "jpeg has authenticated download URL",
+      "passed": true
+    },
+    {
+      "name": "download jpeg bytes",
+      "passed": true
+    },
+    {
+      "name": "jpeg output hash",
+      "passed": true
+    },
+    {
+      "name": "jpeg output size",
+      "passed": true
+    },
+    {
+      "name": "jpeg decoded dimensions",
+      "passed": true,
+      "detail": "actual=(4, 3) expected=(4, 3)"
+    },
+    {
+      "name": "jpeg metadata dimensions",
+      "passed": true
+    },
+    {
+      "name": "jpeg operation idempotency",
+      "passed": true
+    },
+    {
+      "name": "enqueue png",
+      "passed": true
+    },
+    {
+      "name": "complete png",
+      "passed": true,
+      "detail": "None"
+    },
+    {
+      "name": "png has authenticated download URL",
+      "passed": true
+    },
+    {
+      "name": "download png bytes",
+      "passed": true
+    },
+    {
+      "name": "png output hash",
+      "passed": true
+    },
+    {
+      "name": "png output size",
+      "passed": true
+    },
+    {
+      "name": "png decoded dimensions",
+      "passed": true,
+      "detail": "actual=(2, 3) expected=(2, 3)"
+    },
+    {
+      "name": "png metadata dimensions",
+      "passed": true
+    },
+    {
+      "name": "png operation idempotency",
+      "passed": true
+    },
+    {
+      "name": "enqueue webp",
+      "passed": true
+    },
+    {
+      "name": "complete webp",
+      "passed": true,
+      "detail": "None"
+    },
+    {
+      "name": "webp has authenticated download URL",
+      "passed": true
+    },
+    {
+      "name": "download webp bytes",
+      "passed": true
+    },
+    {
+      "name": "webp output hash",
+      "passed": true
+    },
+    {
+      "name": "webp output size",
+      "passed": true
+    },
+    {
+      "name": "webp decoded dimensions",
+      "passed": true,
+      "detail": "actual=(6, 5) expected=(6, 5)"
+    },
+    {
+      "name": "webp metadata dimensions",
+      "passed": true
+    },
+    {
+      "name": "webp operation idempotency",
+      "passed": true
+    },
+    {
+      "name": "enqueue tiff",
+      "passed": true
+    },
+    {
+      "name": "complete tiff",
+      "passed": true,
+      "detail": "None"
+    },
+    {
+      "name": "tiff has authenticated download URL",
+      "passed": true
+    },
+    {
+      "name": "download tiff bytes",
+      "passed": true
+    },
+    {
+      "name": "tiff output hash",
+      "passed": true
+    },
+    {
+      "name": "tiff output size",
+      "passed": true
+    },
+    {
+      "name": "tiff decoded dimensions",
+      "passed": true,
+      "detail": "actual=(4, 3) expected=(4, 3)"
+    },
+    {
+      "name": "tiff metadata dimensions",
+      "passed": true
+    },
+    {
+      "name": "tiff operation idempotency",
+      "passed": true
+    },
+    {
+      "name": "reject invalid requested dimensions",
+      "passed": true,
+      "detail": "HTTP 400 code=BAD_REQUEST"
+    },
+    {
+      "name": "enqueue bounded crop for worker validation",
+      "passed": true,
+      "detail": "HTTP 202 code=None"
+    },
+    {
+      "name": "invalid crop fails without output object",
+      "passed": true
+    },
+    {
+      "name": "source object remains unchanged",
+      "passed": true
+    }
+  ],
+  "sourceHash": "e2a62ebe4f015b536411102a801b8b90a8d5f2f7e5fa68c13f683d8906ff2fb1",
+  "sourceByteSize": 105,
+  "checkedAt": "2026-10-26T17:26:24Z"
+}

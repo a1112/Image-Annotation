@@ -1,9 +1,19 @@
+pub mod account;
 pub mod annotations;
-pub mod attachments;
 pub mod assets;
+pub mod attachments;
+pub mod collaboration;
+pub mod data_project_metadata;
+pub mod data_projects;
+pub mod dataset_jobs;
+pub mod datasets;
 pub mod issues;
+pub mod image_transforms;
+pub mod objects;
 pub mod projects;
 pub mod sync;
+pub mod web_auth;
+pub mod web_workspace;
 
 use axum::Json;
 use axum::{
@@ -25,6 +35,15 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "UNAUTHORIZED",
+            message: message.into(),
+            details: Value::Null,
+        }
+    }
+
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -58,6 +77,15 @@ impl ApiError {
             code,
             message: message.into(),
             details,
+        }
+    }
+
+    pub fn internal_message(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "INTERNAL_ERROR",
+            message: message.into(),
+            details: Value::Null,
         }
     }
 }

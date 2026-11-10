@@ -31,10 +31,7 @@ pub fn list_members(
     request(
         &context,
         Method::GET,
-        &format!(
-            "/api/v1/projects/{}/members",
-            context.remote_project_id
-        ),
+        &format!("/api/v1/projects/{}/members", context.remote_project_id),
         None,
     )
 }
@@ -50,10 +47,7 @@ pub fn upsert_member(
     request(
         &context,
         Method::POST,
-        &format!(
-            "/api/v1/projects/{}/members",
-            context.remote_project_id
-        ),
+        &format!("/api/v1/projects/{}/members", context.remote_project_id),
         Some(json!({ "userId": user_id, "role": role })),
     )
 }
@@ -139,8 +133,7 @@ fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, String>
             .unwrap_or_else(|| format!("remote member request failed with {status}"));
         return Err(message);
     }
-    serde_json::from_str(&text)
-        .map_err(|error| format!("invalid remote member response: {error}"))
+    serde_json::from_str(&text).map_err(|error| format!("invalid remote member response: {error}"))
 }
 
 fn validate_role(role: &str) -> Result<(), String> {

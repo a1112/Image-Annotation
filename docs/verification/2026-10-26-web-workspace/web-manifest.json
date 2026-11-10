@@ -1,0 +1,17 @@
+{
+  "sha256": "287cb59891edc9cdefe1326c4d13f92cc562333c74aa9e3bea747980afc69b4c",
+  "files": [
+    {
+      "path": "assets/index-BKj5aJ73.js",
+      "sha256": "b7c0d83abc7119cd7ea5ce1bdeb1dff4cd7b89e7bf3f80044ce8bed8b81f0ad1"
+    },
+    {
+      "path": "assets/index-CWlEnRB2.css",
+      "sha256": "2d1a77d0f11a492e506f23da42fc9056ba5b6cb12b1f0df5bf84b19d8457e080"
+    },
+    {
+      "path": "index.html",
+      "sha256": "d476e869b7c8b1c028a8b7c4b01fe88e11e38c5ec68a3946d604b539d366b5bb"
+    }
+  ]
+}

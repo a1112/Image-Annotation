@@ -1,0 +1,300 @@
+{
+  "checkedAt": "2026-10-25T15:34:35.494795+00:00",
+  "baseUrl": "http://127.0.0.1:16425",
+  "passed": true,
+  "checkCount": 71,
+  "checks": [
+    {
+      "name": "health",
+      "passed": true
+    },
+    {
+      "name": "organization quota readable",
+      "passed": true
+    },
+    {
+      "name": "completion replay preserves submitted image status",
+      "passed": true
+    },
+    {
+      "name": "completion replay never double charges quota",
+      "passed": true
+    },
+    {
+      "name": "capture includes uploaded image after submission",
+      "passed": true
+    },
+    {
+      "name": "capture operation replay is stable",
+      "passed": true
+    },
+    {
+      "name": "independent dataset listed",
+      "passed": true
+    },
+    {
+      "name": "dataset reports stored image bytes",
+      "passed": true
+    },
+    {
+      "name": "dataset revision CAS rejects stale metadata",
+      "passed": true
+    },
+    {
+      "name": "version operation replay stable",
+      "passed": true
+    },
+    {
+      "name": "operation ID cannot be reused for different version payload",
+      "passed": true
+    },
+    {
+      "name": "immutable manifest contains image and annotation",
+      "passed": true
+    },
+    {
+      "name": "new version after recapture",
+      "passed": true
+    },
+    {
+      "name": "old version unchanged after source edits",
+      "passed": true
+    },
+    {
+      "name": "different projects with same local image key remain separate",
+      "passed": true
+    },
+    {
+      "name": "same-name image export completes",
+      "passed": true
+    },
+    {
+      "name": "same-name images roundtrip without overwrite",
+      "passed": true
+    },
+    {
+      "name": "reuse operation creates one project",
+      "passed": true
+    },
+    {
+      "name": "reused project supports existing client bootstrap",
+      "passed": true
+    },
+    {
+      "name": "reuse takes frozen annotation rather than current source",
+      "passed": true
+    },
+    {
+      "name": "reused original bytes verified",
+      "passed": true
+    },
+    {
+      "name": "target annotation edit isolated from source",
+      "passed": true
+    },
+    {
+      "name": "target annotation edit isolated from version",
+      "passed": true
+    },
+    {
+      "name": "same-organization user needs dataset membership",
+      "passed": true
+    },
+    {
+      "name": "dataset member can be granted by email",
+      "passed": true
+    },
+    {
+      "name": "granted viewer reads version",
+      "passed": true
+    },
+    {
+      "name": "viewer cannot mutate dataset or organization quota",
+      "passed": true
+    },
+    {
+      "name": "native export completes",
+      "passed": true
+    },
+    {
+      "name": "native ZIP CRC and frozen image count",
+      "passed": true
+    },
+    {
+      "name": "native download hash",
+      "passed": true
+    },
+    {
+      "name": "native import operation replay",
+      "passed": true
+    },
+    {
+      "name": "native import completes",
+      "passed": true
+    },
+    {
+      "name": "native roundtrip item count",
+      "passed": true
+    },
+    {
+      "name": "native import creates version",
+      "passed": true
+    },
+    {
+      "name": "native roundtrip annotation geometry",
+      "passed": true
+    },
+    {
+      "name": "coco export completes",
+      "passed": true
+    },
+    {
+      "name": "coco ZIP CRC and frozen image count",
+      "passed": true
+    },
+    {
+      "name": "coco download hash",
+      "passed": true
+    },
+    {
+      "name": "coco import operation replay",
+      "passed": true
+    },
+    {
+      "name": "coco import completes",
+      "passed": true
+    },
+    {
+      "name": "coco roundtrip item count",
+      "passed": true
+    },
+    {
+      "name": "coco import creates version",
+      "passed": true
+    },
+    {
+      "name": "coco roundtrip annotation geometry",
+      "passed": true
+    },
+    {
+      "name": "yolo export completes",
+      "passed": true
+    },
+    {
+      "name": "yolo ZIP CRC and frozen image count",
+      "passed": true
+    },
+    {
+      "name": "yolo download hash",
+      "passed": true
+    },
+    {
+      "name": "yolo import operation replay",
+      "passed": true
+    },
+    {
+      "name": "yolo import completes",
+      "passed": true
+    },
+    {
+      "name": "yolo roundtrip item count",
+      "passed": true
+    },
+    {
+      "name": "yolo import creates version",
+      "passed": true
+    },
+    {
+      "name": "yolo roundtrip annotation geometry",
+      "passed": true
+    },
+    {
+      "name": "labelme export completes",
+      "passed": true
+    },
+    {
+      "name": "labelme ZIP CRC and frozen image count",
+      "passed": true
+    },
+    {
+      "name": "labelme download hash",
+      "passed": true
+    },
+    {
+      "name": "labelme import operation replay",
+      "passed": true
+    },
+    {
+      "name": "labelme import completes",
+      "passed": true
+    },
+    {
+      "name": "labelme roundtrip item count",
+      "passed": true
+    },
+    {
+      "name": "labelme import creates version",
+      "passed": true
+    },
+    {
+      "name": "labelme roundtrip annotation geometry",
+      "passed": true
+    },
+    {
+      "name": "concurrent same import operation is idempotent",
+      "passed": true
+    },
+    {
+      "name": "concurrent import completes once",
+      "passed": true
+    },
+    {
+      "name": "import operation rejects changed archive",
+      "passed": true
+    },
+    {
+      "name": "ZIP traversal rejected",
+      "passed": true
+    },
+    {
+      "name": "bad archive leaves no quota reservation",
+      "passed": true
+    },
+    {
+      "name": "concurrent quota permits exactly one new asset",
+      "passed": true
+    },
+    {
+      "name": "project upload cannot bypass dataset byte quota",
+      "passed": true
+    },
+    {
+      "name": "dataset survives source project deletion",
+      "passed": true
+    },
+    {
+      "name": "outside organization cannot read datasets versions or job downloads",
+      "passed": true
+    },
+    {
+      "name": "outside organization cannot be granted dataset membership",
+      "passed": true
+    },
+    {
+      "name": "dataset membership revocation applies immediately",
+      "passed": true
+    },
+    {
+      "name": "archive retains dataset history",
+      "passed": true
+    }
+  ],
+  "fixtures": {
+    "sourceProjectId": "ad5c9703-7b52-4f16-9bef-6d0e914837d1",
+    "datasetId": "6762252b-5012-4f5b-9aa6-212411f2f3f1",
+    "versionId": "73b97170-c9eb-45c6-851b-e0088e9a7a2f",
+    "reusedProjectId": "dcfe2327-d351-4cb3-b0d8-779d9061e86a"
+  },
+  "isolatedQuotaTests": true,
+  "error": null
+}

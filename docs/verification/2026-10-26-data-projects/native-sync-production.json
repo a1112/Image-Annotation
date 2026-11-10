@@ -1,0 +1,75 @@
+{
+  "passed": true,
+  "checkedAt": "2026-10-26T10:47:17.910205+00:00",
+  "clientAProjectId": "data-project-65fbfa72-712d-4f0c-959d-2ce6dab513ee",
+  "clientADatasetId": "bbcb0a860-day",
+  "finalMainCommitId": "3599c19c-f530-48fc-89a2-d6f8ca8ef9a0",
+  "ids": {
+    "remoteProjectId": "4a8e2989-2935-4c00-bb4b-03daddac960d",
+    "clientBProjectId": "data-project-c45aea48-1782-402d-a109-02017f2d1338",
+    "clientBDatasetId": "remote-020e3c79d68ddb24b377b78ead12cee22dd7f66e2d7b03121024901a89471770",
+    "viewerId": "4e43a1f0-7637-4f02-86cc-8b79c00ae552"
+  },
+  "checks": [
+    {
+      "name": "native publisher uploads project graph and immutable objects",
+      "passed": true
+    },
+    {
+      "name": "second native client clones both datasets",
+      "passed": true
+    },
+    {
+      "name": "clone restores actual image annotations",
+      "passed": true
+    },
+    {
+      "name": "cloned worktree is clean",
+      "passed": true
+    },
+    {
+      "name": "all branch heads are cloned",
+      "passed": true
+    },
+    {
+      "name": "merge second parent survives cloud round trip",
+      "passed": true
+    },
+    {
+      "name": "feature-only commit syncs while main stays unchanged",
+      "passed": true
+    },
+    {
+      "name": "concurrent remote branch never overwrites local head",
+      "passed": true
+    },
+    {
+      "name": "divergent remote is retained as a mergeable tracking branch",
+      "passed": true
+    },
+    {
+      "name": "tracking branch merges with two native parents",
+      "passed": true
+    },
+    {
+      "name": "pull updates actual annotations on the other client",
+      "passed": true
+    },
+    {
+      "name": "offline sync failure preserves committed local draft",
+      "passed": true
+    },
+    {
+      "name": "network recovery syncs the offline annotation",
+      "passed": true
+    },
+    {
+      "name": "both native clients end with clean worktrees",
+      "passed": true
+    },
+    {
+      "name": "native ACL management adds a distinct viewer",
+      "passed": true
+    }
+  ]
+}

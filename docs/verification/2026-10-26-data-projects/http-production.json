@@ -1,0 +1,219 @@
+{
+  "baseUrl": "https://175.178.16.90/image-annotation",
+  "checks": [
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "legacy project for second-member invitation",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "create same-organization member invitation",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "accept second-member invitation",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "create data project",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "add viewer member",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "viewer can read member list",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "viewer can read graph",
+      "passed": true
+    },
+    {
+      "errorCode": "FORBIDDEN",
+      "expectedStatus": 403,
+      "httpStatus": 403,
+      "name": "viewer cannot push",
+      "passed": true
+    },
+    {
+      "errorCode": "BAD_REQUEST",
+      "expectedStatus": 400,
+      "httpStatus": 400,
+      "name": "reject blob hash mismatch",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "upload verified blob",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "viewer can read project-scoped blob",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "create second project for object isolation",
+      "passed": true
+    },
+    {
+      "errorCode": "NOT_FOUND",
+      "expectedStatus": 404,
+      "httpStatus": 404,
+      "name": "reject cross-project blob lookup",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "delete object-isolation project",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "push baseline commit",
+      "passed": true
+    },
+    {
+      "errorCode": "IMMUTABLE_COMMIT_MISMATCH",
+      "expectedStatus": 409,
+      "httpStatus": 409,
+      "name": "reject immutable commit mutation",
+      "passed": true
+    },
+    {
+      "errorCode": "REMOTE_REVISION_MISMATCH",
+      "expectedStatus": 409,
+      "httpStatus": 409,
+      "name": "reject stale remote revision",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "push fast-forward commit",
+      "passed": true
+    },
+    {
+      "errorCode": "NON_FAST_FORWARD",
+      "expectedStatus": 409,
+      "httpStatus": 409,
+      "name": "reject non-fast-forward ref",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "promote member to editor",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "read revision after membership change",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "editor can push fast-forward",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "push non-main feature ref",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "push double-parent merge",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "read feature and merge graph",
+      "passed": true
+    },
+    {
+      "errorCode": "PROTECTED_REF",
+      "expectedStatus": 409,
+      "httpStatus": 409,
+      "name": "main branch cannot be cleared",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "revoke member",
+      "passed": true
+    },
+    {
+      "errorCode": "FORBIDDEN",
+      "expectedStatus": 403,
+      "httpStatus": 403,
+      "name": "revoked member loses graph access",
+      "passed": true
+    },
+    {
+      "errorCode": null,
+      "expectedStatus": 200,
+      "httpStatus": 200,
+      "name": "delete data project",
+      "passed": true
+    },
+    {
+      "errorCode": "FORBIDDEN",
+      "expectedStatus": 403,
+      "httpStatus": 403,
+      "name": "deleted project is inaccessible",
+      "passed": true
+    }
+  ],
+  "memberId": "95c8f11d-0d7e-46c2-aec6-930695c6f018",
+  "passed": true,
+  "projectId": "bf5a1adb-051b-4a1e-9bae-44dc4d2bfa36",
+  "schema": "data-project-cloud-verification/v1"
+}
