@@ -3,6 +3,7 @@ dist/
 dist-web/
 data/
 .worktrees/
+.macos-signing-identity
 src-tauri/target/
 # Tauri Android/iOS project files are generated from the checked-in config,
 # but the platform project itself is versioned so local signing and CI can

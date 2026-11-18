@@ -11,7 +11,8 @@
     "test": "vitest run && npm run test:chrome",
     "test:watch": "vitest",
     "test:chrome": "node --test src-tauri/src/project-window-chrome.test.cjs",
-    "tauri": "tauri"
+    "test:signing": "node --test scripts/tauri-with-signing.test.mjs",
+    "tauri": "node scripts/tauri-with-signing.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",

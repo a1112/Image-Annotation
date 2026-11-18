@@ -26,3 +26,9 @@ npm test            # 前端和窗口控件测试
 ```
 
 原生客户端和服务端的构建需要各自的 Rust/Tauri 环境；服务端的数据库及环境变量配置见其 README。部署和验证脚本可能需要特定环境，使用前请先阅读脚本及对应文档。
+
+### macOS 本机签名
+
+`npm run tauri -- build --bundles app` 和 `npm run tauri -- bundle --bundles app` 在 macOS 上会读取仓库根目录中 Git 忽略的 `.macos-signing-identity`：文件只能包含一行 40 位代码签名证书 SHA-1 指纹。可使用 `security find-identity -v -p codesigning` 查看本机可用身份；不要在此文件中放置私钥或密码。未配置文件时沿用 Tauri 默认行为。显式设置 `APPLE_SIGNING_IDENTITY` 会覆盖本机文件，值 `-` 可明确选择 ad-hoc 签名。
+
+固定证书和 bundle ID 可让重新构建的应用保持可识别的签名身份。首次切换签名后，原有钥匙串项目可能仍需一次授权；换证书、过期、吊销或证书无法访问时可能再次提示。`npm exec tauri`、`cargo tauri` 或其他绕过该脚本的入口不读取此文件。此设置仅用于本机桌面包，不改变 iOS 构建，也不代表已完成分发公证。
