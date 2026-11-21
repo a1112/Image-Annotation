@@ -1,4 +1,5 @@
 mod auth;
+mod central_auth;
 mod config;
 mod routes;
 mod state;
@@ -53,6 +54,7 @@ async fn main() -> Result<()> {
     }
     let aws = aws_loader.load().await;
     let state = AppState {
+        central_auth: central_auth::CentralAuth::from_env()?,
         pool,
         s3: aws_sdk_s3::Client::new(&aws),
         config: config.clone(),
@@ -75,6 +77,7 @@ async fn main() -> Result<()> {
     let request_id = axum::http::HeaderName::from_static("x-request-id");
     let app = Router::new()
         .route("/health", get(routes::health))
+        .route("/api/v1/web/auth/provider", get(routes::web_auth::provider))
         .merge(web_commands)
         .merge(web_uploads)
         .route(

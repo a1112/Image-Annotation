@@ -47,6 +47,12 @@ impl FromRequestParts<AppState> for AuthUser {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "));
         let cookie_token = if bearer.is_none() {
+            if let Some(central) = &state.central_auth {
+                if !matches!(parts.method, Method::GET | Method::HEAD | Method::OPTIONS) {
+                    validate_web_origin(&parts.headers, &state.config)?;
+                }
+                return central.authenticate(&parts.headers, &state.pool).await;
+            }
             let cookie = cookie_value(&parts.headers, "ia_web_access");
             if cookie.is_some()
                 && !matches!(parts.method, Method::GET | Method::HEAD | Method::OPTIONS)

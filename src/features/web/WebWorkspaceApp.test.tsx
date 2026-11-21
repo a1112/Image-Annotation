@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import WebWorkspaceApp from "./WebWorkspaceApp";
 
 const webApi = vi.hoisted(() => ({
+  getWebLoginProvider: vi.fn(async () => ({ provider: "local" })),
   getWebSession: vi.fn(), loginWeb: vi.fn(), logoutWeb: vi.fn(), createWebDataset: vi.fn(),
   exportWebDataProject: vi.fn(), uploadWebDatasetImages: vi.fn(),
   WebApiError: class extends Error { constructor(public status: number, message: string) { super(message); } },

@@ -12,6 +12,7 @@ import {
   createWebDataset,
   exportWebDataProject,
   getWebSession,
+  getWebLoginProvider,
   loginWeb,
   logoutWeb,
   uploadWebDatasetImages,
@@ -102,6 +103,13 @@ function downloadJsonFile(fileName: string, value: unknown): void {
 }
 
 function WebLoginScreen({ onAuthenticated }: { onAuthenticated: (session: WebSession) => void }) {
+  const [central, setCentral] = useState(false);
+  useEffect(() => {
+    let active = true;
+    void getWebLoginProvider().then(value => { if (active) setCentral(value.provider === "r-auth"); })
+      .catch(() => {});
+    return () => { active = false; };
+  }, []);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -139,14 +147,14 @@ function WebLoginScreen({ onAuthenticated }: { onAuthenticated: (session: WebSes
         <div className="web-auth-mark"><LogIn size={21} /></div>
         <span className="web-eyebrow">IMAGE ANNOTATION / WEB</span>
         <h1 id="web-login-title">登录图像标注</h1>
-        <form className="web-login-form" onSubmit={(event) => void submit(event)}>
+        {central ? <a className="primary web-login-button" href={'/_r-auth/enter?next=' + encodeURIComponent(location.pathname)}>使用 R-Auth 登录</a> : <form className="web-login-form" onSubmit={(event) => void submit(event)}>
           <label><span>邮箱</span><input autoComplete="username" autoFocus value={email} onChange={(event) => setEmail(event.target.value)} type="email" /></label>
           <label><span>密码</span><input autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} type="password" /></label>
           {error ? <div className="web-alert error" role="alert">{error}</div> : null}
           <button className="primary web-login-button" disabled={busy || !email.trim() || !password} type="submit">
             <LogIn size={16} />{busy ? "正在登录…" : "登录"}
           </button>
-        </form>
+        </form>}
       </section>
     </main>
   );
@@ -475,6 +483,16 @@ export default function WebWorkspaceApp() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const sessionRequestRef = useRef(0);
+  useEffect(() => {
+    if (!session?.rAuthSession) return;
+    const meta = document.createElement("meta");
+    meta.name = "r-auth-session"; meta.content = session.rAuthSession;
+    document.head.append(meta);
+    const script = document.createElement("script");
+    script.src = "/_r-auth/session-watch.js";
+    document.head.append(script);
+    return () => { meta.remove(); script.remove(); };
+  }, [session?.rAuthSession]);
 
   useEffect(() => {
     configureBackendTransport("web");

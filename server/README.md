@@ -1,5 +1,11 @@
 # Hybrid Project Server
 
+## R-Auth browser sign-in
+
+Register the `image-annotation` client with the project's dedicated HTTPS hostname and the exact callback `/_r-auth/callback`. Route `/_r-auth/` on that host to the generated callback process (`R_AUTH_PROJECT_CLIENT_ID=image-annotation PORT=3201 node business.cjs`). Configure its issuer, client secret, account origin and project session key. Continue routing `/app/` and `/api/` to the Rust service.
+
+Set `OIDC_ISSUER`, `R_AUTH_ORIGIN`, `R_AUTH_SESSION_KEY` and `R_AUTH_USER_BINDINGS_JSON` in the Rust service. Bind a verified realm subject to the UUID of its existing annotation user. Set `PUBLIC_BASE_URL` to the public service URL. The web guard checks the central session, the user's active state, device, organization and existing project permissions. An unmapped identity receives 403.
+
 The service is the remote half of the hybrid project-management model. PostgreSQL
 stores project metadata, members, revisions, issues, audit events, sync cursors,
 and idempotency records. MinIO stores original images and generated artifacts.

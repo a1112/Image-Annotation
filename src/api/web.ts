@@ -22,6 +22,7 @@ export type WebSession = {
   authenticated: boolean;
   user: WebSessionUser | null;
   deviceId: string | null;
+  rAuthSession?: string;
 };
 
 export type WebHealth = {
@@ -267,6 +268,7 @@ function sessionFromPayload(payload: unknown): WebSession {
     authenticated: value.authenticated === true || Boolean(user),
     user,
     deviceId: typeof value.deviceId === "string" ? value.deviceId : null,
+    ...(typeof value.rAuthSession === "string" ? { rAuthSession: value.rAuthSession } : {}),
   };
 }
 
@@ -283,6 +285,10 @@ export async function getWebSession(): Promise<WebSession> {
     }
     throw error;
   }
+}
+
+export function getWebLoginProvider(): Promise<{ provider: string }> {
+  return webRequest("/api/v1/web/auth/provider");
 }
 
 export async function loginWeb(input: { email: string; password: string; deviceId: string; deviceName: string }): Promise<WebSession> {

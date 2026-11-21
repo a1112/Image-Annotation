@@ -98,12 +98,19 @@ fn session_response(state: &AppState, mut payload: Value) -> Result<Response, Ap
     Ok(response)
 }
 
+pub async fn provider(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "provider": if state.central_auth.is_some() { "r-auth" } else { "local" } }))
+}
+
 pub async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<WebLogin>,
 ) -> Result<Response, ApiError> {
     origin(&headers, &state)?;
+    if state.central_auth.is_some() {
+        return Err(ApiError::unauthorized("Use R-Auth to sign in"));
+    }
     let Json(payload) = account::login(
         State(state.clone()),
         Json(account::LoginRequest {
@@ -123,6 +130,9 @@ pub async fn refresh(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     origin(&headers, &state)?;
+    if state.central_auth.is_some() {
+        return Err(ApiError::unauthorized("Sign in to R-Auth again"));
+    }
     let refresh_token = cookie_value(&headers, "ia_web_refresh")
         .ok_or_else(|| ApiError::unauthorized("browser session has expired"))?;
     let Json(payload) = account::refresh(
@@ -138,9 +148,10 @@ pub async fn refresh(
 
 pub async fn session(State(state): State<AppState>, user: AuthUser) -> Result<Response, ApiError> {
     let device_id = user.device_id.clone();
+    let central_session = state.central_auth.as_ref().and(user.session_id);
     let Json(profile) = account::me(State(state), user).await?;
     let mut response =
-        Json(json!({"authenticated":true,"user":profile,"deviceId":device_id})).into_response();
+        Json(json!({"authenticated":true,"user":profile,"deviceId":device_id,"rAuthSession":central_session})).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -153,6 +164,9 @@ pub async fn logout(
 ) -> Result<Response, ApiError> {
     origin(&headers, &state)?;
     // Revoke the session even when its short-lived access credential expired.
+    if let Some(central) = &state.central_auth {
+        central.logout(&headers).await?;
+    }
     if let Some(refresh) = cookie_value(&headers, "ia_web_refresh") {
         use sha2::{Digest, Sha256};
         let hash = format!("{:x}", Sha256::digest(refresh.as_bytes()));
